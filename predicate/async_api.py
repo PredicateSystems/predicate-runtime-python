@@ -1,12 +1,12 @@
 """
-Async API for Sentience SDK - Convenience re-exports
+Async API for Predicate SDK - Convenience re-exports
 
 This module re-exports all async functions for backward compatibility and developer convenience.
 You can also import directly from their respective modules:
 
     # Option 1: From async_api (recommended for convenience)
     from predicate.async_api import (
-        AsyncSentienceBrowser,
+        AsyncPredicateBrowser,
         snapshot_async,
         click_async,
         wait_for_async,
@@ -39,6 +39,11 @@ from predicate.base_agent import BaseAgentAsync
 # ========== Browser ==========
 # Re-export AsyncSentienceBrowser from browser.py (moved there for better organization)
 from predicate.browser import AsyncSentienceBrowser
+
+# Predicate-named class counterparts (canonical moving forward).
+# Keep Sentience* names for backward compatibility.
+AsyncPredicateBrowser = AsyncSentienceBrowser
+PredicateAgentAsync = SentienceAgentAsync
 
 # Re-export async expect functions from expect.py
 from predicate.expect import ExpectationAsync, expect_async
@@ -76,6 +81,7 @@ from predicate.wait import wait_for_async
 __all__ = [
     # Browser
     "AsyncSentienceBrowser",  # Re-exported from browser.py
+    "AsyncPredicateBrowser",  # Predicate-named alias (canonical)
     # Snapshot (Phase 1)
     "snapshot_async",  # Re-exported from snapshot.py
     # Actions (Phase 1)
@@ -96,7 +102,8 @@ __all__ = [
     "expect_async",  # Re-exported from expect.py
     "ExpectationAsync",  # Re-exported from expect.py
     # Phase 2C: Agent Layer
-    "SentienceAgentAsync",  # Re-exported from agent.py
+    "SentienceAgentAsync",  # Re-exported from agent.py (legacy name)
+    "PredicateAgentAsync",  # Predicate-named alias (canonical)
     "BaseAgentAsync",  # Re-exported from base_agent.py
     # Phase 2D: Developer Tools
     "RecorderAsync",  # Re-exported from recorder.py
