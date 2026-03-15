@@ -124,6 +124,7 @@ class IntentHeuristics(Protocol):
         ...
 
 
+@runtime_checkable
 class ExecutorOverride(Protocol):
     """
     Protocol for validating or overriding executor element choices.
