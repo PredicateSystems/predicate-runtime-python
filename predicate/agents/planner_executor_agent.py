@@ -45,7 +45,11 @@ from ..verification import (
     url_matches,
 )
 
+from .automation_task import AutomationTask, ExtractionSpec, SuccessCriteria, TaskCategory
 from .browser_agent import CaptchaConfig, VisionFallbackConfig
+from .composable_heuristics import ComposableHeuristics
+from .heuristic_spec import HeuristicHint
+from .recovery import RecoveryCheckpoint, RecoveryState
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +338,10 @@ class PlanStep(BaseModel):
     required: bool = Field(True, description="If True, step failure triggers replan")
     stop_if_true: bool = Field(False, description="If True, stop execution when verification passes")
     optional_substeps: list["PlanStep"] = Field(default_factory=list, description="Optional fallback steps")
+    heuristic_hints: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Planner-generated hints for element selection",
+    )
 
     class Config:
         extra = "allow"
@@ -858,6 +866,15 @@ class PlannerExecutorAgent:
         self._run_id: str | None = None
         self._last_known_good_url: str | None = None
 
+        # Recovery state (initialized per-run)
+        self._recovery_state: RecoveryState | None = None
+
+        # Composable heuristics (wraps static heuristics with dynamic hints)
+        self._composable_heuristics: ComposableHeuristics | None = None
+
+        # Current automation task (for run-level context)
+        self._current_task: AutomationTask | None = None
+
     def _format_context(self, snap: Snapshot, goal: str) -> str:
         """Format snapshot for LLM context."""
         if self._context_formatter is not None:
@@ -873,6 +890,89 @@ class PlannerExecutorAgent:
             clickable = 1 if getattr(el, "clickable", False) else 0
             lines.append(f"{eid}|{role}|{text}|{importance}|{clickable}")
         return "\n".join(lines)
+
+    async def _attempt_recovery(
+        self,
+        runtime: AgentRuntime,
+    ) -> bool:
+        """
+        Attempt to recover to the last known good state.
+
+        Navigates back to the checkpoint URL and verifies we're in a recoverable state.
+
+        Args:
+            runtime: AgentRuntime instance
+
+        Returns:
+            True if recovery succeeded, False otherwise
+        """
+        if self._recovery_state is None:
+            return False
+
+        checkpoint = self._recovery_state.consume_recovery_attempt()
+        if checkpoint is None:
+            return False
+
+        # Emit recovery event
+        if self.tracer:
+            self.tracer.emit(
+                "recovery_attempt",
+                {
+                    "target_url": checkpoint.url,
+                    "target_step_index": checkpoint.step_index,
+                    "attempt": self._recovery_state.recovery_attempts_used,
+                },
+            )
+
+        try:
+            # Navigate to checkpoint URL
+            await runtime.goto(checkpoint.url)
+
+            # Wait for page to settle
+            await runtime.stabilize()
+
+            # Verify we're at the expected URL (basic check)
+            snapshot = await runtime.snapshot()
+            current_url = snapshot.url or ""
+
+            # Check if URL matches (allowing for minor variations)
+            url_matches = (
+                checkpoint.url in current_url
+                or current_url in checkpoint.url
+                or checkpoint.url.rstrip("/") == current_url.rstrip("/")
+            )
+
+            if url_matches:
+                if self.tracer:
+                    self.tracer.emit(
+                        "recovery_success",
+                        {
+                            "recovered_to_url": checkpoint.url,
+                            "actual_url": current_url,
+                        },
+                    )
+                return True
+            else:
+                if self.tracer:
+                    self.tracer.emit(
+                        "recovery_url_mismatch",
+                        {
+                            "expected_url": checkpoint.url,
+                            "actual_url": current_url,
+                        },
+                    )
+                return False
+
+        except Exception as e:
+            if self.tracer:
+                self.tracer.emit(
+                    "recovery_failed",
+                    {
+                        "error": str(e),
+                        "checkpoint_url": checkpoint.url,
+                    },
+                )
+            return False
 
     def _extract_json(self, text: str) -> dict[str, Any]:
         """Extract JSON from LLM response, handling code fences and think tags."""
@@ -1771,7 +1871,7 @@ Return JSON patch:
     async def run(
         self,
         runtime: AgentRuntime,
-        task: str,
+        task: AutomationTask | str,
         *,
         start_url: str | None = None,
         run_id: str | None = None,
@@ -1781,42 +1881,118 @@ Return JSON patch:
 
         Args:
             runtime: AgentRuntime instance
-            task: Task description
-            start_url: Starting URL (optional)
+            task: AutomationTask instance or task description string
+            start_url: Starting URL (only needed if task is a string)
             run_id: Run ID for tracing (optional)
 
         Returns:
             RunOutcome with execution results
+
+        Example with AutomationTask:
+            task = AutomationTask(
+                task_id="purchase-laptop",
+                starting_url="https://amazon.com",
+                task="Find a laptop under $1000 and add to cart",
+                category=TaskCategory.TRANSACTION,
+            )
+            result = await agent.run(runtime, task)
+
+        Example with string:
+            result = await agent.run(
+                runtime,
+                "Search for laptops",
+                start_url="https://amazon.com",
+            )
         """
-        self._run_id = run_id or str(uuid.uuid4())
+        # Normalize task to AutomationTask
+        if isinstance(task, str):
+            if start_url is None:
+                raise ValueError("start_url is required when task is a string")
+            automation_task = AutomationTask(
+                task_id=run_id or str(uuid.uuid4()),
+                starting_url=start_url,
+                task=task,
+            )
+        else:
+            automation_task = task
+            if start_url is None:
+                start_url = automation_task.starting_url
+
+        self._current_task = automation_task
+        self._run_id = run_id or automation_task.task_id
         self._replans_used = 0
         self._vision_calls = 0
         start_time = time.time()
 
+        # Initialize recovery state if enabled
+        if automation_task.enable_recovery:
+            self._recovery_state = RecoveryState(
+                max_recovery_attempts=automation_task.max_recovery_attempts,
+            )
+        else:
+            self._recovery_state = None
+
+        # Initialize composable heuristics
+        self._composable_heuristics = ComposableHeuristics(
+            static_heuristics=self._intent_heuristics,
+            task_category=automation_task.category,
+        )
+
+        # Use task description for planning
+        task_description = automation_task.task
+
         # Emit run start
-        self._emit_run_start(task, start_url)
+        self._emit_run_start(task_description, start_url)
 
         step_outcomes: list[StepOutcome] = []
         error: str | None = None
 
         try:
             # Generate plan
-            plan = await self.plan(task, start_url=start_url)
+            plan = await self.plan(task_description, start_url=start_url)
 
             # Execute steps
             step_index = 0
             while step_index < len(plan.steps):
                 step = plan.steps[step_index]
 
+                # Set step-specific heuristic hints
+                if self._composable_heuristics and step.heuristic_hints:
+                    self._composable_heuristics.set_step_hints(step.heuristic_hints)
+
                 outcome = await self._execute_step(step, runtime, step_index)
                 step_outcomes.append(outcome)
 
+                # Record checkpoint on success (for recovery)
+                if outcome.status in (StepStatus.SUCCESS, StepStatus.VISION_FALLBACK):
+                    if self._recovery_state is not None and outcome.url_after:
+                        self._recovery_state.record_checkpoint(
+                            url=outcome.url_after,
+                            step_index=step_index,
+                            snapshot_digest=hashlib.sha256(
+                                (outcome.url_after or "").encode()
+                            ).hexdigest()[:16],
+                            predicates_passed=[],
+                        )
+
                 # Handle failure
                 if outcome.status == StepStatus.FAILED and step.required:
+                    # Try recovery first if available
+                    if self._recovery_state and self._recovery_state.can_recover():
+                        recovered = await self._attempt_recovery(runtime)
+                        if recovered:
+                            # Resume from checkpoint step
+                            checkpoint = self._recovery_state.current_recovery_target
+                            if checkpoint:
+                                step_index = checkpoint.step_index + 1
+                                self._recovery_state.clear_recovery_target()
+                                continue
+
+                    # Try replanning
                     if self._replans_used < self.config.retry.max_replans:
                         try:
                             plan = await self.replan(
-                                task,
+                                task_description,
                                 step,
                                 outcome.error or "verification_failed",
                             )
@@ -1835,6 +2011,10 @@ Return JSON patch:
 
                 step_index += 1
 
+                # Clear step hints for next iteration
+                if self._composable_heuristics:
+                    self._composable_heuristics.clear_step_hints()
+
         except Exception as e:
             error = str(e)
 
@@ -1847,7 +2027,7 @@ Return JSON patch:
 
         run_outcome = RunOutcome(
             run_id=self._run_id,
-            task=task,
+            task=task_description,
             success=success,
             steps_completed=len(step_outcomes),
             steps_total=len(self._current_plan.steps) if self._current_plan else 0,
