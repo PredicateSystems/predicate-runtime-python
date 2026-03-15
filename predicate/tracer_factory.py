@@ -49,7 +49,7 @@ def create_tracer(
     run_id: str | None = None,
     api_url: str | None = None,
     logger: SentienceLogger | None = None,
-    upload_trace: bool = False,
+    upload_trace: bool | None = None,
     goal: str | None = None,
     agent_type: str | None = None,
     llm_model: str | None = None,
@@ -71,9 +71,10 @@ def create_tracer(
         run_id: Unique identifier for this agent run. If not provided, generates UUID.
         api_url: Sentience API base URL (default: https://api.sentienceapi.com)
         logger: Optional logger instance for logging file sizes and errors
-        upload_trace: Enable cloud trace upload (default: False). When True and api_key
+        upload_trace: Enable cloud trace upload. When None (default), automatically
+                      enables cloud upload if api_key is provided. When True and api_key
                       is provided, traces will be uploaded to cloud. When False, traces
-                      are saved locally only.
+                      are saved locally only regardless of api_key.
         goal: User's goal/objective for this trace run. This will be displayed as the
               trace name in the frontend. Should be descriptive and action-oriented.
               Example: "Add wireless headphones to cart on Amazon"
@@ -133,12 +134,16 @@ def create_tracer(
     if api_url is None:
         api_url = PREDICATE_API_URL
 
+    # Default upload_trace to True when api_key is provided
+    # This ensures tracing is enabled automatically for Pro/Enterprise tiers
+    should_upload = upload_trace if upload_trace is not None else (api_key is not None)
+
     # 0. Check for orphaned traces from previous crashes (if api_key provided and upload enabled)
-    if api_key and upload_trace:
+    if api_key and should_upload:
         _recover_orphaned_traces(api_key, api_url)
 
     # 1. Try to initialize Cloud Sink (Pro/Enterprise tier) if upload enabled
-    if api_key and upload_trace:
+    if api_key and should_upload:
         try:
             # Build metadata object for trace initialization
             # Only include non-empty fields to avoid sending empty strings
