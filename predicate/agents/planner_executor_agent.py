@@ -20,11 +20,12 @@ import json
 import re
 import time
 import uuid
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -45,6 +46,133 @@ from ..verification import (
 )
 
 from .browser_agent import CaptchaConfig, VisionFallbackConfig
+
+
+# ---------------------------------------------------------------------------
+# IntentHeuristics Protocol
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IntentHeuristics(Protocol):
+    """
+    Protocol for pluggable domain-specific element selection heuristics.
+
+    Developers can implement this protocol to provide domain-specific logic
+    for selecting elements based on the step intent. This allows the SDK to
+    remain generic while supporting specialized behavior for different sites.
+
+    Example implementation for an e-commerce site:
+
+        class EcommerceHeuristics:
+            def find_element_for_intent(
+                self,
+                intent: str,
+                elements: list[Any],
+                url: str,
+                goal: str,
+            ) -> int | None:
+                if "add to cart" in intent.lower():
+                    for el in elements:
+                        text = getattr(el, "text", "") or ""
+                        if "add to cart" in text.lower():
+                            return getattr(el, "id", None)
+                return None  # Fall back to LLM
+
+            def priority_order(self) -> list[str]:
+                return ["add_to_cart", "checkout", "search"]
+
+        # Usage:
+        agent = PlannerExecutorAgent(
+            planner=planner,
+            executor=executor,
+            intent_heuristics=EcommerceHeuristics(),
+        )
+    """
+
+    def find_element_for_intent(
+        self,
+        intent: str,
+        elements: list[Any],
+        url: str,
+        goal: str,
+    ) -> int | None:
+        """
+        Find element ID for a given intent using domain-specific heuristics.
+
+        Args:
+            intent: The intent hint from the plan step (e.g., "add_to_cart", "checkout")
+            elements: List of snapshot elements with id, role, text, etc.
+            url: Current page URL
+            goal: Human-readable goal for context
+
+        Returns:
+            Element ID if a match is found, None to fall back to LLM executor
+        """
+        ...
+
+    def priority_order(self) -> list[str]:
+        """
+        Return list of intent patterns in priority order.
+
+        The agent will try heuristics for each intent pattern in order.
+        This helps prioritize certain actions (e.g., checkout over add-to-cart).
+
+        Returns:
+            List of intent pattern strings
+        """
+        ...
+
+
+class ExecutorOverride(Protocol):
+    """
+    Protocol for validating or overriding executor element choices.
+
+    This allows developers to add validation logic or override the executor's
+    choice before an action is executed. Useful for safety checks or
+    domain-specific corrections.
+
+    Example:
+        class SafetyOverride:
+            def validate_choice(
+                self,
+                element_id: int,
+                action: str,
+                elements: list[Any],
+                goal: str,
+            ) -> tuple[bool, int | None, str | None]:
+                # Block clicks on delete buttons
+                for el in elements:
+                    if getattr(el, "id", None) == element_id:
+                        text = getattr(el, "text", "") or ""
+                        if "delete" in text.lower():
+                            return False, None, "blocked_delete_button"
+                return True, None, None
+    """
+
+    def validate_choice(
+        self,
+        element_id: int,
+        action: str,
+        elements: list[Any],
+        goal: str,
+    ) -> tuple[bool, int | None, str | None]:
+        """
+        Validate or override the executor's element choice.
+
+        Args:
+            element_id: The element ID chosen by the executor
+            action: The action type (CLICK, TYPE, etc.)
+            elements: List of snapshot elements
+            goal: Human-readable goal
+
+        Returns:
+            Tuple of (is_valid, override_element_id, rejection_reason)
+            - is_valid: True if choice is acceptable
+            - override_element_id: Alternative element ID, or None
+            - rejection_reason: Reason for rejection, or None
+        """
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +231,25 @@ class RetryConfig:
 
 
 @dataclass(frozen=True)
+class RecoveryNavigationConfig:
+    """
+    Configuration for recovery navigation when agent gets off-track.
+
+    The agent tracks the last known good URL (where verification passed)
+    and can navigate back if subsequent steps fail.
+
+    Attributes:
+        enabled: If True, track last_known_good_url and attempt recovery navigation.
+        max_recovery_attempts: Maximum navigation recovery attempts per step.
+        recovery_predicates: Optional predicates to verify recovery succeeded.
+    """
+
+    enabled: bool = True
+    max_recovery_attempts: int = 2
+    track_successful_urls: bool = True
+
+
+@dataclass(frozen=True)
 class PlannerExecutorConfig:
     """
     High-level configuration for PlannerExecutorAgent.
@@ -111,6 +258,7 @@ class PlannerExecutorConfig:
     - Snapshot escalation settings
     - Retry/verification settings
     - Vision fallback settings
+    - Recovery navigation settings
     - Planner/Executor LLM settings
     - Tracing settings
     """
@@ -132,6 +280,9 @@ class PlannerExecutorConfig:
     # CAPTCHA handling
     captcha: CaptchaConfig = CaptchaConfig()
 
+    # Recovery navigation
+    recovery: RecoveryNavigationConfig = RecoveryNavigationConfig()
+
     # Planner LLM settings
     planner_max_tokens: int = 2048
     planner_temperature: float = 0.0
@@ -144,6 +295,9 @@ class PlannerExecutorConfig:
     stabilize_enabled: bool = True
     stabilize_poll_s: float = 0.35
     stabilize_max_attempts: int = 6
+
+    # Pre-step verification (skip step if predicates already pass)
+    pre_step_verification: bool = True
 
     # Tracing
     trace_screenshots: bool = True
@@ -373,6 +527,125 @@ def build_predicate(spec: PredicateSpec | dict[str, Any]) -> Predicate:
 
 
 # ---------------------------------------------------------------------------
+# Plan Normalization and Validation
+# ---------------------------------------------------------------------------
+
+
+def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
+    """
+    Normalize plan dictionary to handle LLM output variations.
+
+    This function handles common variations in LLM output:
+    - url vs target field names
+    - action aliases (click vs CLICK)
+    - step id variations (string vs int)
+
+    Args:
+        plan_dict: Raw plan dictionary from LLM
+
+    Returns:
+        Normalized plan dictionary
+    """
+    # Normalize steps
+    if "steps" in plan_dict:
+        for step in plan_dict["steps"]:
+            # Normalize action names to uppercase
+            if "action" in step:
+                action = step["action"].upper()
+                # Handle common aliases
+                action_aliases = {
+                    "CLICK_ELEMENT": "CLICK",
+                    "CLICK_BUTTON": "CLICK",
+                    "CLICK_LINK": "CLICK",
+                    "INPUT": "TYPE_AND_SUBMIT",
+                    "TYPE_TEXT": "TYPE_AND_SUBMIT",
+                    "ENTER_TEXT": "TYPE_AND_SUBMIT",
+                    "GOTO": "NAVIGATE",
+                    "GO_TO": "NAVIGATE",
+                    "OPEN": "NAVIGATE",
+                    "SCROLL_DOWN": "SCROLL",
+                    "SCROLL_UP": "SCROLL",
+                }
+                step["action"] = action_aliases.get(action, action)
+
+            # Normalize url -> target for NAVIGATE actions
+            if "url" in step and "target" not in step:
+                step["target"] = step.pop("url")
+
+            # Ensure step id is int
+            if "id" in step and isinstance(step["id"], str):
+                try:
+                    step["id"] = int(step["id"])
+                except ValueError:
+                    pass
+
+            # Normalize optional_substeps recursively
+            if "optional_substeps" in step:
+                for substep in step["optional_substeps"]:
+                    if "action" in substep:
+                        substep["action"] = substep["action"].upper()
+                    if "url" in substep and "target" not in substep:
+                        substep["target"] = substep.pop("url")
+
+    return plan_dict
+
+
+def validate_plan_smoothness(plan: "Plan") -> list[str]:
+    """
+    Validate plan quality and smoothness.
+
+    Checks for common issues that indicate a low-quality plan:
+    - Missing verification predicates
+    - Consecutive same actions
+    - Empty or too short plans
+    - Missing required fields
+
+    Args:
+        plan: Parsed Plan object
+
+    Returns:
+        List of warning strings (empty if plan is smooth)
+    """
+    warnings: list[str] = []
+
+    # Check for empty plan
+    if not plan.steps:
+        warnings.append("Plan has no steps")
+        return warnings
+
+    # Check for very short plans (might be incomplete)
+    if len(plan.steps) < 2:
+        warnings.append("Plan has only one step - might be incomplete")
+
+    # Check each step
+    prev_action = None
+    for i, step in enumerate(plan.steps):
+        # Check for missing verification
+        if not step.verify and step.required:
+            warnings.append(f"Step {step.id} has no verification predicates")
+
+        # Check for consecutive same actions (might indicate loop)
+        if step.action == prev_action and step.action == "CLICK":
+            warnings.append(f"Steps {step.id - 1} and {step.id} both use {step.action}")
+
+        # Check for NAVIGATE without target
+        if step.action == "NAVIGATE" and not step.target:
+            warnings.append(f"Step {step.id} is NAVIGATE but has no target URL")
+
+        # Check for CLICK without intent
+        if step.action == "CLICK" and not step.intent:
+            warnings.append(f"Step {step.id} is CLICK but has no intent hint")
+
+        # Check for TYPE_AND_SUBMIT without input
+        if step.action == "TYPE_AND_SUBMIT" and not step.input:
+            warnings.append(f"Step {step.id} is TYPE_AND_SUBMIT but has no input")
+
+        prev_action = step.action
+
+    return warnings
+
+
+# ---------------------------------------------------------------------------
 # Prompt Builders
 # ---------------------------------------------------------------------------
 
@@ -486,6 +759,13 @@ class PlannerExecutorAgent:
     - SnapshotContext sharing to avoid redundant captures
     - Full tracing integration for Predicate Studio visualization
     - Replanning on step failure
+    - Pre-step verification: skip execution if predicates already pass
+    - Optional substeps: fallback steps for edge cases (scroll, close drawer)
+    - Plan normalization: handles LLM output variations (url vs target, etc.)
+    - Plan smoothness validation: quality checks on generated plans
+    - Pluggable IntentHeuristics: domain-specific element selection without LLM
+    - ExecutorOverride: validate/override executor element choices
+    - Recovery navigation: track last known good URL for off-track recovery
 
     Example:
         >>> from predicate.agents import PlannerExecutorAgent, PlannerExecutorConfig
@@ -508,6 +788,24 @@ class PlannerExecutorAgent:
         ...         start_url="https://amazon.com",
         ...     )
         ...     print(f"Success: {result.success}")
+
+    Example with IntentHeuristics:
+        >>> class EcommerceHeuristics:
+        ...     def find_element_for_intent(self, intent, elements, url, goal):
+        ...         if "add to cart" in intent.lower():
+        ...             for el in elements:
+        ...                 if "add to cart" in (getattr(el, "text", "") or "").lower():
+        ...                     return getattr(el, "id", None)
+        ...         return None  # Fall back to LLM
+        ...
+        ...     def priority_order(self):
+        ...         return ["add_to_cart", "checkout"]
+        >>>
+        >>> agent = PlannerExecutorAgent(
+        ...     planner=planner,
+        ...     executor=executor,
+        ...     intent_heuristics=EcommerceHeuristics(),
+        ... )
     """
 
     def __init__(
@@ -520,6 +818,8 @@ class PlannerExecutorAgent:
         config: PlannerExecutorConfig | None = None,
         tracer: Tracer | None = None,
         context_formatter: Callable[[Snapshot, str], str] | None = None,
+        intent_heuristics: IntentHeuristics | None = None,
+        executor_override: ExecutorOverride | None = None,
     ) -> None:
         """
         Initialize PlannerExecutorAgent.
@@ -532,6 +832,11 @@ class PlannerExecutorAgent:
             config: Agent configuration
             tracer: Tracer for Predicate Studio visualization
             context_formatter: Custom function to format snapshot for LLM
+            intent_heuristics: Optional pluggable heuristics for domain-specific
+                element selection. When provided, the agent tries heuristics
+                before falling back to the LLM executor.
+            executor_override: Optional hook to validate or override executor
+                element choices before action execution.
         """
         self.planner = planner
         self.executor = executor
@@ -540,6 +845,8 @@ class PlannerExecutorAgent:
         self.config = config or PlannerExecutorConfig()
         self.tracer = tracer
         self._context_formatter = context_formatter
+        self._intent_heuristics = intent_heuristics
+        self._executor_override = executor_override
 
         # State tracking
         self._current_plan: Plan | None = None
@@ -548,6 +855,7 @@ class PlannerExecutorAgent:
         self._vision_calls: int = 0
         self._snapshot_context: SnapshotContext | None = None
         self._run_id: str | None = None
+        self._last_known_good_url: str | None = None
 
     def _format_context(self, snap: Snapshot, goal: str) -> str:
         """Format snapshot for LLM context."""
@@ -937,7 +1245,20 @@ class PlannerExecutorAgent:
 
             try:
                 plan_dict = self._extract_json(resp.content)
+
+                # Normalize plan to handle LLM output variations
+                plan_dict = normalize_plan(plan_dict)
+
                 plan = Plan.model_validate(plan_dict)
+
+                # Validate plan smoothness (warnings only, don't fail)
+                warnings = validate_plan_smoothness(plan)
+                if warnings and self.tracer:
+                    try:
+                        self.tracer.emit("plan_warnings", {"warnings": warnings})
+                    except Exception:
+                        pass
+
                 self._current_plan = plan
                 self._step_index = 0
 
@@ -1044,13 +1365,155 @@ Return JSON patch:
     # Step Execution
     # -------------------------------------------------------------------------
 
+    async def _check_pre_step_verification(
+        self,
+        runtime: AgentRuntime,
+        step: PlanStep,
+    ) -> bool:
+        """
+        Check if step verification predicates already pass before executing.
+
+        This optimization skips step execution if the desired state is already
+        achieved (e.g., already on checkout page when step goal is "go to checkout").
+
+        Returns:
+            True if all predicates pass (step can be skipped), False otherwise
+        """
+        if not step.verify:
+            return False
+
+        for verify_spec in step.verify:
+            try:
+                pred = build_predicate(verify_spec)
+                # Quick check without retries
+                snap = await runtime.snapshot(limit=30, screenshot=False, goal=step.goal)
+                if snap is None:
+                    return False
+                if not pred.evaluate(snap):
+                    return False
+            except Exception:
+                return False
+
+        return True
+
+    async def _try_intent_heuristics(
+        self,
+        step: PlanStep,
+        elements: list[Any],
+        url: str,
+    ) -> int | None:
+        """
+        Try pluggable intent heuristics to find element without LLM.
+
+        Returns:
+            Element ID if heuristics found a match, None otherwise
+        """
+        if self._intent_heuristics is None:
+            return None
+
+        if not step.intent:
+            return None
+
+        try:
+            element_id = self._intent_heuristics.find_element_for_intent(
+                intent=step.intent,
+                elements=elements,
+                url=url,
+                goal=step.goal,
+            )
+            return element_id
+        except Exception:
+            return None
+
+    async def _execute_optional_substeps(
+        self,
+        substeps: list[PlanStep],
+        runtime: AgentRuntime,
+        parent_step_index: int,
+    ) -> list[StepOutcome]:
+        """
+        Execute optional substeps (fallback steps for edge cases).
+
+        Optional substeps are executed when the main step's verification fails.
+        They handle scenarios like scroll-to-reveal, closing drawers, etc.
+
+        Returns:
+            List of substep outcomes
+        """
+        outcomes: list[StepOutcome] = []
+
+        for i, substep in enumerate(substeps):
+            substep_index = parent_step_index * 100 + i + 1  # e.g., 101, 102 for step 1's substeps
+
+            # Execute substep with simplified logic
+            try:
+                ctx = await self._snapshot_with_escalation(
+                    runtime,
+                    goal=substep.goal,
+                    capture_screenshot=False,
+                )
+
+                # Determine element and action
+                action_type = substep.action
+                element_id: int | None = None
+
+                if action_type in ("CLICK", "TYPE_AND_SUBMIT"):
+                    # Try heuristics first
+                    elements = getattr(ctx.snapshot, "elements", []) or []
+                    url = getattr(ctx.snapshot, "url", "") or ""
+                    element_id = await self._try_intent_heuristics(substep, elements, url)
+
+                    if element_id is None:
+                        # Fall back to executor
+                        sys_prompt, user_prompt = build_executor_prompt(
+                            substep.goal,
+                            substep.intent,
+                            ctx.compact_representation,
+                        )
+                        resp = self.executor.generate(
+                            sys_prompt,
+                            user_prompt,
+                            temperature=self.config.executor_temperature,
+                            max_new_tokens=self.config.executor_max_tokens,
+                        )
+                        parsed_action, parsed_args = self._parse_action(resp.content)
+                        if parsed_action == "CLICK" and parsed_args:
+                            element_id = parsed_args[0]
+
+                # Execute the action
+                if action_type == "CLICK" and element_id is not None:
+                    await runtime.click(element_id)
+                elif action_type == "SCROLL":
+                    direction = "down"  # Default
+                    await runtime.scroll(direction)
+                elif action_type == "NAVIGATE" and substep.target:
+                    await runtime.goto(substep.target)
+
+                outcomes.append(StepOutcome(
+                    step_id=substep.id,
+                    goal=substep.goal,
+                    status=StepStatus.SUCCESS,
+                    action_taken=f"{action_type}({element_id})" if element_id else action_type,
+                    verification_passed=True,
+                ))
+
+            except Exception as e:
+                outcomes.append(StepOutcome(
+                    step_id=substep.id,
+                    goal=substep.goal,
+                    status=StepStatus.FAILED,
+                    error=str(e),
+                ))
+
+        return outcomes
+
     async def _execute_step(
         self,
         step: PlanStep,
         runtime: AgentRuntime,
         step_index: int,
     ) -> StepOutcome:
-        """Execute a single plan step."""
+        """Execute a single plan step with pre-verification, heuristics, and optional substeps."""
         start_time = time.time()
         pre_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
         step_id = self._emit_step_start(step, step_index, pre_url)
@@ -1058,10 +1521,46 @@ Return JSON patch:
         llm_response: str | None = None
         action_taken: str | None = None
         used_vision = False
+        used_heuristics = False
         error: str | None = None
         verification_passed = False
 
         try:
+            # Pre-step verification check: skip if predicates already pass
+            if self.config.pre_step_verification and step.verify:
+                if await self._check_pre_step_verification(runtime, step):
+                    # Step already satisfied, skip execution
+                    verification_passed = True
+                    action_taken = "SKIPPED(pre_verification_passed)"
+
+                    # Track successful URL for recovery
+                    if self.config.recovery.track_successful_urls:
+                        self._last_known_good_url = pre_url
+
+                    outcome = StepOutcome(
+                        step_id=step.id,
+                        goal=step.goal,
+                        status=StepStatus.SKIPPED,
+                        action_taken=action_taken,
+                        verification_passed=True,
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        url_before=pre_url,
+                        url_after=pre_url,
+                    )
+
+                    self._emit_step_end(
+                        step_id=step_id,
+                        step_index=step_index,
+                        step=step,
+                        outcome=outcome,
+                        pre_url=pre_url,
+                        post_url=pre_url,
+                        llm_response=None,
+                        snapshot_digest=None,
+                    )
+
+                    return outcome
+
             # Capture snapshot with escalation
             ctx = await self._snapshot_with_escalation(
                 runtime,
@@ -1081,52 +1580,122 @@ Return JSON patch:
                     # Vision execution would go here
                     # For now, fall through to standard executor
 
-            # Build executor prompt
-            sys_prompt, user_prompt = build_executor_prompt(
-                step.goal,
-                step.intent,
-                ctx.compact_representation,
-            )
+            # Determine element and action
+            action_type = step.action
+            element_id: int | None = None
 
-            # Call executor
-            resp = self.executor.generate(
-                sys_prompt,
-                user_prompt,
-                temperature=self.config.executor_temperature,
-                max_new_tokens=self.config.executor_max_tokens,
-            )
-            llm_response = resp.content
+            if action_type in ("CLICK", "TYPE_AND_SUBMIT"):
+                # Try intent heuristics first (if available)
+                elements = getattr(ctx.snapshot, "elements", []) or []
+                url = getattr(ctx.snapshot, "url", "") or ""
+                element_id = await self._try_intent_heuristics(step, elements, url)
 
-            # Parse and execute action
-            action_type, action_args = self._parse_action(resp.content)
-            action_taken = f"{action_type}({', '.join(str(a) for a in action_args)})"
+                if element_id is not None:
+                    used_heuristics = True
+                    action_taken = f"{action_type}({element_id}) [heuristic]"
+                else:
+                    # Fall back to LLM executor
+                    sys_prompt, user_prompt = build_executor_prompt(
+                        step.goal,
+                        step.intent,
+                        ctx.compact_representation,
+                    )
+
+                    resp = self.executor.generate(
+                        sys_prompt,
+                        user_prompt,
+                        temperature=self.config.executor_temperature,
+                        max_new_tokens=self.config.executor_max_tokens,
+                    )
+                    llm_response = resp.content
+
+                    # Parse action
+                    parsed_action, parsed_args = self._parse_action(resp.content)
+                    action_type = parsed_action
+                    if parsed_action == "CLICK" and parsed_args:
+                        element_id = parsed_args[0]
+                    elif parsed_action == "TYPE" and len(parsed_args) >= 2:
+                        element_id = parsed_args[0]
+
+                    action_taken = f"{action_type}({', '.join(str(a) for a in parsed_args)})"
+
+                    # Apply executor override if configured
+                    if self._executor_override and element_id is not None:
+                        try:
+                            is_valid, override_id, reason = self._executor_override.validate_choice(
+                                element_id=element_id,
+                                action=action_type,
+                                elements=elements,
+                                goal=step.goal,
+                            )
+                            if not is_valid:
+                                if override_id is not None:
+                                    element_id = override_id
+                                    action_taken = f"{action_type}({element_id}) [override]"
+                                else:
+                                    error = f"Executor override rejected: {reason}"
+                        except Exception:
+                            pass  # Ignore override errors
+
+            elif action_type == "NAVIGATE":
+                action_taken = f"NAVIGATE({step.target})"
+            elif action_type == "SCROLL":
+                action_taken = "SCROLL(down)"
+            else:
+                action_taken = action_type
 
             # Execute action via runtime
-            if action_type == "CLICK" and action_args:
-                element_id = action_args[0]
-                await runtime.click(element_id)
-            elif action_type == "TYPE" and len(action_args) >= 2:
-                element_id, text = action_args[0], action_args[1]
-                await runtime.type(element_id, text)
-            elif action_type == "PRESS" and action_args:
-                key = action_args[0]
-                await runtime.press(key)
-            elif action_type == "SCROLL":
-                direction = action_args[0] if action_args else "down"
-                await runtime.scroll(direction)
-            elif action_type == "FINISH":
-                pass  # No action needed
-            else:
-                error = f"Unknown action: {action_type}"
+            if error is None:
+                if action_type == "CLICK" and element_id is not None:
+                    await runtime.click(element_id)
+                elif action_type == "TYPE" and element_id is not None:
+                    text = step.input or ""
+                    await runtime.type(element_id, text)
+                elif action_type == "TYPE_AND_SUBMIT" and element_id is not None:
+                    text = step.input or ""
+                    await runtime.type(element_id, text)
+                    await runtime.press("Enter")
+                elif action_type == "PRESS":
+                    key = "Enter"  # Default
+                    await runtime.press(key)
+                elif action_type == "SCROLL":
+                    await runtime.scroll("down")
+                elif action_type == "NAVIGATE" and step.target:
+                    await runtime.goto(step.target)
+                elif action_type == "FINISH":
+                    pass  # No action needed
+                elif action_type not in ("CLICK", "TYPE", "TYPE_AND_SUBMIT") or element_id is None:
+                    if action_type in ("CLICK", "TYPE", "TYPE_AND_SUBMIT"):
+                        error = f"No element ID for {action_type}"
+                    else:
+                        error = f"Unknown action: {action_type}"
 
             # Record action for tracing
-            await runtime.record_action(action_taken)
+            if action_taken:
+                await runtime.record_action(action_taken)
 
             # Run verifications
-            if step.verify:
+            if step.verify and error is None:
                 verification_passed = await self._verify_step(runtime, step)
+
+                # If verification failed and we have optional substeps, try them
+                if not verification_passed and step.optional_substeps:
+                    substep_outcomes = await self._execute_optional_substeps(
+                        step.optional_substeps,
+                        runtime,
+                        step_index,
+                    )
+                    # Re-run verification after substeps
+                    if any(o.status == StepStatus.SUCCESS for o in substep_outcomes):
+                        verification_passed = await self._verify_step(runtime, step)
             else:
-                verification_passed = True
+                verification_passed = error is None
+
+            # Track successful URL for recovery
+            if verification_passed and self.config.recovery.track_successful_urls:
+                post_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
+                if post_url:
+                    self._last_known_good_url = post_url
 
         except Exception as e:
             error = str(e)

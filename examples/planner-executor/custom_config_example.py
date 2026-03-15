@@ -6,6 +6,8 @@ This example demonstrates various configuration options:
 - Snapshot escalation (enable/disable, custom step sizes)
 - Retry configuration (timeouts, max attempts)
 - Vision fallback settings
+- Pre-step verification (skip if predicates pass)
+- Recovery navigation (track last good URL)
 
 Usage:
     export OPENAI_API_KEY="sk-..."
@@ -22,6 +24,7 @@ from predicate.agent_runtime import AgentRuntime
 from predicate.agents import (
     PlannerExecutorAgent,
     PlannerExecutorConfig,
+    RecoveryNavigationConfig,
     RetryConfig,
     SnapshotEscalationConfig,
 )
@@ -124,9 +127,45 @@ async def example_vision_fallback() -> None:
     print(f"  vision.max_vision_calls: {config.vision.max_vision_calls}")
 
 
+async def example_pre_step_verification() -> None:
+    """Pre-step verification configuration."""
+    print("\n--- Example 7: Pre-step Verification ---")
+
+    # Default: enabled (steps are skipped if predicates already pass)
+    config_enabled = PlannerExecutorConfig(
+        pre_step_verification=True,  # Default
+    )
+    print(f"  pre_step_verification (default): {config_enabled.pre_step_verification}")
+
+    # Disabled: always execute steps even if predicates pass
+    config_disabled = PlannerExecutorConfig(
+        pre_step_verification=False,
+    )
+    print(f"  pre_step_verification (disabled): {config_disabled.pre_step_verification}")
+    print("  When disabled, all steps are executed even if already satisfied")
+
+
+async def example_recovery_navigation() -> None:
+    """Recovery navigation configuration."""
+    print("\n--- Example 8: Recovery Navigation ---")
+
+    config = PlannerExecutorConfig(
+        recovery=RecoveryNavigationConfig(
+            enabled=True,
+            max_recovery_attempts=3,
+            track_successful_urls=True,
+        ),
+    )
+
+    print(f"  recovery.enabled: {config.recovery.enabled}")
+    print(f"  recovery.max_recovery_attempts: {config.recovery.max_recovery_attempts}")
+    print(f"  recovery.track_successful_urls: {config.recovery.track_successful_urls}")
+    print("  Tracks last_known_good_url for recovery when agent gets off-track")
+
+
 async def example_full_custom() -> None:
     """Full custom configuration with all options."""
-    print("\n--- Example 7: Full Custom Config ---")
+    print("\n--- Example 9: Full Custom Config ---")
 
     config = PlannerExecutorConfig(
         # Snapshot escalation
@@ -148,6 +187,13 @@ async def example_full_custom() -> None:
             enabled=True,
             max_vision_calls=3,
         ),
+        # Recovery navigation
+        recovery=RecoveryNavigationConfig(
+            enabled=True,
+            max_recovery_attempts=2,
+        ),
+        # Pre-step verification
+        pre_step_verification=True,
         # Planner settings
         planner_max_tokens=3000,
         planner_temperature=0.0,
@@ -164,11 +210,13 @@ async def example_full_custom() -> None:
     print(f"  Escalation: {config.snapshot.limit_base} -> ... -> {config.snapshot.limit_max}")
     print(f"  Max replans: {config.retry.max_replans}")
     print(f"  Vision enabled: {config.vision.enabled}")
+    print(f"  Pre-step verification: {config.pre_step_verification}")
+    print(f"  Recovery enabled: {config.recovery.enabled}")
 
 
 async def example_run_with_config() -> None:
     """Run agent with custom config."""
-    print("\n--- Example 8: Run Agent with Custom Config ---")
+    print("\n--- Example 10: Run Agent with Custom Config ---")
 
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
@@ -229,6 +277,8 @@ async def main() -> None:
     await example_custom_limits()
     await example_retry_config()
     await example_vision_fallback()
+    await example_pre_step_verification()
+    await example_recovery_navigation()
     await example_full_custom()
     await example_run_with_config()
 

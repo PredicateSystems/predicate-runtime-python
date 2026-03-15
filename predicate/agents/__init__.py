@@ -18,17 +18,22 @@ from .browser_agent import (
     VisionFallbackConfig,
 )
 from .planner_executor_agent import (
+    ExecutorOverride,
+    IntentHeuristics,
     Plan,
     PlanStep,
     PlannerExecutorAgent,
     PlannerExecutorConfig,
     PredicateSpec,
+    RecoveryNavigationConfig,
     RetryConfig,
     RunOutcome,
     SnapshotContext,
     SnapshotEscalationConfig,
     StepOutcome,
     StepStatus,
+    normalize_plan,
+    validate_plan_smoothness,
 )
 
 __all__ = [
@@ -39,16 +44,21 @@ __all__ = [
     "PredicateBrowserAgentConfig",
     "VisionFallbackConfig",
     # Planner + Executor Agent
+    "ExecutorOverride",
+    "IntentHeuristics",
     "Plan",
     "PlanStep",
     "PlannerExecutorAgent",
     "PlannerExecutorConfig",
     "PredicateSpec",
+    "RecoveryNavigationConfig",
     "RetryConfig",
     "RunOutcome",
     "SnapshotContext",
     "SnapshotEscalationConfig",
     "StepOutcome",
     "StepStatus",
+    "normalize_plan",
+    "validate_plan_smoothness",
 ]
 
