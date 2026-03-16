@@ -450,7 +450,7 @@ class SentienceContext:
             page_url: Current page URL (to detect same-domain links)
 
         Returns:
-            Compressed href with meaningful path info (e.g., "/dp/B0FC5SJNQX" or "/s?k=mouse")
+            Compressed href with meaningful path info (e.g., "B0FC5SJNQX" or "mouse")
         """
         if not href:
             return ""
@@ -469,25 +469,25 @@ class SentienceContext:
             )
 
             if parsed.netloc and not is_same_domain:
-                # External link - show domain
+                # External link - show domain (truncate to 10 chars)
                 parts = parsed.netloc.split(".")
                 if len(parts) >= 2:
-                    return parts[-2][:15]
-                return parsed.netloc[:15]
+                    return parts[-2][:10]
+                return parsed.netloc[:10]
 
             # Same domain or relative link - extract meaningful path
             path = parsed.path or ""
 
-            # For product pages, extract key identifiers
+            # For product pages, extract key identifiers (just the ID, not the path prefix)
             # Amazon: /dp/XXXXX, /gp/product/XXXXX
             # Generic: /product/XXX, /item/XXX, /p/XXX
             import re
             product_patterns = [
-                r"(/dp/[A-Z0-9]+)",  # Amazon product
-                r"(/gp/product/[A-Z0-9]+)",  # Amazon alt
-                r"(/product/[^/]+)",  # Generic product
-                r"(/item/[^/]+)",  # Generic item
-                r"(/p/[^/]+)",  # Short product
+                r"/dp/([A-Z0-9]+)",  # Amazon product
+                r"/gp/product/([A-Z0-9]+)",  # Amazon alt
+                r"/product/([^/]+)",  # Generic product
+                r"/item/([^/]+)",  # Generic item
+                r"/p/([^/]+)",  # Short product
             ]
             for pattern in product_patterns:
                 match = re.search(pattern, path, re.IGNORECASE)
@@ -511,12 +511,11 @@ class SentienceContext:
             if "/checkout" in path.lower():
                 return "/checkout"
 
-            # Fallback: use last meaningful path segment
+            # Fallback: use last meaningful path segment only (no leading slash)
             segments = [s for s in path.split("/") if s and len(s) > 1]
             if segments:
-                # Return last 2 segments for context (max 30 chars)
-                result = "/" + "/".join(segments[-2:])
-                return result[:30]
+                # Return only the last segment (max 30 chars)
+                return segments[-1][:30]
 
             return path[:30] if path else ""
 
