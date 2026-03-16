@@ -1158,14 +1158,22 @@ def build_executor_prompt(
     goal: str,
     intent: str | None,
     compact_context: str,
+    input_text: str | None = None,
 ) -> tuple[str, str]:
     """
     Build system and user prompts for the Executor LLM.
+
+    Args:
+        goal: Human-readable goal for this step
+        intent: Intent hint for element selection (optional)
+        compact_context: Compact representation of page elements
+        input_text: Text to type for TYPE_AND_SUBMIT actions (optional)
 
     Returns:
         (system_prompt, user_prompt)
     """
     intent_line = f"Intent: {intent}\n" if intent else ""
+    input_line = f"Text to type: \"{input_text}\"\n" if input_text else ""
 
     system = """You are a careful web automation executor.
 You must respond with exactly ONE action in this format:
@@ -1180,7 +1188,7 @@ Output only the action. No explanations."""
     user = f"""You are controlling a browser via element IDs.
 
 Goal: {goal}
-{intent_line}
+{intent_line}{input_line}
 Elements (ID|role|text|importance|clickable|...):
 {compact_context}
 
@@ -2311,6 +2319,7 @@ Return JSON patch:
                     step.goal,
                     step.intent,
                     ctx.compact_representation,
+                    input_text=step.input,
                 )
                 resp = self.executor.generate(
                     sys_prompt,
@@ -2381,6 +2390,7 @@ Return JSON patch:
                             substep.goal,
                             substep.intent,
                             ctx.compact_representation,
+                            input_text=substep.input,
                         )
                         resp = self.executor.generate(
                             sys_prompt,
@@ -2893,6 +2903,7 @@ Return JSON patch:
                         step.goal,
                         step.intent,
                         ctx.compact_representation,
+                        input_text=step.input,
                     )
 
                     if self.config.verbose:
@@ -3057,6 +3068,22 @@ Return JSON patch:
                 verification_passed = await self._verify_step(runtime, step)
                 if self.config.verbose:
                     print(f"  [VERIFY] Predicate result: {'PASS' if verification_passed else 'FAIL'}", flush=True)
+
+                # For successful CLICK actions, check if a modal/drawer appeared and dismiss it
+                # This handles cases like Amazon's "Add Protection" drawer after Add to Cart
+                # where verification passes (e.g., "Proceed to checkout" button exists in drawer)
+                # but we need to dismiss the overlay before continuing
+                if verification_passed and original_action == "CLICK" and self.config.modal.enabled:
+                    try:
+                        post_snap = await runtime.snapshot(emit_trace=False)
+                        pre_elements = set(getattr(el, "id", 0) for el in (ctx.snapshot.elements or []))
+                        post_elements = set(getattr(el, "id", 0) for el in (post_snap.elements or []))
+                        new_elements = post_elements - pre_elements
+                        if len(new_elements) >= self.config.modal.min_new_elements:
+                            # Significant DOM change after CLICK - might be a modal/drawer
+                            await self._attempt_modal_dismissal(runtime, post_snap)
+                    except Exception:
+                        pass  # Ignore snapshot errors
 
                 # If verification failed and we have optional substeps, try them
                 if not verification_passed and step.optional_substeps:

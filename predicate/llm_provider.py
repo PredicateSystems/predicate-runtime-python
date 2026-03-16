@@ -186,11 +186,18 @@ class OpenAIProvider(LLMProvider):
             temperature: Sampling temperature (0.0 = deterministic, 1.0 = creative)
             max_tokens: Maximum tokens to generate
             json_mode: Enable JSON response format (requires model support)
-            **kwargs: Additional OpenAI API parameters
+            **kwargs: Additional OpenAI API parameters (max_new_tokens is mapped to max_tokens)
 
         Returns:
             LLMResponse object
         """
+        # Handle max_new_tokens -> max_tokens mapping for cross-provider compatibility
+        if "max_new_tokens" in kwargs:
+            if max_tokens is None:
+                max_tokens = kwargs.pop("max_new_tokens")
+            else:
+                kwargs.pop("max_new_tokens")  # max_tokens takes precedence
+
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -415,11 +422,19 @@ class AnthropicProvider(LLMProvider):
             user_prompt: User query
             temperature: Sampling temperature
             max_tokens: Maximum tokens to generate (required by Anthropic)
-            **kwargs: Additional Anthropic API parameters
+            **kwargs: Additional Anthropic API parameters (max_new_tokens is mapped to max_tokens)
 
         Returns:
             LLMResponse object
         """
+        # Handle max_new_tokens -> max_tokens mapping for cross-provider compatibility
+        if "max_new_tokens" in kwargs:
+            # Use max_new_tokens value if max_tokens is still at default
+            if max_tokens == 1024:
+                max_tokens = kwargs.pop("max_new_tokens")
+            else:
+                kwargs.pop("max_new_tokens")  # Explicit max_tokens takes precedence
+
         # Build API parameters
         api_params = {
             "model": self._model_name,

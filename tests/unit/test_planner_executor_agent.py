@@ -27,9 +27,77 @@ from predicate.agents.planner_executor_agent import (
     PredicateSpec,
     RecoveryNavigationConfig,
     SnapshotEscalationConfig,
+    build_executor_prompt,
     normalize_plan,
     validate_plan_smoothness,
 )
+
+
+# ---------------------------------------------------------------------------
+# Test build_executor_prompt
+# ---------------------------------------------------------------------------
+
+
+class TestBuildExecutorPrompt:
+    """Tests for the build_executor_prompt function."""
+
+    def test_basic_prompt_structure(self) -> None:
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Click the submit button",
+            intent=None,
+            compact_context="123|button|Submit|100|1|0|-|0|",
+        )
+        assert "CLICK(<id>)" in sys_prompt
+        assert "TYPE(<id>" in sys_prompt
+        assert "Goal: Click the submit button" in user_prompt
+        assert "123|button|Submit" in user_prompt
+
+    def test_includes_intent_when_provided(self) -> None:
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Click on product",
+            intent="Click the first product link",
+            compact_context="456|link|Product|100|1|0|-|0|",
+        )
+        assert "Intent: Click the first product link" in user_prompt
+
+    def test_no_intent_line_when_none(self) -> None:
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Click button",
+            intent=None,
+            compact_context="789|button|OK|100|1|0|-|0|",
+        )
+        assert "Intent:" not in user_prompt
+
+    def test_includes_input_text_when_provided(self) -> None:
+        """Input text should be included for TYPE_AND_SUBMIT actions."""
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Search for Logitech mouse",
+            intent=None,
+            compact_context="167|searchbox|Search|100|1|0|-|0|",
+            input_text="Logitech mouse",
+        )
+        assert 'Text to type: "Logitech mouse"' in user_prompt
+
+    def test_no_input_line_when_none(self) -> None:
+        """No input text line when not provided."""
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Click button",
+            intent=None,
+            compact_context="123|button|Submit|100|1|0|-|0|",
+            input_text=None,
+        )
+        assert "Text to type:" not in user_prompt
+
+    def test_includes_both_intent_and_input(self) -> None:
+        """Both intent and input can be present."""
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Search for laptop",
+            intent="search_box",
+            compact_context="100|searchbox|Search|100|1|0|-|0|",
+            input_text="laptop",
+        )
+        assert "Intent: search_box" in user_prompt
+        assert 'Text to type: "laptop"' in user_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -1246,3 +1314,40 @@ class TestAuthBoundaryConfig:
             ),
         )
         assert config.auth_boundary.url_patterns == ("/custom-signin",)
+
+
+# ---------------------------------------------------------------------------
+# Test Modal Dismissal After Successful CLICK
+# ---------------------------------------------------------------------------
+
+
+class TestModalDismissalAfterSuccessfulClick:
+    """Tests for modal dismissal when verification passes after CLICK."""
+
+    def test_modal_dismissal_config_min_new_elements_default(self) -> None:
+        """Default min_new_elements should be 5 for DOM change detection."""
+        config = ModalDismissalConfig()
+        assert config.min_new_elements == 5
+
+    def test_modal_enabled_by_default_in_planner_executor_config(self) -> None:
+        """Modal dismissal should be enabled by default."""
+        config = PlannerExecutorConfig()
+        assert config.modal.enabled is True
+        assert config.modal.min_new_elements == 5
+
+    def test_modal_dismissal_patterns_include_no_thanks(self) -> None:
+        """'no thanks' should be in default patterns for drawer dismissal."""
+        config = ModalDismissalConfig()
+        # This is the pattern that dismisses Amazon's product protection drawer
+        assert "no thanks" in config.dismiss_patterns
+
+    def test_modal_config_has_required_fields_for_drawer_dismissal(self) -> None:
+        """Config should have all fields needed for drawer dismissal logic."""
+        config = ModalDismissalConfig()
+        # These are all used in _attempt_modal_dismissal
+        assert hasattr(config, "enabled")
+        assert hasattr(config, "dismiss_patterns")
+        assert hasattr(config, "dismiss_icons")
+        assert hasattr(config, "role_filter")
+        assert hasattr(config, "max_attempts")
+        assert hasattr(config, "min_new_elements")
