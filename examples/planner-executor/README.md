@@ -3,11 +3,15 @@
 This directory contains examples for the `PlannerExecutorAgent`, a two-tier agent
 architecture with separate Planner (7B+) and Executor (3B-7B) models.
 
+> **See also**: [Full User Manual](../../docs/PLANNER_EXECUTOR_AGENT.md) for comprehensive documentation.
+
 ## Examples
 
 | File | Description |
 |------|-------------|
 | `minimal_example.py` | Basic usage with OpenAI models |
+| `automation_task_example.py` | Using AutomationTask for flexible task definition |
+| `captcha_example.py` | CAPTCHA handling with different solvers |
 | `local_models_example.py` | Using local HuggingFace/MLX models |
 | `custom_config_example.py` | Custom configuration (escalation, retry, vision) |
 | `tracing_example.py` | Full tracing integration for Predicate Studio |
@@ -138,4 +142,58 @@ agent = PlannerExecutorAgent(
 # ... run agent ...
 
 tracer.close()  # Upload trace to Studio
+```
+
+## AutomationTask
+
+Use `AutomationTask` for flexible task definition with built-in recovery:
+
+```python
+from predicate.agents import AutomationTask, TaskCategory
+
+# Basic task
+task = AutomationTask(
+    task_id="search-products",
+    starting_url="https://amazon.com",
+    task="Search for laptops and add the first result to cart",
+    category=TaskCategory.TRANSACTION,
+    enable_recovery=True,
+)
+
+# Add success criteria
+task = task.with_success_criteria(
+    {"predicate": "url_contains", "args": ["/cart"]},
+    {"predicate": "exists", "args": [".cart-item"]},
+)
+
+result = await agent.run(runtime, task)
+```
+
+## CAPTCHA Handling
+
+Configure CAPTCHA solving with different strategies:
+
+```python
+from predicate.agents.browser_agent import CaptchaConfig
+from predicate.captcha_strategies import HumanHandoffSolver, ExternalSolver
+
+# Human handoff: wait for manual solve
+config = PlannerExecutorConfig(
+    captcha=CaptchaConfig(
+        policy="callback",
+        handler=HumanHandoffSolver(timeout_ms=120_000),
+    ),
+)
+
+# External solver: integrate with 2Captcha, CapSolver, etc.
+def solve_captcha(ctx):
+    # Call your CAPTCHA solving service
+    pass
+
+config = PlannerExecutorConfig(
+    captcha=CaptchaConfig(
+        policy="callback",
+        handler=ExternalSolver(resolver=solve_captcha),
+    ),
+)
 ```

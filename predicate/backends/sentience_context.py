@@ -382,8 +382,8 @@ class SentienceContext:
             # DG: 1 if dominant group, else 0
             dg_flag = "1" if in_dg else "0"
 
-            # href: short token (domain or last path segment, or blank)
-            href = self._compress_href(el.href)
+            # href: meaningful path portion (e.g., "/dp/B0FC5SJNQX" for products)
+            href = self._compress_href(el.href, snapshot.url)
 
             # Ultra-compact format: ID|role|text|imp|is_primary|docYq|ord|DG|href
             line = f"{el.id}|{role}|{name}|{importance}|{is_primary_flag}|{doc_yq}|{ord_val}|{dg_flag}|{href}"
@@ -438,37 +438,92 @@ class SentienceContext:
         logger.warning("Sentience extension not ready after %dms timeout", timeout_ms)
         return False
 
-    def _compress_href(self, href: str | None) -> str:
+    def _compress_href(self, href: str | None, page_url: str | None = None) -> str:
         """
-        Compress href into a short token for minimal tokens.
+        Compress href into a meaningful short token for minimal tokens.
+
+        Extracts the path portion that's useful for navigation decisions,
+        stripping the base domain if it matches the current page.
 
         Args:
             href: Full URL or None
+            page_url: Current page URL (to detect same-domain links)
 
         Returns:
-            Short token (domain second-level or last path segment)
+            Compressed href with meaningful path info (e.g., "/dp/B0FC5SJNQX" or "/s?k=mouse")
         """
         if not href:
             return ""
 
         try:
             parsed = urlparse(href)
-            if parsed.netloc:
-                # Extract second-level domain (e.g., "github" from "github.com")
+            page_parsed = urlparse(page_url) if page_url else None
+
+            # Check if same domain as current page
+            is_same_domain = (
+                page_parsed
+                and parsed.netloc
+                and (parsed.netloc == page_parsed.netloc
+                     or parsed.netloc.endswith("." + page_parsed.netloc.split(".")[-2] + "." + page_parsed.netloc.split(".")[-1])
+                     if len(page_parsed.netloc.split(".")) >= 2 else False)
+            )
+
+            if parsed.netloc and not is_same_domain:
+                # External link - show domain
                 parts = parsed.netloc.split(".")
                 if len(parts) >= 2:
-                    return parts[-2][:10]
-                return parsed.netloc[:10]
-            elif parsed.path:
-                # Use last path segment
-                segments = [s for s in parsed.path.split("/") if s]
-                if segments:
-                    return segments[-1][:10]
-                return "item"
+                    return parts[-2][:15]
+                return parsed.netloc[:15]
+
+            # Same domain or relative link - extract meaningful path
+            path = parsed.path or ""
+
+            # For product pages, extract key identifiers
+            # Amazon: /dp/XXXXX, /gp/product/XXXXX
+            # Generic: /product/XXX, /item/XXX, /p/XXX
+            import re
+            product_patterns = [
+                r"(/dp/[A-Z0-9]+)",  # Amazon product
+                r"(/gp/product/[A-Z0-9]+)",  # Amazon alt
+                r"(/product/[^/]+)",  # Generic product
+                r"(/item/[^/]+)",  # Generic item
+                r"(/p/[^/]+)",  # Short product
+            ]
+            for pattern in product_patterns:
+                match = re.search(pattern, path, re.IGNORECASE)
+                if match:
+                    return match.group(1)[:30]
+
+            # For search pages, extract search indicator
+            if "/s?" in href or "/search?" in href or "?q=" in href or "?k=" in href:
+                query = parsed.query or ""
+                # Extract search term if present
+                for param in ["k", "q", "query", "search"]:
+                    match = re.search(rf"{param}=([^&]+)", query)
+                    if match:
+                        term = match.group(1)[:15]
+                        return f"/s?{param}={term}"
+                return "/search"
+
+            # For cart/checkout pages
+            if "/cart" in path.lower():
+                return "/cart"
+            if "/checkout" in path.lower():
+                return "/checkout"
+
+            # Fallback: use last meaningful path segment
+            segments = [s for s in path.split("/") if s and len(s) > 1]
+            if segments:
+                # Return last 2 segments for context (max 30 chars)
+                result = "/" + "/".join(segments[-2:])
+                return result[:30]
+
+            return path[:30] if path else ""
+
         except Exception:
             pass
 
-        return "item"
+        return ""
 
 
 # ---------------------------------------------------------------------------

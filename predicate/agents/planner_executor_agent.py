@@ -14,6 +14,7 @@ Key features:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -214,12 +215,19 @@ class SnapshotEscalationConfig:
 
         # Larger initial limit, smaller steps
         config = SnapshotEscalationConfig(limit_base=100, limit_step=20, limit_max=180)
+
+        # Enable scroll-after-escalation to find elements below/above viewport
+        config = SnapshotEscalationConfig(scroll_after_escalation=True, scroll_directions=("down", "up"))
     """
 
     enabled: bool = True
     limit_base: int = 60
     limit_step: int = 30
     limit_max: int = 200
+    # Scroll after exhausting limit escalation to find elements in different viewports
+    scroll_after_escalation: bool = True
+    scroll_max_attempts: int = 3  # Max scrolls per direction
+    scroll_directions: tuple[str, ...] = ("down", "up")  # Directions to try
 
 
 @dataclass(frozen=True)
@@ -255,6 +263,88 @@ class RecoveryNavigationConfig:
 
 
 @dataclass(frozen=True)
+class ModalDismissalConfig:
+    """
+    Configuration for automatic modal/drawer dismissal after DOM changes.
+
+    When a CLICK action triggers a DOM change (e.g., modal/drawer appears),
+    this feature attempts to dismiss blocking overlays using common patterns.
+
+    This handles common blocking scenarios:
+    - Product protection/warranty upsells (Amazon, etc.)
+    - Cookie consent banners
+    - Newsletter signup popups
+    - Promotional overlays
+    - Cart upsell drawers
+
+    The dismissal logic looks for buttons with common dismissal text patterns
+    and clicks them to clear the overlay.
+
+    Attributes:
+        enabled: If True, attempt to dismiss modals after DOM change detection.
+        dismiss_patterns: Text patterns to match dismissal buttons (case-insensitive).
+        role_filter: Element roles to consider for dismissal buttons.
+        max_attempts: Maximum dismissal attempts per modal.
+        min_new_elements: Minimum new DOM elements to trigger modal detection.
+
+    Example:
+        # Default: enabled with common dismissal patterns
+        config = ModalDismissalConfig()
+
+        # Disable modal dismissal
+        config = ModalDismissalConfig(enabled=False)
+
+        # Custom patterns (e.g., for non-English sites)
+        config = ModalDismissalConfig(
+            dismiss_patterns=("nein danke", "schließen", "abbrechen"),
+        )
+    """
+
+    enabled: bool = True
+    # Patterns that require word boundary matching (longer patterns)
+    # Ordered by preference: decline > close > accept (we prefer not to accept upsells)
+    dismiss_patterns: tuple[str, ...] = (
+        # Decline/Skip patterns (highest priority - user is declining an offer)
+        "no thanks",
+        "no, thanks",
+        "no thank you",
+        "not now",
+        "not interested",
+        "maybe later",
+        "skip",
+        "decline",
+        "reject",
+        "deny",
+        "continue without",
+        # Close patterns
+        "close",
+        "close dialog",
+        "close modal",
+        "close popup",
+        "dismiss",
+        "dismiss banner",
+        "dismiss dialog",
+        "cancel",
+        # Continue patterns (when modal offers upgrade vs continue)
+        "continue",
+        "continue to",
+        "proceed",
+    )
+    # Icon characters that require exact match (entire label is just this character)
+    dismiss_icons: tuple[str, ...] = (
+        "x",
+        "×",  # Unicode multiplication sign
+        "✕",  # Unicode X mark
+        "✖",  # Heavy multiplication X
+        "✗",  # Ballot X
+        "╳",  # Box drawings
+    )
+    role_filter: tuple[str, ...] = ("button", "link")
+    max_attempts: int = 2
+    min_new_elements: int = 5  # Same threshold as DOM change fallback
+
+
+@dataclass(frozen=True)
 class PlannerExecutorConfig:
     """
     High-level configuration for PlannerExecutorAgent.
@@ -264,6 +354,7 @@ class PlannerExecutorConfig:
     - Retry/verification settings
     - Vision fallback settings
     - Recovery navigation settings
+    - Modal dismissal settings
     - Planner/Executor LLM settings
     - Tracing settings
     """
@@ -288,6 +379,9 @@ class PlannerExecutorConfig:
     # Recovery navigation
     recovery: RecoveryNavigationConfig = RecoveryNavigationConfig()
 
+    # Modal dismissal (for blocking overlays after DOM changes)
+    modal: ModalDismissalConfig = ModalDismissalConfig()
+
     # Planner LLM settings
     planner_max_tokens: int = 2048
     planner_temperature: float = 0.0
@@ -304,10 +398,18 @@ class PlannerExecutorConfig:
     # Pre-step verification (skip step if predicates already pass)
     pre_step_verification: bool = True
 
+    # Scroll-to-find: automatically scroll to find elements when not in viewport
+    scroll_to_find_enabled: bool = True
+    scroll_to_find_max_scrolls: int = 3  # Max scroll attempts per direction
+    scroll_to_find_directions: tuple[str, ...] = ("down", "up")  # Try down first, then up
+
     # Tracing
     trace_screenshots: bool = True
     trace_screenshot_format: str = "jpeg"
     trace_screenshot_quality: int = 80
+
+    # Verbose mode (print plan, prompts, and LLM responses to stdout)
+    verbose: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -398,9 +500,10 @@ class SnapshotContext:
 
     def digest(self) -> str:
         """Compute a digest for loop/change detection."""
+        title = getattr(self.snapshot, "title", None) or ""
         parts = [
             self.snapshot.url[:200] if self.snapshot.url else "",
-            self.snapshot.title[:200] if self.snapshot.title else "",
+            title[:200] if title else "",
             f"count:{len(self.snapshot.elements or [])}",
         ]
         for el in (self.snapshot.elements or [])[:100]:
@@ -540,6 +643,51 @@ def build_predicate(spec: PredicateSpec | dict[str, Any]) -> Predicate:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_verify_predicate(pred: dict[str, Any]) -> dict[str, Any]:
+    """
+    Normalize a verify predicate to the expected format.
+
+    LLMs may output predicates in various formats:
+    - {"url_contains": "amazon.com"} -> {"predicate": "url_contains", "args": ["amazon.com"]}
+    - {"exists": "text~'Logitech'"} -> {"predicate": "exists", "args": ["text~'Logitech'"]}
+    - {"predicate": "url_contains", "input": "x"} -> {"predicate": "url_contains", "args": ["x"]}
+
+    Args:
+        pred: Raw predicate dictionary
+
+    Returns:
+        Normalized predicate with "predicate" and "args" fields
+    """
+    # Already has predicate field - normalize args
+    if "predicate" in pred:
+        # Handle "input" field as alternative to "args"
+        if "args" not in pred or not pred["args"]:
+            if "input" in pred:
+                pred["args"] = [pred.pop("input")]
+            elif "value" in pred:
+                pred["args"] = [pred.pop("value")]
+        return pred
+
+    # Predicate type is a key in the dict (e.g., {"url_contains": "amazon.com"})
+    known_predicates = [
+        "url_contains", "url_equals", "url_matches",
+        "exists", "not_exists",
+        "element_count", "element_visible",
+        "any_of", "all_of",
+        "text_contains", "text_equals",
+    ]
+
+    for pred_type in known_predicates:
+        if pred_type in pred:
+            return {
+                "predicate": pred_type,
+                "args": [pred[pred_type]] if pred[pred_type] else [],
+            }
+
+    # Unknown format - return as-is and let validation fail with clear error
+    return pred
+
+
 def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
     """
     Normalize plan dictionary to handle LLM output variations.
@@ -548,6 +696,7 @@ def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
     - url vs target field names
     - action aliases (click vs CLICK)
     - step id variations (string vs int)
+    - verify predicate format variations
 
     Args:
         plan_dict: Raw plan dictionary from LLM
@@ -588,6 +737,13 @@ def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
                 except ValueError:
                     pass
 
+            # Normalize verify predicates
+            if "verify" in step and isinstance(step["verify"], list):
+                step["verify"] = [
+                    _normalize_verify_predicate(pred) if isinstance(pred, dict) else pred
+                    for pred in step["verify"]
+                ]
+
             # Normalize optional_substeps recursively
             if "optional_substeps" in step:
                 for substep in step["optional_substeps"]:
@@ -595,6 +751,12 @@ def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
                         substep["action"] = substep["action"].upper()
                     if "url" in substep and "target" not in substep:
                         substep["target"] = substep.pop("url")
+                    # Normalize verify in substeps too
+                    if "verify" in substep and isinstance(substep["verify"], list):
+                        substep["verify"] = [
+                            _normalize_verify_predicate(pred) if isinstance(pred, dict) else pred
+                            for pred in substep["verify"]
+                        ]
 
     return plan_dict
 
@@ -876,19 +1038,166 @@ class PlannerExecutorAgent:
         self._current_task: AutomationTask | None = None
 
     def _format_context(self, snap: Snapshot, goal: str) -> str:
-        """Format snapshot for LLM context."""
+        """
+        Format snapshot for LLM context.
+
+        Uses compact format: id|role|text|importance|is_primary|bg|clickable|nearby_text|ord|DG|href
+        Same format as documented in reddit_post_planner_executor_local_llm.md
+        """
         if self._context_formatter is not None:
             return self._context_formatter(snap, goal)
 
-        # Default compact format
+        import re
+
+        # Filter to interactive elements
+        interactive_roles = {
+            "button", "link", "textbox", "searchbox", "combobox",
+            "checkbox", "radio", "slider", "tab", "menuitem",
+            "option", "switch", "cell", "a", "input", "select", "textarea",
+        }
+
+        elements = []
+        for el in snap.elements:
+            role = (getattr(el, "role", "") or "").lower()
+            if role in interactive_roles or getattr(el, "clickable", False):
+                elements.append(el)
+
+        # Sort by importance
+        elements.sort(key=lambda el: getattr(el, "importance", 0) or 0, reverse=True)
+
+        # Build dominant group rank map
+        rank_in_group_map: dict[int, int] = {}
+        dg_key = getattr(snap, "dominant_group_key", None)
+        dg_elements = [el for el in elements if getattr(el, "in_dominant_group", False)]
+        if not dg_elements and dg_key:
+            dg_elements = [el for el in elements if getattr(el, "group_key", None) == dg_key]
+
+        # Sort dominant group by position
+        def rank_sort_key(el):
+            doc_y = getattr(el, "doc_y", None) or float("inf")
+            bbox = getattr(el, "bbox", None)
+            bbox_y = bbox.y if bbox else float("inf")
+            bbox_x = bbox.x if bbox else float("inf")
+            neg_imp = -(getattr(el, "importance", 0) or 0)
+            return (doc_y, bbox_y, bbox_x, neg_imp)
+
+        dg_elements.sort(key=rank_sort_key)
+        for rank, el in enumerate(dg_elements):
+            rank_in_group_map[el.id] = rank
+
+        # Format lines - take top elements by importance + from dominant group + by position
+        selected_ids: set[int] = set()
+        selected: list = []
+
+        # Top 40 by importance
+        for el in elements[:40]:
+            if el.id not in selected_ids:
+                selected_ids.add(el.id)
+                selected.append(el)
+
+        # Top 20 from dominant group
+        for el in dg_elements[:20]:
+            if el.id not in selected_ids:
+                selected_ids.add(el.id)
+                selected.append(el)
+
+        # Top 20 by position
+        elements_by_pos = sorted(elements, key=lambda el: (
+            getattr(el, "doc_y", None) or float("inf"),
+            -(getattr(el, "importance", 0) or 0)
+        ))
+        for el in elements_by_pos[:20]:
+            if el.id not in selected_ids:
+                selected_ids.add(el.id)
+                selected.append(el)
+
+        def compress_href(href: str | None) -> str:
+            if not href:
+                return ""
+            # Extract domain or last path segment
+            href = href.strip()
+            if href.startswith("/"):
+                parts = href.split("/")
+                return parts[-1][:20] if parts[-1] else ""
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(href)
+                if parsed.path and parsed.path != "/":
+                    parts = parsed.path.rstrip("/").split("/")
+                    return parts[-1][:20] if parts[-1] else parsed.netloc[:15]
+                return parsed.netloc[:15]
+            except Exception:
+                return href[:20]
+
+        def get_bg_color(el) -> str:
+            """Extract background color name from visual_cues."""
+            visual_cues = getattr(el, "visual_cues", None)
+            if not visual_cues:
+                return ""
+            # Try bg_color_name first, then bg_fallback
+            bg = getattr(visual_cues, "bg_color_name", None) or ""
+            if not bg:
+                bg = getattr(visual_cues, "bg_fallback", None) or ""
+            return bg[:10] if bg else ""
+
+        def get_nearby_text(el) -> str:
+            """Extract nearby text for context."""
+            nearby = getattr(el, "nearby_text", None) or ""
+            if not nearby:
+                # Try aria_label or placeholder as fallback
+                nearby = getattr(el, "aria_label", None) or ""
+            if not nearby:
+                nearby = getattr(el, "placeholder", None) or ""
+            # Truncate and normalize
+            nearby = re.sub(r"\s+", " ", nearby.strip())
+            return nearby[:20] if nearby else ""
+
         lines = []
-        for el in snap.elements[:120]:
-            eid = getattr(el, "id", "?")
-            role = getattr(el, "role", "")
-            text = (getattr(el, "text", "") or "")[:50]
-            importance = getattr(el, "importance", 0)
-            clickable = 1 if getattr(el, "clickable", False) else 0
-            lines.append(f"{eid}|{role}|{text}|{importance}|{clickable}")
+        for el in selected:
+            eid = el.id
+            role = getattr(el, "role", "") or ""
+            if getattr(el, "href", None):
+                role = "link"
+
+            # Truncate and normalize text
+            text = getattr(el, "text", "") or ""
+            text = re.sub(r"\s+", " ", text.strip())
+            if len(text) > 30:
+                text = text[:27] + "..."
+
+            importance = getattr(el, "importance", 0) or 0
+
+            # is_primary from visual_cues
+            is_primary = "0"
+            visual_cues = getattr(el, "visual_cues", None)
+            if visual_cues and getattr(visual_cues, "is_primary", False):
+                is_primary = "1"
+
+            # bg: background color
+            bg = get_bg_color(el)
+
+            # clickable flag
+            clickable = "1" if getattr(el, "clickable", False) else "0"
+
+            # nearby_text
+            nearby_text = get_nearby_text(el)
+
+            # in dominant group
+            in_dg = getattr(el, "in_dominant_group", False)
+            if not in_dg and dg_key:
+                in_dg = getattr(el, "group_key", None) == dg_key
+
+            # ord: rank in dominant group
+            ord_val = rank_in_group_map.get(eid, "") if in_dg else ""
+            dg_flag = "1" if in_dg else "0"
+
+            # href
+            href = compress_href(getattr(el, "href", None))
+
+            # Format: id|role|text|importance|is_primary|bg|clickable|nearby_text|ord|DG|href
+            line = f"{eid}|{role}|{text}|{importance}|{is_primary}|{bg}|{clickable}|{nearby_text}|{ord_val}|{dg_flag}|{href}"
+            lines.append(line)
+
         return "\n".join(lines)
 
     async def _attempt_recovery(
@@ -991,31 +1300,41 @@ class PlannerExecutorAgent:
         raise ValueError("No JSON object found in response")
 
     def _parse_action(self, text: str) -> tuple[str, list[Any]]:
-        """Parse action from executor response."""
+        """Parse action from executor response.
+
+        Handles various LLM output formats:
+        - CLICK(42)
+        - - CLICK(42)  (with leading dash/bullet)
+        - TYPE(42, "text")
+        - - TYPE(42, "Logitech mouse")
+        """
         text = text.strip()
 
+        # Strip common prefixes (bullets, dashes, asterisks)
+        text = re.sub(r"^[-*•]\s*", "", text)
+
         # CLICK(<id>)
-        match = re.match(r"CLICK\((\d+)\)", text)
+        match = re.search(r"CLICK\((\d+)\)", text)
         if match:
             return "CLICK", [int(match.group(1))]
 
-        # TYPE(<id>, "text")
-        match = re.match(r'TYPE\((\d+),\s*["\'](.+?)["\']\)', text)
+        # TYPE(<id>, "text") - also handle without quotes
+        match = re.search(r'TYPE\((\d+),\s*["\']?([^"\']+?)["\']?\)', text)
         if match:
-            return "TYPE", [int(match.group(1)), match.group(2)]
+            return "TYPE", [int(match.group(1)), match.group(2).strip()]
 
         # PRESS('key')
-        match = re.match(r"PRESS\(['\"](.+?)['\"]\)", text)
+        match = re.search(r"PRESS\(['\"]?(.+?)['\"]?\)", text)
         if match:
             return "PRESS", [match.group(1)]
 
         # SCROLL(direction)
-        match = re.match(r"SCROLL\((\w+)\)", text)
+        match = re.search(r"SCROLL\((\w+)\)", text)
         if match:
             return "SCROLL", [match.group(1)]
 
         # FINISH()
-        if text.startswith("FINISH"):
+        if "FINISH" in text:
             return "FINISH", []
 
         return "UNKNOWN", [text]
@@ -1207,15 +1526,25 @@ class PlannerExecutorAgent:
         runtime: AgentRuntime,
         goal: str,
         capture_screenshot: bool = True,
+        step: PlanStep | None = None,
     ) -> SnapshotContext:
         """
-        Capture snapshot with incremental limit escalation.
+        Capture snapshot with incremental limit escalation and optional scroll-to-find.
 
         Progressively increases snapshot limit if elements are missing or
         confidence is low. Escalation can be disabled via config.
 
+        After exhausting limit escalation, if scroll_after_escalation is enabled,
+        scrolls down/up to find elements that may be outside the current viewport.
+
         When escalation is disabled (config.snapshot.enabled=False), only a
         single snapshot at limit_base is captured.
+
+        Args:
+            runtime: AgentRuntime for capturing snapshots and scrolling
+            goal: Goal string for context formatting
+            capture_screenshot: Whether to capture screenshot
+            step: Optional PlanStep for goal-aware element detection during scroll
         """
         cfg = self.config.snapshot
         current_limit = cfg.limit_base
@@ -1232,6 +1561,7 @@ class PlannerExecutorAgent:
                     limit=current_limit,
                     screenshot=capture_screenshot,
                     goal=goal,
+                    show_overlay=True,  # Show visual overlay for debugging
                 )
                 if snap is None:
                     if not cfg.enabled:
@@ -1277,6 +1607,86 @@ class PlannerExecutorAgent:
                 if not cfg.enabled:
                     break  # No escalation on error
                 current_limit = min(current_limit + cfg.limit_step, max_limit + 1)
+
+        # Scroll-after-escalation: if we have a step and scroll is enabled,
+        # try scrolling to find elements that may be outside the viewport
+        #
+        # IMPORTANT: Only trigger scroll-after-escalation for CLICK actions with
+        # specific intents that suggest an element may be below the viewport
+        # (e.g., "add_to_cart", "checkout"). Do NOT scroll for TYPE_AND_SUBMIT
+        # or generic actions where elements are typically visible.
+        should_try_scroll = (
+            cfg.scroll_after_escalation
+            and step is not None
+            and last_snap is not None
+            and not requires_vision
+            and step.action == "CLICK"  # Only for CLICK actions
+            and step.intent  # Must have a specific intent
+            and self._intent_heuristics is not None  # Must have heuristics to detect
+        )
+
+        if should_try_scroll:
+            # Check if we can find the target element using intent heuristics
+            elements = getattr(last_snap, "elements", []) or []
+            url = getattr(last_snap, "url", "") or ""
+            found_element = await self._try_intent_heuristics(step, elements, url)
+
+            if found_element is None:
+                # Element not found in current viewport - try scrolling
+                if self.config.verbose:
+                    print(f"  [SNAPSHOT-ESCALATION] Target element not found, trying scroll-after-escalation...", flush=True)
+
+                for direction in cfg.scroll_directions:
+                    for scroll_num in range(cfg.scroll_max_attempts):
+                        if self.config.verbose:
+                            print(f"  [SNAPSHOT-ESCALATION] Scrolling {direction} ({scroll_num + 1}/{cfg.scroll_max_attempts})...", flush=True)
+
+                        # Scroll
+                        await runtime.scroll(direction)
+
+                        # Wait for stabilization
+                        if self.config.stabilize_enabled:
+                            await asyncio.sleep(self.config.stabilize_poll_s)
+
+                        # Take new snapshot at max limit (we already escalated)
+                        try:
+                            snap = await runtime.snapshot(
+                                limit=cfg.limit_max,
+                                screenshot=capture_screenshot,
+                                goal=goal,
+                                show_overlay=True,
+                            )
+                            if snap is None:
+                                continue
+
+                            last_snap = snap
+                            last_compact = self._format_context(snap, goal)
+
+                            # Extract screenshot
+                            if capture_screenshot:
+                                raw_screenshot = getattr(snap, "screenshot", None)
+                                if raw_screenshot:
+                                    screenshot_b64 = raw_screenshot
+
+                            # Check if target element is now visible
+                            elements = getattr(snap, "elements", []) or []
+                            url = getattr(snap, "url", "") or ""
+                            found_element = await self._try_intent_heuristics(step, elements, url)
+
+                            if found_element is not None:
+                                if self.config.verbose:
+                                    print(f"  [SNAPSHOT-ESCALATION] Found target element {found_element} after scrolling {direction}", flush=True)
+                                # Break out of both loops
+                                break
+                        except Exception:
+                            continue
+
+                    # If found, break out of direction loop
+                    if found_element is not None:
+                        break
+
+                if found_element is None and self.config.verbose:
+                    print(f"  [SNAPSHOT-ESCALATION] Target element not found after scrolling", flush=True)
 
         # Fallback for failed capture
         if last_snap is None:
@@ -1336,6 +1746,14 @@ class PlannerExecutorAgent:
                 schema_errors=last_errors or None,
             )
 
+            if self.config.verbose:
+                print("\n" + "=" * 60, flush=True)
+                print(f"[PLANNER] Attempt {attempt}/{max_attempts}", flush=True)
+                print("=" * 60, flush=True)
+                print(f"Task: {task}", flush=True)
+                print(f"Start URL: {start_url}", flush=True)
+                print("-" * 40, flush=True)
+
             resp = self.planner.generate(
                 sys_prompt,
                 user_prompt,
@@ -1343,6 +1761,11 @@ class PlannerExecutorAgent:
                 max_new_tokens=max_tokens,
             )
             last_output = resp.content
+
+            if self.config.verbose:
+                print("\n--- Planner Response ---", flush=True)
+                print(resp.content, flush=True)
+                print("--- End Response ---\n", flush=True)
 
             try:
                 plan_dict = self._extract_json(resp.content)
@@ -1366,10 +1789,18 @@ class PlannerExecutorAgent:
                 # Emit trace event
                 self._emit_plan_event(plan, last_output)
 
+                if self.config.verbose:
+                    import json
+                    print("\n=== PLAN GENERATED ===", flush=True)
+                    print(json.dumps(plan.model_dump(), indent=2, default=str), flush=True)
+                    print("=== END PLAN ===\n", flush=True)
+
                 return plan
 
             except Exception as e:
                 last_errors = str(e)
+                if self.config.verbose:
+                    print(f"[PLANNER] Parse error: {e}", flush=True)
                 continue
 
         raise RuntimeError(f"Planner failed after {max_attempts} attempts. Last output:\n{last_output[:500]}")
@@ -1526,6 +1957,84 @@ Return JSON patch:
         except Exception:
             return None
 
+    async def _scroll_to_find_element(
+        self,
+        runtime: AgentRuntime,
+        step: PlanStep,
+        goal: str,
+    ) -> tuple[int | None, "SnapshotContext | None"]:
+        """
+        Scroll the page to find an element that matches the step's goal/intent.
+
+        This is used when the initial snapshot doesn't contain the target element
+        (e.g., "Add to Cart" button below the viewport).
+
+        Returns:
+            (element_id, new_snapshot_context) if found, (None, None) otherwise
+        """
+        if not self.config.scroll_to_find_enabled:
+            return None, None
+
+        for direction in self.config.scroll_to_find_directions:
+            for scroll_num in range(self.config.scroll_to_find_max_scrolls):
+                if self.config.verbose:
+                    print(f"  [SCROLL-TO-FIND] Scrolling {direction} ({scroll_num + 1}/{self.config.scroll_to_find_max_scrolls})...", flush=True)
+
+                # Scroll
+                await runtime.scroll(direction)
+
+                # Wait for stabilization
+                if self.config.stabilize_enabled:
+                    await asyncio.sleep(self.config.stabilize_poll_s)
+
+                # Take new snapshot (don't pass step to avoid recursive scroll-to-find)
+                ctx = await self._snapshot_with_escalation(
+                    runtime,
+                    goal=goal,
+                    capture_screenshot=self.config.trace_screenshots,
+                    step=None,  # Avoid recursive scroll-after-escalation
+                )
+
+                # Try heuristics on new snapshot
+                elements = getattr(ctx.snapshot, "elements", []) or []
+                url = getattr(ctx.snapshot, "url", "") or ""
+                element_id = await self._try_intent_heuristics(step, elements, url)
+
+                if element_id is not None:
+                    if self.config.verbose:
+                        print(f"  [SCROLL-TO-FIND] Found element {element_id} after scrolling {direction}", flush=True)
+                    return element_id, ctx
+
+                # Try LLM executor on new snapshot
+                sys_prompt, user_prompt = build_executor_prompt(
+                    step.goal,
+                    step.intent,
+                    ctx.compact_representation,
+                )
+                resp = self.executor.generate(
+                    sys_prompt,
+                    user_prompt,
+                    temperature=self.config.executor_temperature,
+                    max_new_tokens=self.config.executor_max_tokens,
+                )
+                parsed_action, parsed_args = self._parse_action(resp.content)
+
+                if parsed_action == "CLICK" and parsed_args:
+                    element_id = parsed_args[0]
+                    # Verify element exists in snapshot
+                    if any(getattr(el, "id", None) == element_id for el in elements):
+                        if self.config.verbose:
+                            print(f"  [SCROLL-TO-FIND] LLM found element {element_id} after scrolling {direction}", flush=True)
+                        return element_id, ctx
+
+                # If LLM suggests SCROLL, it means element still not visible
+                if parsed_action == "SCROLL":
+                    continue
+
+        if self.config.verbose:
+            print(f"  [SCROLL-TO-FIND] Element not found after scrolling", flush=True)
+        return None, None
+
     async def _execute_optional_substeps(
         self,
         substeps: list[PlanStep],
@@ -1552,6 +2061,7 @@ Return JSON patch:
                     runtime,
                     goal=substep.goal,
                     capture_screenshot=False,
+                    step=substep,  # Enable scroll-after-escalation for substeps
                 )
 
                 # Determine element and action
@@ -1608,6 +2118,159 @@ Return JSON patch:
 
         return outcomes
 
+    def _word_boundary_match(self, pattern: str, text: str) -> bool:
+        """
+        Match pattern as a word boundary to avoid false positives.
+
+        For example, "x" should match "x" but not "mexico" or "boxer".
+        "close" should match "close" or "Close Dialog" but not "enclosed".
+        """
+        import re
+
+        if not pattern or not text:
+            return False
+
+        pattern_lower = pattern.lower()
+        text_lower = text.lower()
+
+        # For very short patterns (1-2 chars like "x", "×"), require exact match
+        if len(pattern) <= 2:
+            return text_lower == pattern_lower or text_lower.strip() == pattern_lower
+
+        # For longer patterns, use word boundary matching
+        try:
+            return bool(re.search(r'\b' + re.escape(pattern_lower) + r'\b', text_lower))
+        except re.error:
+            # Fall back to contains if regex fails
+            return pattern_lower in text_lower
+
+    async def _attempt_modal_dismissal(
+        self,
+        runtime: AgentRuntime,
+        post_snap: Any,
+    ) -> bool:
+        """
+        Attempt to dismiss a modal/drawer overlay after DOM change detection.
+
+        This handles common blocking scenarios like:
+        - Product protection/warranty upsells
+        - Cookie consent banners
+        - Newsletter signup popups
+        - Promotional overlays
+        - Cart upsell drawers
+
+        The method looks for buttons with common dismissal text patterns
+        and clicks them to clear the overlay.
+
+        Uses word boundary matching to avoid false positives like:
+        - "mexico" matching "x"
+        - "enclosed" matching "close"
+        - "boxer" matching "x"
+
+        Args:
+            runtime: The AgentRuntime for browser control
+            post_snap: The snapshot after DOM change was detected
+
+        Returns:
+            True if a dismissal was attempted, False otherwise
+        """
+        if not self.config.modal.enabled:
+            return False
+
+        cfg = self.config.modal
+        elements = getattr(post_snap, "elements", []) or []
+
+        # Find candidates that match dismissal patterns
+        candidates: list[tuple[int, int, str]] = []  # (element_id, score, matched_pattern)
+
+        for el in elements:
+            el_id = getattr(el, "id", None)
+            if el_id is None:
+                continue
+
+            role = (getattr(el, "role", "") or "").lower()
+            if role not in cfg.role_filter:
+                continue
+
+            # Get text and aria_label for matching
+            text = (getattr(el, "text", "") or "").lower().strip()
+            aria_label = (getattr(el, "aria_label", "") or getattr(el, "ariaLabel", "") or "").lower().strip()
+            labels = [lbl for lbl in [text, aria_label] if lbl]
+
+            if not labels:
+                continue
+
+            matched = False
+
+            # Check icon patterns first (require exact match)
+            for i, icon in enumerate(cfg.dismiss_icons):
+                icon_lower = icon.lower()
+                score = 200 + len(cfg.dismiss_icons) - i  # Icons get high priority
+
+                for lbl in labels:
+                    if lbl == icon_lower:
+                        candidates.append((el_id, score, icon))
+                        matched = True
+                        break
+                if matched:
+                    break
+
+            if matched:
+                continue
+
+            # Check word boundary patterns
+            for i, pattern in enumerate(cfg.dismiss_patterns):
+                score = len(cfg.dismiss_patterns) - i  # Higher score for earlier patterns
+
+                for lbl in labels:
+                    if self._word_boundary_match(pattern, lbl):
+                        candidates.append((el_id, score, pattern))
+                        matched = True
+                        break
+                if matched:
+                    break
+
+        if not candidates:
+            if self.config.verbose:
+                print("  [MODAL] No dismissal candidates found", flush=True)
+            return False
+
+        # Sort by score (highest first) and try the best candidates
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+        for attempt in range(min(cfg.max_attempts, len(candidates))):
+            el_id, score, pattern = candidates[attempt]
+            if self.config.verbose:
+                print(f"  [MODAL] Attempting dismissal: clicking element {el_id} (pattern: '{pattern}')", flush=True)
+
+            try:
+                await runtime.click(el_id)
+                # Wait briefly for modal to close
+                await asyncio.sleep(0.3)
+
+                # Check if modal was dismissed (DOM changed again)
+                try:
+                    new_snap = await runtime.snapshot(emit_trace=False)
+                    new_elements = set(getattr(el, "id", 0) for el in (new_snap.elements or []))
+                    post_elements = set(getattr(el, "id", 0) for el in (post_snap.elements or []))
+                    removed_elements = post_elements - new_elements
+
+                    if len(removed_elements) > 3:
+                        if self.config.verbose:
+                            print(f"  [MODAL] Dismissal successful ({len(removed_elements)} elements removed)", flush=True)
+                        return True
+                except Exception:
+                    pass  # Continue with next attempt
+
+            except Exception as e:
+                if self.config.verbose:
+                    print(f"  [MODAL] Dismissal click failed: {e}", flush=True)
+                continue
+
+        if self.config.verbose:
+            print("  [MODAL] All dismissal attempts exhausted", flush=True)
+        return False
+
     async def _execute_step(
         self,
         step: PlanStep,
@@ -1618,6 +2281,16 @@ Return JSON patch:
         start_time = time.time()
         pre_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
         step_id = self._emit_step_start(step, step_index, pre_url)
+
+        if self.config.verbose:
+            print(f"\n[STEP {step.id}] {step.goal}", flush=True)
+            print(f"  Action: {step.action}", flush=True)
+            if step.intent:
+                print(f"  Intent: {step.intent}", flush=True)
+            if step.input:
+                print(f"  Input: {step.input}", flush=True)
+            if step.target:
+                print(f"  Target: {step.target}", flush=True)
 
         llm_response: str | None = None
         action_taken: str | None = None
@@ -1662,13 +2335,24 @@ Return JSON patch:
 
                     return outcome
 
-            # Capture snapshot with escalation
+            # Wait for page to stabilize before snapshot
+            if self.config.stabilize_enabled:
+                await runtime.stabilize()
+
+            # Capture snapshot with escalation (includes scroll-after-escalation if enabled)
             ctx = await self._snapshot_with_escalation(
                 runtime,
                 goal=step.goal,
                 capture_screenshot=self.config.trace_screenshots,
+                step=step,  # Enable scroll-after-escalation to find elements outside viewport
             )
             self._snapshot_context = ctx
+
+            if self.config.verbose:
+                elements = getattr(ctx.snapshot, "elements", []) or []
+                print(f"  [SNAPSHOT] Elements: {len(elements)}, URL: {getattr(ctx.snapshot, 'url', 'N/A')}", flush=True)
+                if ctx.requires_vision:
+                    print(f"  [SNAPSHOT] Vision required: {ctx.requires_vision}", flush=True)
 
             # Emit snapshot trace
             self._emit_snapshot(ctx, step_id, step_index)
@@ -1682,8 +2366,10 @@ Return JSON patch:
                     # For now, fall through to standard executor
 
             # Determine element and action
+            original_action = step.action  # Keep original plan action for submit logic
             action_type = step.action
             element_id: int | None = None
+            executor_text: str | None = None  # Text from executor response (for TYPE actions)
 
             if action_type in ("CLICK", "TYPE_AND_SUBMIT"):
                 # Try intent heuristics first (if available)
@@ -1694,6 +2380,8 @@ Return JSON patch:
                 if element_id is not None:
                     used_heuristics = True
                     action_taken = f"{action_type}({element_id}) [heuristic]"
+                    if self.config.verbose:
+                        print(f"  [EXECUTOR] Using heuristic: {action_taken}", flush=True)
                 else:
                     # Fall back to LLM executor
                     sys_prompt, user_prompt = build_executor_prompt(
@@ -1701,6 +2389,11 @@ Return JSON patch:
                         step.intent,
                         ctx.compact_representation,
                     )
+
+                    if self.config.verbose:
+                        print("\n--- Compact Context (Snapshot) ---", flush=True)
+                        print(ctx.compact_representation, flush=True)
+                        print("--- End Compact Context ---\n", flush=True)
 
                     resp = self.executor.generate(
                         sys_prompt,
@@ -1710,6 +2403,9 @@ Return JSON patch:
                     )
                     llm_response = resp.content
 
+                    if self.config.verbose:
+                        print(f"  [EXECUTOR] LLM Response: {resp.content}", flush=True)
+
                     # Parse action
                     parsed_action, parsed_args = self._parse_action(resp.content)
                     action_type = parsed_action
@@ -1717,8 +2413,12 @@ Return JSON patch:
                         element_id = parsed_args[0]
                     elif parsed_action == "TYPE" and len(parsed_args) >= 2:
                         element_id = parsed_args[0]
+                        executor_text = parsed_args[1]  # Store text from executor response
 
                     action_taken = f"{action_type}({', '.join(str(a) for a in parsed_args)})"
+
+                    if self.config.verbose:
+                        print(f"  [EXECUTOR] Parsed action: {action_taken}", flush=True)
 
                     # Apply executor override if configured
                     if self._executor_override and element_id is not None:
@@ -1733,36 +2433,106 @@ Return JSON patch:
                                 if override_id is not None:
                                     element_id = override_id
                                     action_taken = f"{action_type}({element_id}) [override]"
+                                    if self.config.verbose:
+                                        print(f"  [EXECUTOR] Override: {action_taken}", flush=True)
                                 else:
                                     error = f"Executor override rejected: {reason}"
                         except Exception:
                             pass  # Ignore override errors
 
             elif action_type == "NAVIGATE":
-                action_taken = f"NAVIGATE({step.target})"
+                action_taken = f"NAVIGATE({step.target or 'current'})"
             elif action_type == "SCROLL":
                 action_taken = "SCROLL(down)"
             else:
                 action_taken = action_type
 
+            # If executor suggested SCROLL or selected a non-actionable element for CLICK,
+            # try scroll-to-find to locate the actual target element
+            if error is None and original_action == "CLICK":
+                should_scroll_to_find = False
+                reason = ""
+
+                if action_type == "SCROLL":
+                    # Executor explicitly said to scroll - element not visible
+                    should_scroll_to_find = True
+                    reason = "executor suggested SCROLL"
+                elif element_id is not None:
+                    # Check if selected element is a non-actionable type (input fields)
+                    selected_element = None
+                    for el in elements:
+                        if getattr(el, "id", None) == element_id:
+                            selected_element = el
+                            break
+                    if selected_element:
+                        role = (getattr(selected_element, "role", "") or "").lower()
+                        if role in {"searchbox", "textbox", "combobox", "input", "textarea"}:
+                            should_scroll_to_find = True
+                            reason = f"selected input element ({role})"
+
+                if should_scroll_to_find and self.config.scroll_to_find_enabled:
+                    if self.config.verbose:
+                        print(f"  [SCROLL-TO-FIND] Triggering because {reason}", flush=True)
+                    found_id, new_ctx = await self._scroll_to_find_element(runtime, step, step.goal)
+                    if found_id is not None and new_ctx is not None:
+                        element_id = found_id
+                        ctx = new_ctx
+                        action_type = "CLICK"
+                        action_taken = f"CLICK({element_id}) [scroll-to-find]"
+
             # Execute action via runtime
             if error is None:
                 if action_type == "CLICK" and element_id is not None:
                     await runtime.click(element_id)
+                    if self.config.verbose:
+                        print(f"  [ACTION] CLICK({element_id})", flush=True)
                 elif action_type == "TYPE" and element_id is not None:
-                    text = step.input or ""
+                    # Use text from executor response first, then fall back to step.input
+                    text = executor_text or step.input or ""
                     await runtime.type(element_id, text)
+                    # If original plan action was TYPE_AND_SUBMIT, press Enter to submit
+                    if original_action == "TYPE_AND_SUBMIT":
+                        await runtime.press("Enter")
+                        if self.config.verbose:
+                            print(f"  [ACTION] TYPE_AND_SUBMIT({element_id}, '{text}')", flush=True)
+                        await runtime.stabilize()
+                    elif self.config.verbose:
+                        print(f"  [ACTION] TYPE({element_id}, '{text[:30]}...')" if len(text) > 30 else f"  [ACTION] TYPE({element_id}, '{text}')", flush=True)
                 elif action_type == "TYPE_AND_SUBMIT" and element_id is not None:
-                    text = step.input or ""
+                    # Use text from executor response first, then step.input, then extract from goal
+                    text = executor_text or step.input or ""
+                    if not text:
+                        # Try to extract from goal like "Search for Logitech mouse"
+                        import re
+                        match = re.search(r"[Ss]earch\s+(?:for\s+)?['\"]?([^'\"]+)['\"]?", step.goal)
+                        if match:
+                            text = match.group(1).strip()
                     await runtime.type(element_id, text)
                     await runtime.press("Enter")
+                    if self.config.verbose:
+                        print(f"  [ACTION] TYPE_AND_SUBMIT({element_id}, '{text}')", flush=True)
+                    # Wait for page to load after submit
+                    await runtime.stabilize()
                 elif action_type == "PRESS":
                     key = "Enter"  # Default
                     await runtime.press(key)
+                    if self.config.verbose:
+                        print(f"  [ACTION] PRESS({key})", flush=True)
                 elif action_type == "SCROLL":
                     await runtime.scroll("down")
-                elif action_type == "NAVIGATE" and step.target:
-                    await runtime.goto(step.target)
+                    if self.config.verbose:
+                        print(f"  [ACTION] SCROLL(down)", flush=True)
+                elif action_type == "NAVIGATE":
+                    if step.target:
+                        await runtime.goto(step.target)
+                        if self.config.verbose:
+                            print(f"  [ACTION] NAVIGATE({step.target})", flush=True)
+                        # Wait for page to load after navigation
+                        await runtime.stabilize()
+                    else:
+                        # No target URL - we're already at the page, just verify
+                        if self.config.verbose:
+                            print(f"  [ACTION] NAVIGATE(skip - already at page)", flush=True)
                 elif action_type == "FINISH":
                     pass  # No action needed
                 elif action_type not in ("CLICK", "TYPE", "TYPE_AND_SUBMIT") or element_id is None:
@@ -1777,7 +2547,11 @@ Return JSON patch:
 
             # Run verifications
             if step.verify and error is None:
+                if self.config.verbose:
+                    print(f"  [VERIFY] Running {len(step.verify)} verification predicates...", flush=True)
                 verification_passed = await self._verify_step(runtime, step)
+                if self.config.verbose:
+                    print(f"  [VERIFY] Predicate result: {'PASS' if verification_passed else 'FAIL'}", flush=True)
 
                 # If verification failed and we have optional substeps, try them
                 if not verification_passed and step.optional_substeps:
@@ -1789,8 +2563,60 @@ Return JSON patch:
                     # Re-run verification after substeps
                     if any(o.status == StepStatus.SUCCESS for o in substep_outcomes):
                         verification_passed = await self._verify_step(runtime, step)
+
+                # Fallback: For navigation-causing actions, if URL changed significantly,
+                # consider the action successful even if predicate verification failed.
+                # This handles cases where local LLMs generate imprecise predicates.
+                if not verification_passed and original_action in ("TYPE_AND_SUBMIT", "CLICK"):
+                    current_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
+                    if current_url and pre_url and current_url != pre_url:
+                        # URL changed - the action likely achieved navigation
+                        if self.config.verbose:
+                            print(f"  [VERIFY] Predicate failed but URL changed: {pre_url} -> {current_url}", flush=True)
+                            print(f"  [VERIFY] Accepting {original_action} as successful (URL change fallback)", flush=True)
+                        verification_passed = True
+                    elif original_action == "CLICK" and error is None and element_id is not None:
+                        # For CLICK actions that don't change URL, check if DOM changed
+                        # (e.g., modal appeared, cart drawer opened)
+                        # But first verify we clicked an actionable element, not an input field
+                        clicked_element = None
+                        for el in (ctx.snapshot.elements or []):
+                            if getattr(el, "id", None) == element_id:
+                                clicked_element = el
+                                break
+
+                        # Don't accept DOM change fallback for input/search elements
+                        # (clicking them causes focus changes but doesn't complete actions)
+                        clicked_role = (getattr(clicked_element, "role", "") or "").lower() if clicked_element else ""
+                        input_roles = {"searchbox", "textbox", "combobox", "input", "textarea"}
+                        if clicked_role in input_roles:
+                            if self.config.verbose:
+                                print(f"  [VERIFY] Clicked input element ({clicked_role}), not accepting DOM change fallback", flush=True)
+                        else:
+                            try:
+                                post_snap = await runtime.snapshot(emit_trace=False)
+                                pre_elements = set(getattr(el, "id", 0) for el in (ctx.snapshot.elements or []))
+                                post_elements = set(getattr(el, "id", 0) for el in (post_snap.elements or []))
+                                new_elements = post_elements - pre_elements
+                                if len(new_elements) >= self.config.modal.min_new_elements:  # Significant DOM change
+                                    if self.config.verbose:
+                                        print(f"  [VERIFY] Predicate failed but DOM changed ({len(new_elements)} new elements)", flush=True)
+                                        print(f"  [VERIFY] Accepting CLICK as successful (DOM change fallback)", flush=True)
+                                    verification_passed = True
+
+                                    # Attempt modal dismissal if enabled
+                                    # This handles blocking overlays like product protection drawers
+                                    if self.config.modal.enabled:
+                                        await self._attempt_modal_dismissal(runtime, post_snap)
+                            except Exception:
+                                pass  # Ignore snapshot errors
             else:
                 verification_passed = error is None
+                if self.config.verbose:
+                    if not step.verify:
+                        print(f"  [VERIFY] No predicates defined, using error check: {'PASS' if verification_passed else 'FAIL'}", flush=True)
+                    elif error:
+                        print(f"  [VERIFY] Skipped due to error: {error}", flush=True)
 
             # Track successful URL for recovery
             if verification_passed and self.config.recovery.track_successful_urls:
@@ -1849,6 +2675,12 @@ Return JSON patch:
             pred = build_predicate(verify_spec)
             label = f"verify_{step.id}"
 
+            # Log what predicate we're checking
+            if self.config.verbose:
+                import json
+                spec_str = json.dumps(verify_spec, default=str) if isinstance(verify_spec, dict) else str(verify_spec)
+                print(f"  [VERIFY] Checking predicate: {spec_str[:100]}...", flush=True)
+
             # Use runtime's check with eventually for required verifications
             if step.required:
                 ok = await runtime.check(pred, label=label, required=True).eventually(
@@ -1860,7 +2692,12 @@ Return JSON patch:
                 ok = runtime.assert_(pred, label=label, required=False)
 
             if not ok:
+                if self.config.verbose:
+                    print(f"  [VERIFY] Predicate FAILED", flush=True)
                 return False
+            else:
+                if self.config.verbose:
+                    print(f"  [VERIFY] Predicate PASSED", flush=True)
 
         return True
 

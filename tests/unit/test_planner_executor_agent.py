@@ -19,11 +19,13 @@ from typing import Any
 from predicate.agents.planner_executor_agent import (
     ExecutorOverride,
     IntentHeuristics,
+    ModalDismissalConfig,
     Plan,
     PlannerExecutorConfig,
     PlanStep,
     PredicateSpec,
     RecoveryNavigationConfig,
+    SnapshotEscalationConfig,
     normalize_plan,
     validate_plan_smoothness,
 )
@@ -491,6 +493,82 @@ class TestRecoveryNavigationConfig:
 
 
 # ---------------------------------------------------------------------------
+# Test ModalDismissalConfig
+# ---------------------------------------------------------------------------
+
+
+class TestModalDismissalConfig:
+    """Tests for ModalDismissalConfig."""
+
+    def test_default_values(self) -> None:
+        config = ModalDismissalConfig()
+        assert config.enabled is True
+        assert config.max_attempts == 2
+        assert config.min_new_elements == 5
+        assert "button" in config.role_filter
+        assert "link" in config.role_filter
+
+    def test_default_patterns_exist(self) -> None:
+        config = ModalDismissalConfig()
+        # Should have common dismissal patterns
+        assert "no thanks" in config.dismiss_patterns
+        assert "close" in config.dismiss_patterns
+        assert "skip" in config.dismiss_patterns
+        assert "cancel" in config.dismiss_patterns
+
+    def test_default_icons_exist(self) -> None:
+        config = ModalDismissalConfig()
+        # Should have common close icons
+        assert "x" in config.dismiss_icons
+        assert "×" in config.dismiss_icons
+        assert "✕" in config.dismiss_icons
+
+    def test_can_be_disabled(self) -> None:
+        config = ModalDismissalConfig(enabled=False)
+        assert config.enabled is False
+
+    def test_custom_patterns_for_i18n(self) -> None:
+        # German patterns
+        config_german = ModalDismissalConfig(
+            dismiss_patterns=(
+                "nein danke",
+                "schließen",
+                "abbrechen",
+            ),
+        )
+        assert "nein danke" in config_german.dismiss_patterns
+        assert "schließen" in config_german.dismiss_patterns
+        assert config_german.dismiss_patterns[0] == "nein danke"
+
+    def test_custom_icons(self) -> None:
+        config = ModalDismissalConfig(
+            dismiss_icons=("x", "×", "✖"),
+        )
+        assert len(config.dismiss_icons) == 3
+        assert "✖" in config.dismiss_icons
+
+    def test_custom_max_attempts(self) -> None:
+        config = ModalDismissalConfig(max_attempts=5)
+        assert config.max_attempts == 5
+
+    def test_planner_executor_config_has_modal(self) -> None:
+        config = PlannerExecutorConfig()
+        assert hasattr(config, "modal")
+        assert config.modal.enabled is True
+
+    def test_planner_executor_config_custom_modal(self) -> None:
+        config = PlannerExecutorConfig(
+            modal=ModalDismissalConfig(
+                enabled=True,
+                dismiss_patterns=("custom pattern",),
+                max_attempts=3,
+            ),
+        )
+        assert config.modal.max_attempts == 3
+        assert "custom pattern" in config.modal.dismiss_patterns
+
+
+# ---------------------------------------------------------------------------
 # Test PlannerExecutorConfig with new options
 # ---------------------------------------------------------------------------
 
@@ -573,3 +651,488 @@ class TestPlanStepOptionalSubsteps:
         assert len(step.optional_substeps) == 2
         assert step.optional_substeps[0].action == "SCROLL"
         assert step.optional_substeps[1].action == "CLICK"
+
+
+# ---------------------------------------------------------------------------
+# Test SnapshotEscalationConfig
+# ---------------------------------------------------------------------------
+
+
+class TestSnapshotEscalationConfig:
+    """Tests for SnapshotEscalationConfig including scroll-after-escalation."""
+
+    def test_default_values(self) -> None:
+        config = SnapshotEscalationConfig()
+        assert config.enabled is True
+        assert config.limit_base == 60
+        assert config.limit_step == 30
+        assert config.limit_max == 200
+
+    def test_scroll_after_escalation_defaults(self) -> None:
+        config = SnapshotEscalationConfig()
+        assert config.scroll_after_escalation is True
+        assert config.scroll_max_attempts == 3
+        assert config.scroll_directions == ("down", "up")
+
+    def test_scroll_after_escalation_can_be_disabled(self) -> None:
+        config = SnapshotEscalationConfig(scroll_after_escalation=False)
+        assert config.scroll_after_escalation is False
+
+    def test_custom_scroll_settings(self) -> None:
+        config = SnapshotEscalationConfig(
+            scroll_after_escalation=True,
+            scroll_max_attempts=5,
+            scroll_directions=("down",),  # Only scroll down
+        )
+        assert config.scroll_max_attempts == 5
+        assert config.scroll_directions == ("down",)
+
+    def test_scroll_directions_can_be_reordered(self) -> None:
+        # Try up first, then down
+        config = SnapshotEscalationConfig(
+            scroll_directions=("up", "down"),
+        )
+        assert config.scroll_directions == ("up", "down")
+
+    def test_limit_escalation_steps(self) -> None:
+        # Default: 60 -> 90 -> 120 -> 150 -> 180 -> 200
+        config = SnapshotEscalationConfig()
+        limits = []
+        current = config.limit_base
+        while current <= config.limit_max:
+            limits.append(current)
+            current = min(current + config.limit_step, config.limit_max + 1)
+            if current > config.limit_max and current - config.limit_step < config.limit_max:
+                limits.append(config.limit_max)
+                break
+        assert limits == [60, 90, 120, 150, 180, 200] or limits == [60, 90, 120, 150, 180]
+
+    def test_custom_limit_step(self) -> None:
+        # Custom: 60 -> 110 -> 160 -> 200
+        config = SnapshotEscalationConfig(limit_step=50)
+        assert config.limit_step == 50
+
+
+# ---------------------------------------------------------------------------
+# Test PlannerExecutorConfig with SnapshotEscalationConfig
+# ---------------------------------------------------------------------------
+
+
+class TestPlannerExecutorConfigSnapshot:
+    """Tests for PlannerExecutorConfig snapshot escalation settings."""
+
+    def test_default_snapshot_config(self) -> None:
+        config = PlannerExecutorConfig()
+        assert config.snapshot is not None
+        assert config.snapshot.enabled is True
+        assert config.snapshot.scroll_after_escalation is True
+
+    def test_custom_snapshot_config(self) -> None:
+        config = PlannerExecutorConfig(
+            snapshot=SnapshotEscalationConfig(
+                enabled=True,
+                limit_base=100,
+                limit_max=300,
+                scroll_after_escalation=True,
+                scroll_max_attempts=5,
+            ),
+        )
+        assert config.snapshot.limit_base == 100
+        assert config.snapshot.limit_max == 300
+        assert config.snapshot.scroll_max_attempts == 5
+
+    def test_disable_snapshot_escalation(self) -> None:
+        config = PlannerExecutorConfig(
+            snapshot=SnapshotEscalationConfig(enabled=False),
+        )
+        assert config.snapshot.enabled is False
+
+    def test_scroll_to_find_config_exists(self) -> None:
+        # Verify scroll_to_find settings exist in PlannerExecutorConfig
+        config = PlannerExecutorConfig()
+        assert hasattr(config, "scroll_to_find_enabled")
+        assert hasattr(config, "scroll_to_find_max_scrolls")
+        assert hasattr(config, "scroll_to_find_directions")
+
+
+# ---------------------------------------------------------------------------
+# Test _snapshot_with_escalation scroll-after-escalation behavior (async)
+# ---------------------------------------------------------------------------
+
+
+class MockElement:
+    """Mock element for testing."""
+
+    def __init__(self, id: int, role: str = "button", text: str = ""):
+        self.id = id
+        self.role = role
+        self.text = text
+        self.name = text
+
+
+class MockSnapshot:
+    """Mock snapshot for testing."""
+
+    def __init__(self, elements: list[MockElement], url: str = "https://example.com"):
+        # Ensure we have at least 3 elements to pass detect_snapshot_failure
+        if len(elements) < 3:
+            # Add filler elements to prevent "too_few_elements" detection
+            for i in range(3 - len(elements)):
+                elements.append(MockElement(100 + i, "generic", f"Filler {i}"))
+        self.elements = elements
+        self.url = url
+        self.title = "Test Page"
+        self.status = "success"  # Use "success" to pass detect_snapshot_failure
+        self.screenshot = None
+        self.diagnostics = None  # No diagnostics to avoid confidence checks
+
+
+class MockRuntime:
+    """Mock runtime for testing scroll-after-escalation."""
+
+    def __init__(self, snapshots_by_scroll: dict[int, MockSnapshot] | None = None):
+        self.scroll_count = 0
+        self.scroll_directions: list[str] = []
+        self.snapshots_by_scroll = snapshots_by_scroll or {}
+        self.default_snapshot = MockSnapshot([MockElement(1, "button", "Submit")])
+
+    async def snapshot(
+        self,
+        limit: int = 60,
+        screenshot: bool = False,
+        goal: str = "",
+        show_overlay: bool = False,
+    ) -> MockSnapshot:
+        # Return snapshot based on scroll count
+        return self.snapshots_by_scroll.get(self.scroll_count, self.default_snapshot)
+
+    async def scroll(self, direction: str = "down") -> None:
+        self.scroll_count += 1
+        self.scroll_directions.append(direction)
+
+    async def stabilize(self) -> None:
+        pass
+
+
+class MockLLMProvider:
+    """Mock LLM provider for testing."""
+
+    def generate(self, *args: Any, **kwargs: Any) -> Any:
+        class MockResponse:
+            content = '{"task": "test", "steps": []}'
+
+        return MockResponse()
+
+
+class MockIntentHeuristics:
+    """Mock intent heuristics for testing scroll-after-escalation."""
+
+    def __init__(self, element_map: dict[str, int] | None = None):
+        """
+        Args:
+            element_map: Maps intent names to element IDs to return.
+                         If intent not in map, returns None.
+        """
+        self.element_map = element_map or {}
+
+    def find_element_for_intent(
+        self,
+        intent: str,
+        elements: list[Any],
+        url: str,
+        goal: str,
+    ) -> int | None:
+        return self.element_map.get(intent)
+
+    def priority_order(self) -> list[str]:
+        return list(self.element_map.keys())
+
+
+class TestSnapshotWithEscalationScrollBehavior:
+    """Tests for _snapshot_with_escalation scroll-after-escalation behavior."""
+
+    @pytest.mark.asyncio
+    async def test_scroll_after_escalation_disabled_no_scroll(self) -> None:
+        """When scroll_after_escalation is disabled, no scrolling should occur."""
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent
+
+        config = PlannerExecutorConfig(
+            snapshot=SnapshotEscalationConfig(
+                enabled=True,
+                scroll_after_escalation=False,  # Disabled
+            ),
+        )
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=config,
+        )
+
+        runtime = MockRuntime()
+        step = PlanStep(
+            id=1,
+            goal="Click Add to Cart",
+            action="CLICK",
+            intent="add_to_cart",
+            verify=[],
+        )
+
+        ctx = await agent._snapshot_with_escalation(
+            runtime,
+            goal=step.goal,
+            capture_screenshot=False,
+            step=step,
+        )
+
+        # No scrolling should have occurred
+        assert runtime.scroll_count == 0
+        assert ctx.snapshot is not None
+
+    @pytest.mark.asyncio
+    async def test_scroll_after_escalation_scrolls_when_element_not_found(self) -> None:
+        """When element not found after limit escalation, should scroll to find it."""
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        config = PlannerExecutorConfig(
+            snapshot=SnapshotEscalationConfig(
+                enabled=False,  # Disable limit escalation to test scroll directly
+                scroll_after_escalation=True,
+                scroll_max_attempts=2,
+                scroll_directions=("down",),
+            ),
+            verbose=True,  # Enable verbose to see debug output
+            stabilize_enabled=False,
+        )
+
+        # Must inject intent_heuristics for scroll-after-escalation to trigger
+        # (scroll only happens for CLICK actions with intent and heuristics)
+        mock_heuristics = MockIntentHeuristics()
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=config,
+            intent_heuristics=mock_heuristics,  # Required for scroll-after-escalation
+        )
+
+        # Initial snapshot has no "Add to Cart" button
+        # After 1 scroll, "Add to Cart" appears
+        initial_snap = MockSnapshot([MockElement(1, "button", "Submit")])
+        after_scroll_snap = MockSnapshot([
+            MockElement(1, "button", "Submit"),
+            MockElement(2, "button", "Add to Cart"),
+        ])
+
+        runtime = MockRuntime(snapshots_by_scroll={0: initial_snap, 1: after_scroll_snap})
+
+        step = PlanStep(
+            id=1,
+            goal="Click Add to Cart button",
+            action="CLICK",
+            intent="add_to_cart",
+            verify=[],
+        )
+
+        # Mock _try_intent_heuristics to simulate finding element after scroll
+        call_count = 0
+
+        async def mock_try_heuristics(step: Any, elements: list, url: str) -> int | None:
+            nonlocal call_count
+            call_count += 1
+            # First call (before scroll): element not found
+            # Second call (after scroll): element found
+            if call_count == 1:
+                return None
+            return 2  # Found element 2 after scrolling
+
+        # Mock _format_context to avoid issues with snapshot formatting
+        def mock_format_context(snap: Any, goal: str) -> str:
+            return "mocked context"
+
+        with patch.object(agent, "_try_intent_heuristics", side_effect=mock_try_heuristics):
+            with patch.object(agent, "_format_context", side_effect=mock_format_context):
+                ctx = await agent._snapshot_with_escalation(
+                    runtime,
+                    goal=step.goal,
+                    capture_screenshot=False,
+                    step=step,
+                )
+
+        # Should have scrolled to find the element
+        assert runtime.scroll_count >= 1
+        assert "down" in runtime.scroll_directions
+
+    @pytest.mark.asyncio
+    async def test_scroll_tries_multiple_directions(self) -> None:
+        """Should try all configured directions when element not found."""
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        config = PlannerExecutorConfig(
+            snapshot=SnapshotEscalationConfig(
+                enabled=False,  # Disable limit escalation
+                scroll_after_escalation=True,
+                scroll_max_attempts=2,
+                scroll_directions=("down", "up"),
+            ),
+            verbose=True,  # Enable verbose to see debug output
+            stabilize_enabled=False,
+        )
+
+        # Must inject intent_heuristics for scroll-after-escalation to trigger
+        mock_heuristics = MockIntentHeuristics()
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=config,
+            intent_heuristics=mock_heuristics,  # Required for scroll-after-escalation
+        )
+
+        # Element never found - should try all directions
+        snap = MockSnapshot([MockElement(1, "button", "Submit")])
+        runtime = MockRuntime(snapshots_by_scroll={i: snap for i in range(10)})
+
+        step = PlanStep(
+            id=1,
+            goal="Click non-existent button",
+            action="CLICK",
+            intent="nonexistent",
+            verify=[],
+        )
+
+        # Mock _try_intent_heuristics to always return None (element never found)
+        async def mock_try_heuristics(step: Any, elements: list, url: str) -> int | None:
+            return None  # Element never found
+
+        # Mock _format_context to avoid issues with snapshot formatting
+        def mock_format_context(snap: Any, goal: str) -> str:
+            return "mocked context"
+
+        with patch.object(agent, "_try_intent_heuristics", side_effect=mock_try_heuristics):
+            with patch.object(agent, "_format_context", side_effect=mock_format_context):
+                ctx = await agent._snapshot_with_escalation(
+                    runtime,
+                    goal=step.goal,
+                    capture_screenshot=False,
+                    step=step,
+                )
+
+        # Should have tried both directions
+        assert "down" in runtime.scroll_directions
+        assert "up" in runtime.scroll_directions
+        # Max attempts per direction is 2, so total scrolls should be 4
+        assert runtime.scroll_count == 4
+
+    @pytest.mark.asyncio
+    async def test_no_scroll_when_step_is_none(self) -> None:
+        """When step is None, scroll-after-escalation should not trigger."""
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent
+
+        config = PlannerExecutorConfig(
+            snapshot=SnapshotEscalationConfig(
+                enabled=False,
+                scroll_after_escalation=True,
+            ),
+        )
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=config,
+        )
+
+        runtime = MockRuntime()
+
+        ctx = await agent._snapshot_with_escalation(
+            runtime,
+            goal="Some goal",
+            capture_screenshot=False,
+            step=None,  # No step provided
+        )
+
+        # No scrolling should occur without a step
+        assert runtime.scroll_count == 0
+
+    @pytest.mark.asyncio
+    async def test_no_scroll_for_type_and_submit_actions(self) -> None:
+        """Scroll-after-escalation should NOT trigger for TYPE_AND_SUBMIT actions."""
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent
+
+        config = PlannerExecutorConfig(
+            snapshot=SnapshotEscalationConfig(
+                enabled=False,
+                scroll_after_escalation=True,  # Enabled, but should not trigger
+            ),
+        )
+
+        # Even with intent_heuristics, TYPE_AND_SUBMIT should not trigger scroll
+        mock_heuristics = MockIntentHeuristics()
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=config,
+            intent_heuristics=mock_heuristics,
+        )
+
+        runtime = MockRuntime()
+
+        step = PlanStep(
+            id=1,
+            goal="Search for Logitech mouse",
+            action="TYPE_AND_SUBMIT",  # Not a CLICK action
+            intent="search",
+            input="Logitech mouse",
+            verify=[],
+        )
+
+        ctx = await agent._snapshot_with_escalation(
+            runtime,
+            goal=step.goal,
+            capture_screenshot=False,
+            step=step,
+        )
+
+        # No scrolling should occur for TYPE_AND_SUBMIT
+        assert runtime.scroll_count == 0
+
+    @pytest.mark.asyncio
+    async def test_no_scroll_without_intent_heuristics(self) -> None:
+        """Scroll-after-escalation should NOT trigger without intent_heuristics."""
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent
+
+        config = PlannerExecutorConfig(
+            snapshot=SnapshotEscalationConfig(
+                enabled=False,
+                scroll_after_escalation=True,  # Enabled, but should not trigger
+            ),
+        )
+
+        # No intent_heuristics injected
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=config,
+            # intent_heuristics=None  # Not provided
+        )
+
+        runtime = MockRuntime()
+
+        step = PlanStep(
+            id=1,
+            goal="Click Add to Cart",
+            action="CLICK",
+            intent="add_to_cart",
+            verify=[],
+        )
+
+        ctx = await agent._snapshot_with_escalation(
+            runtime,
+            goal=step.goal,
+            capture_screenshot=False,
+            step=step,
+        )
+
+        # No scrolling should occur without intent_heuristics
+        assert runtime.scroll_count == 0

@@ -40,6 +40,7 @@ from .heuristic_spec import COMMON_HINTS, HeuristicHint, get_common_hint
 from .planner_executor_agent import (
     ExecutorOverride,
     IntentHeuristics,
+    ModalDismissalConfig,
     Plan,
     PlanStep,
     PlannerExecutorAgent,
@@ -77,6 +78,7 @@ __all__ = [
     # Planner + Executor Agent
     "ExecutorOverride",
     "IntentHeuristics",
+    "ModalDismissalConfig",
     "Plan",
     "PlanStep",
     "PlannerExecutorAgent",

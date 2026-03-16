@@ -4,10 +4,12 @@ PlannerExecutorAgent example with custom configuration.
 
 This example demonstrates various configuration options:
 - Snapshot escalation (enable/disable, custom step sizes)
+- Scroll-after-escalation (find elements outside viewport)
 - Retry configuration (timeouts, max attempts)
 - Vision fallback settings
 - Pre-step verification (skip if predicates pass)
 - Recovery navigation (track last good URL)
+- Modal dismissal (auto-dismiss overlays, custom patterns for i18n)
 
 Usage:
     export OPENAI_API_KEY="sk-..."
@@ -22,6 +24,7 @@ import os
 from predicate import AsyncPredicateBrowser
 from predicate.agent_runtime import AgentRuntime
 from predicate.agents import (
+    ModalDismissalConfig,
     PlannerExecutorAgent,
     PlannerExecutorConfig,
     RecoveryNavigationConfig,
@@ -34,9 +37,10 @@ from predicate.llm_provider import OpenAIProvider
 
 
 async def example_default_config() -> None:
-    """Default configuration: escalation enabled, step=30."""
+    """Default configuration: escalation enabled, step=30, scroll enabled."""
     print("\n--- Example 1: Default Config ---")
     print("Escalation: 60 -> 90 -> 120 -> 150 -> 180 -> 200")
+    print("Scroll-after-escalation: down (x3), up (x3)")
 
     config = PlannerExecutorConfig()
 
@@ -44,6 +48,9 @@ async def example_default_config() -> None:
     print(f"  snapshot.limit_base: {config.snapshot.limit_base}")
     print(f"  snapshot.limit_step: {config.snapshot.limit_step}")
     print(f"  snapshot.limit_max: {config.snapshot.limit_max}")
+    print(f"  snapshot.scroll_after_escalation: {config.snapshot.scroll_after_escalation}")
+    print(f"  snapshot.scroll_max_attempts: {config.snapshot.scroll_max_attempts}")
+    print(f"  snapshot.scroll_directions: {config.snapshot.scroll_directions}")
 
 
 async def example_disabled_escalation() -> None:
@@ -89,6 +96,43 @@ async def example_custom_limits() -> None:
     print(f"  snapshot.limit_base: {config.snapshot.limit_base}")
     print(f"  snapshot.limit_step: {config.snapshot.limit_step}")
     print(f"  snapshot.limit_max: {config.snapshot.limit_max}")
+
+
+async def example_scroll_after_escalation() -> None:
+    """Scroll-after-escalation configuration."""
+    print("\n--- Example 4b: Scroll-after-Escalation ---")
+    print("After exhausting limit escalation, scroll to find elements outside viewport")
+
+    # Default: scroll down first, then up
+    config_default = PlannerExecutorConfig()
+    print(f"  Default scroll_directions: {config_default.snapshot.scroll_directions}")
+
+    # Disable scroll-after-escalation (only use limit escalation)
+    config_no_scroll = PlannerExecutorConfig(
+        snapshot=SnapshotEscalationConfig(
+            scroll_after_escalation=False,
+        ),
+    )
+    print(f"  Disabled: scroll_after_escalation={config_no_scroll.snapshot.scroll_after_escalation}")
+
+    # Custom: more scroll attempts, down only (useful for infinite scroll pages)
+    config_down_only = PlannerExecutorConfig(
+        snapshot=SnapshotEscalationConfig(
+            scroll_after_escalation=True,
+            scroll_max_attempts=5,       # More scrolls
+            scroll_directions=("down",), # Only scroll down
+        ),
+    )
+    print(f"  Down-only: scroll_directions={config_down_only.snapshot.scroll_directions}")
+    print(f"  Down-only: scroll_max_attempts={config_down_only.snapshot.scroll_max_attempts}")
+
+    # Custom: try up first (e.g., for elements at top of page)
+    config_up_first = PlannerExecutorConfig(
+        snapshot=SnapshotEscalationConfig(
+            scroll_directions=("up", "down"),  # Try up before down
+        ),
+    )
+    print(f"  Up-first: scroll_directions={config_up_first.snapshot.scroll_directions}")
 
 
 async def example_retry_config() -> None:
@@ -163,17 +207,123 @@ async def example_recovery_navigation() -> None:
     print("  Tracks last_known_good_url for recovery when agent gets off-track")
 
 
+async def example_modal_dismissal() -> None:
+    """Modal dismissal configuration for auto-dismissing overlays."""
+    print("\n--- Example 9: Modal Dismissal ---")
+    print("Auto-dismiss blocking modals, drawers, and popups")
+
+    # Default: enabled with common English patterns
+    config_default = PlannerExecutorConfig()
+    print(f"  Default enabled: {config_default.modal.enabled}")
+    print(f"  Default patterns: {config_default.modal.dismiss_patterns[:5]}...")
+
+    # Disable modal dismissal
+    config_disabled = PlannerExecutorConfig(
+        modal=ModalDismissalConfig(enabled=False),
+    )
+    print(f"  Disabled: modal.enabled={config_disabled.modal.enabled}")
+
+    # Custom patterns for German sites
+    config_german = PlannerExecutorConfig(
+        modal=ModalDismissalConfig(
+            dismiss_patterns=(
+                "nein danke",       # No thanks
+                "nicht jetzt",      # Not now
+                "abbrechen",        # Cancel
+                "schließen",        # Close
+                "überspringen",     # Skip
+                "später",           # Later
+                "ablehnen",         # Decline
+                "weiter",           # Continue
+            ),
+            dismiss_icons=("x", "×", "✕"),  # Icons are universal
+        ),
+    )
+    print(f"  German patterns: {config_german.modal.dismiss_patterns[:4]}...")
+
+    # Custom patterns for Spanish sites
+    config_spanish = PlannerExecutorConfig(
+        modal=ModalDismissalConfig(
+            dismiss_patterns=(
+                "no gracias",       # No thanks
+                "ahora no",         # Not now
+                "cancelar",         # Cancel
+                "cerrar",           # Close
+                "omitir",           # Skip
+                "más tarde",        # Later
+                "rechazar",         # Reject
+                "continuar",        # Continue
+            ),
+        ),
+    )
+    print(f"  Spanish patterns: {config_spanish.modal.dismiss_patterns[:4]}...")
+
+    # Custom patterns for French sites
+    config_french = PlannerExecutorConfig(
+        modal=ModalDismissalConfig(
+            dismiss_patterns=(
+                "non merci",        # No thanks
+                "pas maintenant",   # Not now
+                "annuler",          # Cancel
+                "fermer",           # Close
+                "passer",           # Skip
+                "plus tard",        # Later
+                "refuser",          # Refuse
+                "continuer",        # Continue
+            ),
+        ),
+    )
+    print(f"  French patterns: {config_french.modal.dismiss_patterns[:4]}...")
+
+    # Custom patterns for Japanese sites
+    config_japanese = PlannerExecutorConfig(
+        modal=ModalDismissalConfig(
+            dismiss_patterns=(
+                "いいえ",           # No
+                "後で",             # Later
+                "閉じる",           # Close
+                "キャンセル",       # Cancel
+                "スキップ",         # Skip
+                "続ける",           # Continue
+                "結構です",         # No thank you
+            ),
+        ),
+    )
+    print(f"  Japanese patterns: {config_japanese.modal.dismiss_patterns[:4]}...")
+
+    # Combined multilingual config
+    config_multilingual = PlannerExecutorConfig(
+        modal=ModalDismissalConfig(
+            dismiss_patterns=(
+                # English
+                "no thanks", "not now", "close", "skip", "cancel",
+                # German
+                "nein danke", "schließen", "abbrechen",
+                # Spanish
+                "no gracias", "cerrar", "cancelar",
+                # French
+                "non merci", "fermer", "annuler",
+            ),
+        ),
+    )
+    print(f"  Multilingual: {len(config_multilingual.modal.dismiss_patterns)} patterns")
+
+
 async def example_full_custom() -> None:
     """Full custom configuration with all options."""
-    print("\n--- Example 9: Full Custom Config ---")
+    print("\n--- Example 10: Full Custom Config ---")
 
     config = PlannerExecutorConfig(
-        # Snapshot escalation
+        # Snapshot escalation with scroll-after-escalation
         snapshot=SnapshotEscalationConfig(
             enabled=True,
             limit_base=80,
             limit_step=40,
             limit_max=240,
+            # Scroll to find elements outside viewport
+            scroll_after_escalation=True,
+            scroll_max_attempts=3,
+            scroll_directions=("down", "up"),
         ),
         # Retry settings
         retry=RetryConfig(
@@ -192,6 +342,11 @@ async def example_full_custom() -> None:
             enabled=True,
             max_recovery_attempts=2,
         ),
+        # Modal dismissal (auto-dismiss blocking overlays)
+        modal=ModalDismissalConfig(
+            enabled=True,
+            max_attempts=2,
+        ),
         # Pre-step verification
         pre_step_verification=True,
         # Planner settings
@@ -208,15 +363,17 @@ async def example_full_custom() -> None:
 
     print("  Full config created successfully!")
     print(f"  Escalation: {config.snapshot.limit_base} -> ... -> {config.snapshot.limit_max}")
+    print(f"  Scroll-after-escalation: {config.snapshot.scroll_after_escalation}")
     print(f"  Max replans: {config.retry.max_replans}")
     print(f"  Vision enabled: {config.vision.enabled}")
     print(f"  Pre-step verification: {config.pre_step_verification}")
     print(f"  Recovery enabled: {config.recovery.enabled}")
+    print(f"  Modal dismissal: {config.modal.enabled}")
 
 
 async def example_run_with_config() -> None:
     """Run agent with custom config."""
-    print("\n--- Example 10: Run Agent with Custom Config ---")
+    print("\n--- Example 11: Run Agent with Custom Config ---")
 
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
@@ -275,10 +432,12 @@ async def main() -> None:
     await example_disabled_escalation()
     await example_custom_step_size()
     await example_custom_limits()
+    await example_scroll_after_escalation()
     await example_retry_config()
     await example_vision_fallback()
     await example_pre_step_verification()
     await example_recovery_navigation()
+    await example_modal_dismissal()
     await example_full_custom()
     await example_run_with_config()
 

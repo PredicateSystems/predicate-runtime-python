@@ -326,6 +326,124 @@ class AgentRuntime:
         self._cached_url = url
         return url
 
+    # -------------------------------------------------------------------------
+    # Action methods for PlannerExecutorAgent compatibility
+    # -------------------------------------------------------------------------
+
+    async def click(self, element_id: int) -> None:
+        """
+        Click an element by its snapshot ID.
+
+        Args:
+            element_id: Element ID from snapshot
+        """
+        from .actions import click_async
+
+        # Get element bounds from last snapshot
+        if self.last_snapshot is None:
+            raise RuntimeError("No snapshot available. Call snapshot() first.")
+
+        element = None
+        for el in self.last_snapshot.elements or []:
+            if getattr(el, "id", None) == element_id:
+                element = el
+                break
+
+        if element is None:
+            raise ValueError(f"Element {element_id} not found in snapshot")
+
+        # Use the backend page for clicking
+        page = getattr(self.backend, "page", None) or getattr(self.backend, "_page", None)
+        if page is None:
+            raise RuntimeError("No page available in backend")
+
+        # Get element center coordinates (Element model uses 'bbox' not 'bounds')
+        bbox = getattr(element, "bbox", None)
+        if bbox:
+            x = bbox.x + bbox.width / 2
+            y = bbox.y + bbox.height / 2
+            await self.backend.mouse_click(x=x, y=y, button="left", click_count=1)
+        else:
+            # Fall back to evaluating click via page
+            # Note: click_async expects AsyncSentienceBrowser, not page
+            await page.evaluate(f"window.sentience?.clickElement({element_id})")
+
+        await self.record_action(f"CLICK({element_id})")
+
+    async def type(self, element_id: int, text: str) -> None:
+        """
+        Type text into an element.
+
+        Args:
+            element_id: Element ID from snapshot
+            text: Text to type
+        """
+        # First click to focus
+        await self.click(element_id)
+
+        # Then type
+        await self.backend.type_text(text)
+        await self.record_action(f"TYPE({element_id}, '{text[:20]}...')" if len(text) > 20 else f"TYPE({element_id}, '{text}')")
+
+    async def press(self, key: str) -> None:
+        """
+        Press a keyboard key.
+
+        Args:
+            key: Key to press (e.g., "Enter", "Tab", "Escape")
+        """
+        page = getattr(self.backend, "page", None) or getattr(self.backend, "_page", None)
+        if page is None:
+            raise RuntimeError("No page available in backend")
+
+        await page.keyboard.press(key)
+        await self.record_action(f"PRESS({key})")
+
+    async def goto(self, url: str) -> None:
+        """
+        Navigate to a URL.
+
+        Args:
+            url: URL to navigate to
+        """
+        page = getattr(self.backend, "page", None) or getattr(self.backend, "_page", None)
+        if page is None:
+            raise RuntimeError("No page available in backend")
+
+        await page.goto(url)
+        await page.wait_for_load_state("domcontentloaded")
+        self._cached_url = url
+        await self.record_action(f"NAVIGATE({url})")
+
+    async def scroll(self, direction: str = "down", amount: int = 500) -> None:
+        """
+        Scroll the page.
+
+        Args:
+            direction: "up" or "down"
+            amount: Pixels to scroll
+        """
+        dy = amount if direction == "down" else -amount
+        await self.backend.wheel(delta_y=float(dy))
+        await self.record_action(f"SCROLL({direction})")
+
+    async def stabilize(self, timeout_s: float = 5.0, poll_s: float = 0.5) -> None:
+        """
+        Wait for page to stabilize (network idle, no pending animations).
+
+        Args:
+            timeout_s: Maximum wait time
+            poll_s: Poll interval
+        """
+        page = getattr(self.backend, "page", None) or getattr(self.backend, "_page", None)
+        if page is None:
+            return
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=int(timeout_s * 1000))
+        except Exception:
+            pass  # Best effort
+
     async def snapshot(self, emit_trace: bool = True, **kwargs: Any) -> Snapshot:
         """
         Take a snapshot of the current page state.
