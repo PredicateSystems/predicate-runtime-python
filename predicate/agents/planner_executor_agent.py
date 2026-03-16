@@ -345,6 +345,130 @@ class ModalDismissalConfig:
 
 
 @dataclass(frozen=True)
+class CheckoutDetectionConfig:
+    """
+    Configuration for checkout page detection.
+
+    After modal dismissal or action completion, the agent checks if the
+    current page is a checkout-relevant page. If detected, this triggers
+    a replan to continue the checkout flow.
+
+    This handles scenarios where:
+    - Agent clicks "Add to Cart" and modal is dismissed, but agent stops
+    - Agent lands on cart page but plan doesn't include checkout steps
+    - Agent reaches login page during checkout flow
+
+    Attributes:
+        enabled: If True, detect checkout pages and trigger continuation.
+        url_patterns: URL patterns that indicate checkout-relevant pages.
+        element_patterns: Element text patterns that indicate checkout pages.
+        trigger_replan: If True, trigger replanning when checkout page detected.
+
+    Example:
+        # Default: enabled with common checkout patterns
+        config = CheckoutDetectionConfig()
+
+        # Disable checkout detection
+        config = CheckoutDetectionConfig(enabled=False)
+
+        # Custom patterns
+        config = CheckoutDetectionConfig(
+            url_patterns=("/warenkorb", "/kasse"),  # German
+        )
+    """
+
+    enabled: bool = True
+    # URL patterns that indicate checkout-relevant pages
+    url_patterns: tuple[str, ...] = (
+        # Cart pages
+        "/cart",
+        "/basket",
+        "/bag",
+        "/shopping-cart",
+        "/gp/cart",  # Amazon
+        # Checkout pages
+        "/checkout",
+        "/buy",
+        "/order",
+        "/payment",
+        "/pay",
+        "/purchase",
+        "/gp/buy",  # Amazon
+        "/gp/checkout",  # Amazon
+        # Sign-in during checkout
+        "/signin",
+        "/sign-in",
+        "/login",
+        "/ap/signin",  # Amazon
+        "/auth",
+        "/authenticate",
+    )
+    # Element text patterns that indicate checkout pages (case-insensitive)
+    element_patterns: tuple[str, ...] = (
+        "proceed to checkout",
+        "proceed to buy",
+        "go to checkout",
+        "view cart",
+        "shopping cart",
+        "your cart",
+        "sign in to checkout",
+        "continue to payment",
+        "place your order",
+        "buy now",
+        "checkout",
+    )
+    # If True, trigger replanning when checkout page is detected
+    trigger_replan: bool = True
+
+
+@dataclass(frozen=True)
+class AuthBoundaryConfig:
+    """
+    Configuration for authentication boundary detection.
+
+    When the agent reaches a login/sign-in page and doesn't have credentials,
+    it should stop gracefully instead of failing or spinning endlessly.
+
+    This is a "terminal state" - the agent has successfully navigated as far
+    as possible without authentication.
+
+    Attributes:
+        enabled: If True, detect auth boundaries and stop gracefully.
+        url_patterns: URL patterns indicating authentication pages.
+        stop_on_auth: If True, mark run as successful when auth boundary reached.
+        auth_success_message: Message to include in outcome when stopping at auth.
+
+    Example:
+        # Default: enabled, stop gracefully at login pages
+        config = AuthBoundaryConfig()
+
+        # Disable (try to continue past auth pages)
+        config = AuthBoundaryConfig(enabled=False)
+    """
+
+    enabled: bool = True
+    # URL patterns that indicate authentication/login pages
+    url_patterns: tuple[str, ...] = (
+        "/signin",
+        "/sign-in",
+        "/login",
+        "/log-in",
+        "/auth",
+        "/authenticate",
+        "/ap/signin",  # Amazon
+        "/ap/register",  # Amazon
+        "/account/login",
+        "/accounts/login",
+        "/user/login",
+    )
+    # If True, mark the run as successful when auth boundary is reached
+    # (since the agent did everything it could without credentials)
+    stop_on_auth: bool = True
+    # Message to include when stopping at auth boundary
+    auth_success_message: str = "Reached authentication boundary (login required)"
+
+
+@dataclass(frozen=True)
 class PlannerExecutorConfig:
     """
     High-level configuration for PlannerExecutorAgent.
@@ -381,6 +505,12 @@ class PlannerExecutorConfig:
 
     # Modal dismissal (for blocking overlays after DOM changes)
     modal: ModalDismissalConfig = ModalDismissalConfig()
+
+    # Checkout page detection (continue workflow when reaching checkout pages)
+    checkout: CheckoutDetectionConfig = CheckoutDetectionConfig()
+
+    # Authentication boundary detection (stop gracefully at login pages)
+    auth_boundary: AuthBoundaryConfig = AuthBoundaryConfig()
 
     # Planner LLM settings
     planner_max_tokens: int = 2048
@@ -643,6 +773,52 @@ def build_predicate(spec: PredicateSpec | dict[str, Any]) -> Predicate:
 # ---------------------------------------------------------------------------
 
 
+def _parse_string_predicate(pred_str: str) -> dict[str, Any] | None:
+    """
+    Parse a string predicate into a normalized dict.
+
+    LLMs sometimes output predicates as strings like:
+    - "url_contains('amazon.com')" -> {"predicate": "url_contains", "args": ["amazon.com"]}
+    - "url_matches(^https://www\\.amazon\\.com/.*)" -> {"predicate": "url_matches", "args": ["^https://www\\.amazon\\.com/.*"]}
+    - "exists(role=button)" -> {"predicate": "exists", "args": ["role=button"]}
+
+    Args:
+        pred_str: String representation of a predicate
+
+    Returns:
+        Normalized predicate dict or None if parsing fails
+    """
+    import re
+
+    pred_str = pred_str.strip()
+
+    # Try to match function-call style: predicate_name(args)
+    match = re.match(r'^(\w+)\s*\(\s*(.+?)\s*\)$', pred_str, re.DOTALL)
+    if match:
+        pred_name = match.group(1)
+        args_str = match.group(2)
+
+        # Strip quotes from args if present
+        args_str = args_str.strip()
+        if (args_str.startswith("'") and args_str.endswith("'")) or \
+           (args_str.startswith('"') and args_str.endswith('"')):
+            args_str = args_str[1:-1]
+
+        return {
+            "predicate": pred_name,
+            "args": [args_str],
+        }
+
+    # Try simple predicate name without args
+    if re.match(r'^[\w_]+$', pred_str):
+        return {
+            "predicate": pred_str,
+            "args": [],
+        }
+
+    return None
+
+
 def _normalize_verify_predicate(pred: dict[str, Any]) -> dict[str, Any]:
     """
     Normalize a verify predicate to the expected format.
@@ -651,6 +827,7 @@ def _normalize_verify_predicate(pred: dict[str, Any]) -> dict[str, Any]:
     - {"url_contains": "amazon.com"} -> {"predicate": "url_contains", "args": ["amazon.com"]}
     - {"exists": "text~'Logitech'"} -> {"predicate": "exists", "args": ["text~'Logitech'"]}
     - {"predicate": "url_contains", "input": "x"} -> {"predicate": "url_contains", "args": ["x"]}
+    - {"type": "url_contains", "input": "x"} -> {"predicate": "url_contains", "args": ["x"]}
 
     Args:
         pred: Raw predicate dictionary
@@ -658,6 +835,10 @@ def _normalize_verify_predicate(pred: dict[str, Any]) -> dict[str, Any]:
     Returns:
         Normalized predicate with "predicate" and "args" fields
     """
+    # Handle "type" field as alternative to "predicate" (common LLM variation)
+    if "type" in pred and "predicate" not in pred:
+        pred["predicate"] = pred.pop("type")
+
     # Already has predicate field - normalize args
     if "predicate" in pred:
         # Handle "input" field as alternative to "args"
@@ -666,6 +847,12 @@ def _normalize_verify_predicate(pred: dict[str, Any]) -> dict[str, Any]:
                 pred["args"] = [pred.pop("input")]
             elif "value" in pred:
                 pred["args"] = [pred.pop("value")]
+            elif "pattern" in pred:  # For url_matches
+                pred["args"] = [pred.pop("pattern")]
+            elif "substring" in pred:  # For url_contains
+                pred["args"] = [pred.pop("substring")]
+            elif "selector" in pred:  # For exists/not_exists
+                pred["args"] = [pred.pop("selector")]
         return pred
 
     # Predicate type is a key in the dict (e.g., {"url_contains": "amazon.com"})
@@ -739,10 +926,21 @@ def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
 
             # Normalize verify predicates
             if "verify" in step and isinstance(step["verify"], list):
-                step["verify"] = [
-                    _normalize_verify_predicate(pred) if isinstance(pred, dict) else pred
-                    for pred in step["verify"]
-                ]
+                normalized_verify = []
+                for pred in step["verify"]:
+                    if isinstance(pred, dict):
+                        normalized_verify.append(_normalize_verify_predicate(pred))
+                    elif isinstance(pred, str):
+                        # Try to parse string predicates like "url_contains('text')"
+                        parsed = _parse_string_predicate(pred)
+                        if parsed:
+                            normalized_verify.append(parsed)
+                        else:
+                            # Keep as-is, let validation fail with clear error
+                            normalized_verify.append({"predicate": "unknown", "args": [pred]})
+                    else:
+                        normalized_verify.append(pred)
+                step["verify"] = normalized_verify
 
             # Normalize optional_substeps recursively
             if "optional_substeps" in step:
@@ -753,10 +951,19 @@ def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
                         substep["target"] = substep.pop("url")
                     # Normalize verify in substeps too
                     if "verify" in substep and isinstance(substep["verify"], list):
-                        substep["verify"] = [
-                            _normalize_verify_predicate(pred) if isinstance(pred, dict) else pred
-                            for pred in substep["verify"]
-                        ]
+                        normalized_verify = []
+                        for pred in substep["verify"]:
+                            if isinstance(pred, dict):
+                                normalized_verify.append(_normalize_verify_predicate(pred))
+                            elif isinstance(pred, str):
+                                parsed = _parse_string_predicate(pred)
+                                if parsed:
+                                    normalized_verify.append(parsed)
+                                else:
+                                    normalized_verify.append({"predicate": "unknown", "args": [pred]})
+                            else:
+                                normalized_verify.append(pred)
+                        substep["verify"] = normalized_verify
 
     return plan_dict
 
@@ -839,31 +1046,97 @@ def build_planner_prompt(
     strict_note = "\nReturn ONLY a JSON object. No explanations, no code fences.\n" if strict else ""
     schema_note = f"\nSchema errors from last attempt:\n{schema_errors}\n" if schema_errors else ""
 
+    # Detect task type for domain-specific guidance
+    task_lower = task.lower()
+    is_ecommerce_task = any(keyword in task_lower for keyword in [
+        "buy", "purchase", "add to cart", "checkout", "order", "shop",
+        "amazon", "ebay", "walmart", "target", "bestbuy",
+        "cart", "mouse", "keyboard", "laptop", "product",
+    ])
+    is_search_task = any(keyword in task_lower for keyword in [
+        "search", "find", "look for", "look up", "google",
+    ])
+
+    # Build domain-specific planning guidance
+    domain_guidance = ""
+    if is_ecommerce_task:
+        domain_guidance = """
+
+IMPORTANT: E-Commerce Task Planning Rules
+=========================================
+For shopping/purchase tasks, include ALL necessary steps in order:
+1. NAVIGATE to the site (if not already there)
+2. TYPE_AND_SUBMIT search query in search box
+3. CLICK on specific product from results (not filters or categories)
+4. CLICK "Add to Cart" button on product page
+5. CLICK "Proceed to Checkout" or cart icon
+6. Handle login/signup if required (may need CLICK + TYPE_AND_SUBMIT)
+7. CLICK through checkout process
+
+Common mistakes to AVOID:
+- Do NOT skip "Add to Cart" step - clicking a product link is NOT adding to cart
+- Do NOT combine multiple distinct actions into one step
+- Do NOT confuse filter/category clicks with product selection
+- Each distinct user action should be its own step
+
+Intent hints are critical - use clear hints like:
+- intent: "Click Add to Cart button"
+- intent: "Click Proceed to Checkout"
+- intent: "Click on product title or image"
+- intent: "Click sign in button"
+"""
+    elif is_search_task:
+        domain_guidance = """
+
+IMPORTANT: Search Task Planning Rules
+=====================================
+For search tasks, include steps to:
+1. NAVIGATE to the search site (if not already there)
+2. TYPE_AND_SUBMIT the search query
+3. Wait for/verify search results
+4. If selecting a result: CLICK on specific result item
+"""
+
     system = f"""You are the PLANNER. Output a JSON execution plan for the web automation task.
 {strict_note}
-Your output must be a valid JSON object with:
-- task: string (the task description)
-- notes: list of strings (assumptions, constraints)
-- steps: list of step objects
+Your output must be a valid JSON object with this EXACT structure:
 
-Each step must have:
-- id: int (1-indexed, contiguous)
-- goal: string (human-readable goal)
-- action: string (NAVIGATE, CLICK, TYPE_AND_SUBMIT, or SCROLL)
-- verify: list of predicate specs
+{{
+  "task": "description of task",
+  "notes": ["assumption 1", "assumption 2"],
+  "steps": [
+    {{
+      "id": 1,
+      "goal": "Navigate to website",
+      "action": "NAVIGATE",
+      "target": "https://example.com",
+      "verify": [{{"predicate": "url_contains", "args": ["example.com"]}}]
+    }},
+    {{
+      "id": 2,
+      "goal": "Search for product",
+      "action": "TYPE_AND_SUBMIT",
+      "input": "search query",
+      "verify": [{{"predicate": "url_contains", "args": ["search"]}}]
+    }},
+    {{
+      "id": 3,
+      "goal": "Click on result",
+      "action": "CLICK",
+      "intent": "Click on product title",
+      "verify": [{{"predicate": "url_contains", "args": ["/product/"]}}]
+    }}
+  ]
+}}
 
-Available predicates:
-- url_contains(substring): URL contains the given string
-- url_matches(pattern): URL matches regex pattern
-- exists(selector): Element matching selector exists
-- not_exists(selector): Element matching selector does not exist
-- element_count(selector, min, max): Element count within range
-- any_of(predicates...): Any predicate is true
-- all_of(predicates...): All predicates are true
+CRITICAL: Each verify predicate MUST be an object with "predicate" and "args" keys:
+- {{"predicate": "url_contains", "args": ["substring"]}}
+- {{"predicate": "exists", "args": ["role=button"]}}
+- {{"predicate": "not_exists", "args": ["text~'error'"]}}
 
-Selectors: role=button, role=link, text~'text', role=textbox, etc.
-
-Return ONLY valid JSON. No prose, no code fences."""
+DO NOT use string format like "url_contains('text')" - use object format only.
+{domain_guidance}
+Return ONLY valid JSON. No prose, no code fences, no markdown."""
 
     user = f"""Task: {task}
 {schema_note}
@@ -871,7 +1144,7 @@ Starting URL: {start_url or "browser's current page"}
 Site type: {site_type}
 Auth state: {auth_state}
 
-Output a JSON plan to accomplish this task."""
+Output a JSON plan to accomplish this task. Each step should represent ONE distinct action."""
 
     return system, user
 
@@ -2271,6 +2544,176 @@ Return JSON patch:
             print("  [MODAL] All dismissal attempts exhausted", flush=True)
         return False
 
+    async def _detect_checkout_page(
+        self,
+        runtime: AgentRuntime,
+        snapshot: Any | None = None,
+    ) -> tuple[bool, str | None]:
+        """
+        Detect if the current page is a checkout-relevant page.
+
+        This detects pages that indicate the agent should continue
+        the checkout flow, such as:
+        - Cart pages
+        - Checkout pages
+        - Sign-in pages during checkout
+
+        Args:
+            runtime: The AgentRuntime for browser control
+            snapshot: Optional snapshot to check (avoids re-capture)
+
+        Returns:
+            (is_checkout_page, page_type) - page_type is 'cart', 'checkout', 'login', etc.
+        """
+        if not self.config.checkout.enabled:
+            return False, None
+
+        cfg = self.config.checkout
+
+        # Get current URL
+        try:
+            current_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
+        except Exception:
+            current_url = None
+
+        if not current_url:
+            return False, None
+
+        url_lower = current_url.lower()
+
+        # Check URL patterns
+        for pattern in cfg.url_patterns:
+            if pattern.lower() in url_lower:
+                page_type = self._classify_checkout_page(pattern)
+                if self.config.verbose:
+                    print(f"  [CHECKOUT] Detected {page_type} page (URL: {pattern})", flush=True)
+                return True, page_type
+
+        # Check element patterns if we have a snapshot
+        if snapshot:
+            elements = getattr(snapshot, "elements", []) or []
+            for el in elements:
+                text = (getattr(el, "text", "") or "").lower()
+                for pattern in cfg.element_patterns:
+                    if pattern.lower() in text:
+                        page_type = self._classify_checkout_page(pattern)
+                        if self.config.verbose:
+                            print(f"  [CHECKOUT] Detected {page_type} page (element: '{pattern}')", flush=True)
+                        return True, page_type
+
+        return False, None
+
+    def _classify_checkout_page(self, pattern: str) -> str:
+        """Classify the type of checkout page based on the matched pattern."""
+        pattern_lower = pattern.lower()
+
+        if any(kw in pattern_lower for kw in ["cart", "basket", "bag"]):
+            return "cart"
+        elif any(kw in pattern_lower for kw in ["signin", "sign-in", "login", "auth"]):
+            return "login"
+        elif any(kw in pattern_lower for kw in ["payment", "pay"]):
+            return "payment"
+        elif any(kw in pattern_lower for kw in ["order", "place"]):
+            return "order"
+        else:
+            return "checkout"
+
+    def _should_continue_after_checkout_detection(
+        self,
+        page_type: str | None,
+        current_step_index: int,
+        total_steps: int,
+    ) -> bool:
+        """
+        Determine if the agent should trigger a replan after detecting a checkout page.
+
+        Returns True if:
+        - We're on the last step or near the end
+        - The page type indicates we need more steps (e.g., login, payment)
+        """
+        if not page_type:
+            return False
+
+        # If we're on the last few steps and detected checkout, we may need to continue
+        steps_remaining = total_steps - current_step_index - 1
+
+        # Always continue if we hit a login page (authentication required)
+        if page_type == "login":
+            return True
+
+        # Continue if we're on cart/checkout and have no more steps
+        if page_type in ("cart", "checkout", "payment", "order") and steps_remaining <= 1:
+            return True
+
+        return False
+
+    def _build_checkout_continuation_task(
+        self,
+        original_task: str,
+        page_type: str | None,
+    ) -> str:
+        """
+        Build a task description for continuing from a checkout page.
+
+        Args:
+            original_task: The original task description
+            page_type: Type of checkout page detected
+
+        Returns:
+            A new task description that continues from the current page
+        """
+        if page_type == "login":
+            return f"Continue from sign-in page: Complete sign-in if credentials are available, or proceed as guest if possible. Original task: {original_task}"
+        elif page_type == "cart":
+            return f"Continue from cart page: Proceed to checkout to complete the purchase. Original task: {original_task}"
+        elif page_type == "payment":
+            return f"Continue from payment page: Complete payment details and place order. Original task: {original_task}"
+        elif page_type == "order":
+            return f"Continue from order page: Review and place the order. Original task: {original_task}"
+        else:
+            return f"Continue checkout process from current page. Original task: {original_task}"
+
+    async def _detect_auth_boundary(
+        self,
+        runtime: AgentRuntime,
+    ) -> bool:
+        """
+        Detect if the current page is an authentication boundary.
+
+        An auth boundary is a login/sign-in page where the agent cannot
+        proceed without credentials. This is a terminal state.
+
+        Args:
+            runtime: The AgentRuntime for browser control
+
+        Returns:
+            True if on an authentication page, False otherwise
+        """
+        if not self.config.auth_boundary.enabled:
+            return False
+
+        cfg = self.config.auth_boundary
+
+        # Get current URL
+        try:
+            current_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
+        except Exception:
+            current_url = None
+
+        if not current_url:
+            return False
+
+        url_lower = current_url.lower()
+
+        # Check URL patterns
+        for pattern in cfg.url_patterns:
+            if pattern.lower() in url_lower:
+                if self.config.verbose:
+                    print(f"  [AUTH] Detected authentication boundary (URL: {pattern})", flush=True)
+                return True
+
+        return False
+
     async def _execute_step(
         self,
         step: PlanStep,
@@ -2814,6 +3257,32 @@ Return JSON patch:
 
                 # Handle failure
                 if outcome.status == StepStatus.FAILED and step.required:
+                    # Check if we've reached an authentication boundary
+                    # This is a graceful terminal state - agent did all it could
+                    if self.config.auth_boundary.enabled:
+                        is_auth_page = await self._detect_auth_boundary(runtime)
+                        if is_auth_page and self.config.auth_boundary.stop_on_auth:
+                            if self.config.verbose:
+                                print(f"  [AUTH] Stopping at authentication boundary", flush=True)
+                            # Mark as success since we reached the auth page successfully
+                            # The "failure" is just that we can't proceed without credentials
+                            error = None  # Clear any error
+                            # Update the outcome to indicate auth boundary
+                            outcome = StepOutcome(
+                                step_id=outcome.step_id,
+                                goal=outcome.goal,
+                                status=StepStatus.SUCCESS,  # Treat as success
+                                action_taken=outcome.action_taken,
+                                verification_passed=True,
+                                used_vision=outcome.used_vision,
+                                error=self.config.auth_boundary.auth_success_message,
+                                duration_ms=outcome.duration_ms,
+                                url_before=outcome.url_before,
+                                url_after=outcome.url_after,
+                            )
+                            step_outcomes[-1] = outcome  # Replace the failed outcome
+                            break  # Stop execution gracefully
+
                     # Try recovery first if available
                     if self._recovery_state and self._recovery_state.can_recover():
                         recovered = await self._attempt_recovery(runtime)
@@ -2847,6 +3316,37 @@ Return JSON patch:
                     break
 
                 step_index += 1
+
+                # Check for checkout page detection at end of plan
+                # This handles cases where modal dismissal leaves us on a checkout page
+                # but the plan has no more steps
+                if (
+                    self.config.checkout.enabled
+                    and self.config.checkout.trigger_replan
+                    and step_index >= len(plan.steps)  # Just finished last step
+                    and outcome.status in (StepStatus.SUCCESS, StepStatus.VISION_FALLBACK)
+                    and self._replans_used < self.config.retry.max_replans
+                ):
+                    # Check if we're on a checkout-relevant page
+                    is_checkout, page_type = await self._detect_checkout_page(runtime)
+                    if is_checkout and self._should_continue_after_checkout_detection(
+                        page_type, step_index - 1, len(plan.steps)
+                    ):
+                        if self.config.verbose:
+                            print(f"  [CHECKOUT] Triggering replan for {page_type} page", flush=True)
+                        try:
+                            # Replan with context about where we are
+                            continuation_task = self._build_checkout_continuation_task(
+                                task_description, page_type
+                            )
+                            plan = await self.plan(continuation_task, start_url=None)
+                            step_index = 0  # Start from beginning of new plan
+                            self._replans_used += 1
+                            continue
+                        except Exception as e:
+                            if self.config.verbose:
+                                print(f"  [CHECKOUT] Replan failed: {e}", flush=True)
+                            # Continue without replanning
 
                 # Clear step hints for next iteration
                 if self._composable_heuristics:

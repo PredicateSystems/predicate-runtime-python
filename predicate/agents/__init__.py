@@ -38,6 +38,8 @@ from .browser_agent import (
 from .composable_heuristics import ComposableHeuristics
 from .heuristic_spec import COMMON_HINTS, HeuristicHint, get_common_hint
 from .planner_executor_agent import (
+    AuthBoundaryConfig,
+    CheckoutDetectionConfig,
     ExecutorOverride,
     IntentHeuristics,
     ModalDismissalConfig,
@@ -76,6 +78,8 @@ __all__ = [
     "HeuristicHint",
     "get_common_hint",
     # Planner + Executor Agent
+    "AuthBoundaryConfig",
+    "CheckoutDetectionConfig",
     "ExecutorOverride",
     "IntentHeuristics",
     "ModalDismissalConfig",

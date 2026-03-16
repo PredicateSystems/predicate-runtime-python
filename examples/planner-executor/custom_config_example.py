@@ -24,6 +24,7 @@ import os
 from predicate import AsyncPredicateBrowser
 from predicate.agent_runtime import AgentRuntime
 from predicate.agents import (
+    CheckoutDetectionConfig,
     ModalDismissalConfig,
     PlannerExecutorAgent,
     PlannerExecutorConfig,
@@ -309,9 +310,55 @@ async def example_modal_dismissal() -> None:
     print(f"  Multilingual: {len(config_multilingual.modal.dismiss_patterns)} patterns")
 
 
+async def example_checkout_detection() -> None:
+    """Checkout page detection configuration."""
+    print("\n--- Example 10: Checkout Detection ---")
+    print("Auto-detect checkout pages and trigger continuation replanning")
+
+    # Default: enabled with common checkout patterns
+    config_default = PlannerExecutorConfig()
+    print(f"  Default enabled: {config_default.checkout.enabled}")
+    print(f"  Default URL patterns: {config_default.checkout.url_patterns[:5]}...")
+
+    # Disable checkout detection
+    config_disabled = PlannerExecutorConfig(
+        checkout=CheckoutDetectionConfig(enabled=False),
+    )
+    print(f"  Disabled: checkout.enabled={config_disabled.checkout.enabled}")
+
+    # Custom patterns for German e-commerce sites
+    config_german = PlannerExecutorConfig(
+        checkout=CheckoutDetectionConfig(
+            url_patterns=(
+                "/warenkorb",       # Cart
+                "/kasse",           # Checkout
+                "/zahlung",         # Payment
+                "/bestellung",      # Order
+                "/anmelden",        # Sign-in
+            ),
+            element_patterns=(
+                "zur kasse",        # To checkout
+                "warenkorb",        # Shopping cart
+                "jetzt kaufen",     # Buy now
+                "anmelden",         # Sign in
+            ),
+        ),
+    )
+    print(f"  German URL patterns: {config_german.checkout.url_patterns[:3]}...")
+
+    # Disable replan trigger (just detect, don't act)
+    config_detect_only = PlannerExecutorConfig(
+        checkout=CheckoutDetectionConfig(
+            enabled=True,
+            trigger_replan=False,  # Only detect, don't trigger continuation
+        ),
+    )
+    print(f"  Detect-only: trigger_replan={config_detect_only.checkout.trigger_replan}")
+
+
 async def example_full_custom() -> None:
     """Full custom configuration with all options."""
-    print("\n--- Example 10: Full Custom Config ---")
+    print("\n--- Example 11: Full Custom Config ---")
 
     config = PlannerExecutorConfig(
         # Snapshot escalation with scroll-after-escalation
@@ -347,6 +394,11 @@ async def example_full_custom() -> None:
             enabled=True,
             max_attempts=2,
         ),
+        # Checkout detection (continue workflow on checkout pages)
+        checkout=CheckoutDetectionConfig(
+            enabled=True,
+            trigger_replan=True,
+        ),
         # Pre-step verification
         pre_step_verification=True,
         # Planner settings
@@ -369,11 +421,12 @@ async def example_full_custom() -> None:
     print(f"  Pre-step verification: {config.pre_step_verification}")
     print(f"  Recovery enabled: {config.recovery.enabled}")
     print(f"  Modal dismissal: {config.modal.enabled}")
+    print(f"  Checkout detection: {config.checkout.enabled}")
 
 
 async def example_run_with_config() -> None:
     """Run agent with custom config."""
-    print("\n--- Example 11: Run Agent with Custom Config ---")
+    print("\n--- Example 12: Run Agent with Custom Config ---")
 
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
@@ -438,6 +491,7 @@ async def main() -> None:
     await example_pre_step_verification()
     await example_recovery_navigation()
     await example_modal_dismissal()
+    await example_checkout_detection()
     await example_full_custom()
     await example_run_with_config()
 
