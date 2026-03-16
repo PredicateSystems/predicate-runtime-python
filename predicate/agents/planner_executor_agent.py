@@ -218,6 +218,9 @@ class SnapshotEscalationConfig:
 
         # Enable scroll-after-escalation to find elements below/above viewport
         config = SnapshotEscalationConfig(scroll_after_escalation=True, scroll_directions=("down", "up"))
+
+        # Custom scroll amount as fraction of viewport height (default: 0.4 = 40%)
+        config = SnapshotEscalationConfig(scroll_viewport_fraction=0.5)  # 50% of viewport
     """
 
     enabled: bool = True
@@ -228,6 +231,7 @@ class SnapshotEscalationConfig:
     scroll_after_escalation: bool = True
     scroll_max_attempts: int = 3  # Max scrolls per direction
     scroll_directions: tuple[str, ...] = ("down", "up")  # Directions to try
+    scroll_viewport_fraction: float = 0.4  # Scroll by 40% of viewport height (adaptive to screen size)
 
 
 @dataclass(frozen=True)
@@ -455,8 +459,9 @@ class AuthBoundaryConfig:
         "/log-in",
         "/auth",
         "/authenticate",
-        "/ap/signin",  # Amazon
-        "/ap/register",  # Amazon
+        "/ap/signin",  # Amazon sign-in
+        "/ap/register",  # Amazon registration
+        "/ax/claim",  # Amazon CAPTCHA/verification
         "/account/login",
         "/accounts/login",
         "/user/login",
@@ -1866,6 +1871,9 @@ class PlannerExecutorAgent:
                     break
 
                 # Check element count - if sufficient, no need to escalate
+                # NOTE: Limit escalation is based on element COUNT only, not on whether
+                # a specific target element was found. Intent heuristics are only used
+                # for scroll-after-escalation AFTER limit escalation is exhausted.
                 elements = getattr(snap, "elements", []) or []
                 if len(elements) >= 10:
                     break
@@ -1909,15 +1917,35 @@ class PlannerExecutorAgent:
                 if self.config.verbose:
                     print(f"  [SNAPSHOT-ESCALATION] Target element not found, trying scroll-after-escalation...", flush=True)
 
+                # Get viewport height and calculate scroll delta
+                viewport_height = await runtime.get_viewport_height()
+                scroll_delta = viewport_height * cfg.scroll_viewport_fraction
+
                 for direction in cfg.scroll_directions:
+                    # Map direction to dy (pixels): down=positive, up=negative
+                    scroll_dy = scroll_delta if direction == "down" else -scroll_delta
+
                     for scroll_num in range(cfg.scroll_max_attempts):
                         if self.config.verbose:
                             print(f"  [SNAPSHOT-ESCALATION] Scrolling {direction} ({scroll_num + 1}/{cfg.scroll_max_attempts})...", flush=True)
 
-                        # Scroll
-                        await runtime.scroll(direction)
+                        # Scroll with deterministic verification
+                        # scroll_by() returns False if scroll had no effect (reached page boundary)
+                        scroll_effective = await runtime.scroll_by(
+                            dy=scroll_dy,
+                            verify=True,
+                            min_delta_px=50.0,
+                            js_fallback=True,
+                            required=False,  # Don't fail the task if scroll doesn't work
+                            timeout_s=5.0,
+                        )
 
-                        # Wait for stabilization
+                        if not scroll_effective:
+                            if self.config.verbose:
+                                print(f"  [SNAPSHOT-ESCALATION] Scroll {direction} had no effect (reached boundary), skipping remaining attempts", flush=True)
+                            break  # No point trying more scrolls in this direction
+
+                        # Wait for stabilization after successful scroll
                         if self.config.stabilize_enabled:
                             await asyncio.sleep(self.config.stabilize_poll_s)
 
@@ -2778,6 +2806,40 @@ Return JSON patch:
 
                     return outcome
 
+            # Pre-step auth boundary check: stop early if on signin page without credentials
+            # This prevents executing login steps that would fail or use fake credentials
+            if self.config.auth_boundary.enabled and self.config.auth_boundary.stop_on_auth:
+                is_auth_page = await self._detect_auth_boundary(runtime)
+                if is_auth_page:
+                    if self.config.verbose:
+                        print(f"  [AUTH] Auth boundary detected at step start - stopping gracefully", flush=True)
+
+                    outcome = StepOutcome(
+                        step_id=step.id,
+                        goal=step.goal,
+                        status=StepStatus.SUCCESS,  # Graceful stop = success
+                        action_taken="AUTH_BOUNDARY_REACHED",
+                        verification_passed=True,
+                        error=self.config.auth_boundary.auth_success_message,
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        url_before=pre_url,
+                        url_after=pre_url,
+                    )
+
+                    self._emit_step_end(
+                        step_id=step_id,
+                        step_index=step_index,
+                        step=step,
+                        outcome=outcome,
+                        pre_url=pre_url,
+                        post_url=pre_url,
+                        llm_response=None,
+                        snapshot_digest=None,
+                    )
+
+                    # Return special outcome that signals run completion
+                    return outcome
+
             # Wait for page to stabilize before snapshot
             if self.config.stabilize_enabled:
                 await runtime.stabilize()
@@ -3242,6 +3304,12 @@ Return JSON patch:
 
                 outcome = await self._execute_step(step, runtime, step_index)
                 step_outcomes.append(outcome)
+
+                # Check if auth boundary was reached at step start (graceful termination)
+                if outcome.action_taken == "AUTH_BOUNDARY_REACHED":
+                    if self.config.verbose:
+                        print(f"  [AUTH] Run completed at authentication boundary", flush=True)
+                    break  # Graceful termination - no error
 
                 # Record checkpoint on success (for recovery)
                 if outcome.status in (StepStatus.SUCCESS, StepStatus.VISION_FALLBACK):

@@ -326,6 +326,34 @@ class AgentRuntime:
         self._cached_url = url
         return url
 
+    async def get_viewport_height(self) -> int:
+        """
+        Get current viewport height in pixels.
+
+        Returns:
+            Viewport height in pixels, or 800 as fallback if unavailable
+        """
+        try:
+            # Try refresh_page_info first (PlaywrightBackend)
+            refresh_fn = getattr(self.backend, "refresh_page_info", None)
+            if callable(refresh_fn):
+                info = await refresh_fn()
+                height = getattr(info, "height", None)
+                if height and height > 0:
+                    return int(height)
+
+            # Try evaluating JavaScript directly
+            eval_fn = getattr(self.backend, "eval", None)
+            if callable(eval_fn):
+                height = await eval_fn("window.innerHeight")
+                if height and height > 0:
+                    return int(height)
+        except Exception:
+            pass
+
+        # Fallback to reasonable default
+        return 800
+
     # -------------------------------------------------------------------------
     # Action methods for PlannerExecutorAgent compatibility
     # -------------------------------------------------------------------------

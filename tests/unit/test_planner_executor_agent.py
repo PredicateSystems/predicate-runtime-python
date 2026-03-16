@@ -17,6 +17,7 @@ import pytest
 from typing import Any
 
 from predicate.agents.planner_executor_agent import (
+    AuthBoundaryConfig,
     ExecutorOverride,
     IntentHeuristics,
     ModalDismissalConfig,
@@ -687,6 +688,14 @@ class TestSnapshotEscalationConfig:
         assert config.scroll_max_attempts == 5
         assert config.scroll_directions == ("down",)
 
+    def test_scroll_viewport_fraction_default(self) -> None:
+        config = SnapshotEscalationConfig()
+        assert config.scroll_viewport_fraction == 0.4
+
+    def test_scroll_viewport_fraction_custom(self) -> None:
+        config = SnapshotEscalationConfig(scroll_viewport_fraction=0.5)
+        assert config.scroll_viewport_fraction == 0.5
+
     def test_scroll_directions_can_be_reordered(self) -> None:
         # Try up first, then down
         config = SnapshotEscalationConfig(
@@ -788,13 +797,26 @@ class MockSnapshot:
 
 
 class MockRuntime:
-    """Mock runtime for testing scroll-after-escalation."""
+    """Mock runtime for testing scroll-after-escalation and auth boundary."""
 
-    def __init__(self, snapshots_by_scroll: dict[int, MockSnapshot] | None = None):
+    def __init__(
+        self,
+        snapshots_by_scroll: dict[int, MockSnapshot] | None = None,
+        url: str = "https://example.com",
+    ):
         self.scroll_count = 0
         self.scroll_directions: list[str] = []
         self.snapshots_by_scroll = snapshots_by_scroll or {}
         self.default_snapshot = MockSnapshot([MockElement(1, "button", "Submit")])
+        self._url = url
+
+    async def get_url(self) -> str:
+        """Return the current URL for auth boundary detection."""
+        return self._url
+
+    async def get_viewport_height(self) -> int:
+        """Return mock viewport height."""
+        return 800  # Standard viewport height
 
     async def snapshot(
         self,
@@ -809,6 +831,23 @@ class MockRuntime:
     async def scroll(self, direction: str = "down") -> None:
         self.scroll_count += 1
         self.scroll_directions.append(direction)
+
+    async def scroll_by(
+        self,
+        dy: float,
+        *,
+        verify: bool = True,
+        min_delta_px: float = 50.0,
+        js_fallback: bool = True,
+        required: bool = True,
+        timeout_s: float = 10.0,
+        **kwargs: Any,
+    ) -> bool:
+        """Mock scroll_by with verification - always returns True (scroll effective)."""
+        direction = "down" if dy > 0 else "up"
+        self.scroll_count += 1
+        self.scroll_directions.append(direction)
+        return True  # Scroll always effective in tests
 
     async def stabilize(self) -> None:
         pass
@@ -1136,3 +1175,74 @@ class TestSnapshotWithEscalationScrollBehavior:
 
         # No scrolling should occur without intent_heuristics
         assert runtime.scroll_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Test AuthBoundaryConfig
+# ---------------------------------------------------------------------------
+
+
+class TestAuthBoundaryConfig:
+    """Tests for AuthBoundaryConfig."""
+
+    def test_default_values(self) -> None:
+        config = AuthBoundaryConfig()
+        assert config.enabled is True
+        assert config.stop_on_auth is True
+        assert "/signin" in config.url_patterns
+        assert "/ap/signin" in config.url_patterns
+        assert "/ax/claim" in config.url_patterns  # Amazon CAPTCHA
+
+    def test_default_url_patterns_include_common_patterns(self) -> None:
+        config = AuthBoundaryConfig()
+        expected_patterns = [
+            "/signin",
+            "/sign-in",
+            "/login",
+            "/log-in",
+            "/auth",
+            "/authenticate",
+            "/ap/signin",  # Amazon
+            "/ap/register",  # Amazon
+            "/ax/claim",  # Amazon CAPTCHA
+            "/account/login",
+            "/accounts/login",
+            "/user/login",
+        ]
+        for pattern in expected_patterns:
+            assert pattern in config.url_patterns, f"Missing pattern: {pattern}"
+
+    def test_can_be_disabled(self) -> None:
+        config = AuthBoundaryConfig(enabled=False)
+        assert config.enabled is False
+
+    def test_stop_on_auth_can_be_disabled(self) -> None:
+        config = AuthBoundaryConfig(stop_on_auth=False)
+        assert config.stop_on_auth is False
+
+    def test_custom_url_patterns(self) -> None:
+        config = AuthBoundaryConfig(
+            url_patterns=("/custom/login", "/my-signin"),
+        )
+        assert config.url_patterns == ("/custom/login", "/my-signin")
+
+    def test_custom_auth_success_message(self) -> None:
+        config = AuthBoundaryConfig(
+            auth_success_message="Custom: Login required",
+        )
+        assert config.auth_success_message == "Custom: Login required"
+
+    def test_planner_executor_config_has_auth_boundary(self) -> None:
+        config = PlannerExecutorConfig()
+        assert config.auth_boundary is not None
+        assert config.auth_boundary.enabled is True
+
+    def test_planner_executor_config_custom_auth_boundary(self) -> None:
+        config = PlannerExecutorConfig(
+            auth_boundary=AuthBoundaryConfig(
+                enabled=True,
+                url_patterns=("/custom-signin",),
+                stop_on_auth=True,
+            ),
+        )
+        assert config.auth_boundary.url_patterns == ("/custom-signin",)
