@@ -54,6 +54,97 @@ from .recovery import RecoveryCheckpoint, RecoveryState
 
 
 # ---------------------------------------------------------------------------
+# Token Usage Tracking
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TokenUsageTotals:
+    """Accumulated token counts for a single role or model."""
+
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def add(self, resp: LLMResponse) -> None:
+        """Add token counts from an LLM response."""
+        self.calls += 1
+        pt = resp.prompt_tokens if isinstance(resp.prompt_tokens, int) else 0
+        ct = resp.completion_tokens if isinstance(resp.completion_tokens, int) else 0
+        tt = resp.total_tokens if isinstance(resp.total_tokens, int) else (pt + ct)
+        self.prompt_tokens += max(0, int(pt))
+        self.completion_tokens += max(0, int(ct))
+        self.total_tokens += max(0, int(tt))
+
+
+class _TokenUsageCollector:
+    """Collects token usage statistics by role (planner/executor) and model."""
+
+    def __init__(self) -> None:
+        self._by_role: dict[str, TokenUsageTotals] = {}
+        self._by_model: dict[str, TokenUsageTotals] = {}
+
+    def record(self, *, role: str, resp: LLMResponse) -> None:
+        """Record token usage from an LLM response."""
+        self._by_role.setdefault(role, TokenUsageTotals()).add(resp)
+        m = str(resp.model_name or "").strip() or "unknown"
+        self._by_model.setdefault(m, TokenUsageTotals()).add(resp)
+
+    def reset(self) -> None:
+        """Clear all recorded statistics."""
+        self._by_role.clear()
+        self._by_model.clear()
+
+    def summary(self) -> dict[str, Any]:
+        """
+        Get a summary of all token usage.
+
+        Returns:
+            Dictionary with:
+            - total: aggregate counts across all calls
+            - by_role: breakdown by role (planner, executor, replan)
+            - by_model: breakdown by model name
+        """
+        def _sum(items: dict[str, TokenUsageTotals]) -> TokenUsageTotals:
+            out = TokenUsageTotals()
+            for t in items.values():
+                out.calls += t.calls
+                out.prompt_tokens += t.prompt_tokens
+                out.completion_tokens += t.completion_tokens
+                out.total_tokens += t.total_tokens
+            return out
+
+        total = _sum(self._by_role)
+        return {
+            "total": {
+                "calls": total.calls,
+                "prompt_tokens": total.prompt_tokens,
+                "completion_tokens": total.completion_tokens,
+                "total_tokens": total.total_tokens,
+            },
+            "by_role": {
+                k: {
+                    "calls": v.calls,
+                    "prompt_tokens": v.prompt_tokens,
+                    "completion_tokens": v.completion_tokens,
+                    "total_tokens": v.total_tokens,
+                }
+                for k, v in self._by_role.items()
+            },
+            "by_model": {
+                k: {
+                    "calls": v.calls,
+                    "prompt_tokens": v.prompt_tokens,
+                    "completion_tokens": v.completion_tokens,
+                    "total_tokens": v.total_tokens,
+                }
+                for k, v in self._by_model.items()
+            },
+        }
+
+
+# ---------------------------------------------------------------------------
 # IntentHeuristics Protocol
 # ---------------------------------------------------------------------------
 
@@ -729,6 +820,7 @@ class RunOutcome:
     step_outcomes: list[StepOutcome] = field(default_factory=list)
     total_duration_ms: int = 0
     error: str | None = None
+    token_usage: dict[str, Any] | None = None  # Token usage summary from get_token_stats()
 
 
 # ---------------------------------------------------------------------------
@@ -1322,6 +1414,37 @@ class PlannerExecutorAgent:
 
         # Current automation task (for run-level context)
         self._current_task: AutomationTask | None = None
+
+        # Token usage tracking
+        self._token_collector = _TokenUsageCollector()
+
+    def get_token_stats(self) -> dict[str, Any]:
+        """
+        Get token usage statistics for the agent session.
+
+        Returns:
+            Dictionary with:
+            - total: aggregate counts (calls, prompt_tokens, completion_tokens, total_tokens)
+            - by_role: breakdown by role (planner, executor, replan, vision)
+            - by_model: breakdown by model name
+
+        Example:
+            >>> stats = agent.get_token_stats()
+            >>> print(f"Total tokens: {stats['total']['total_tokens']}")
+            >>> print(f"Planner tokens: {stats['by_role'].get('planner', {}).get('total_tokens', 0)}")
+        """
+        return self._token_collector.summary()
+
+    def reset_token_stats(self) -> None:
+        """Reset token usage statistics to zero."""
+        self._token_collector.reset()
+
+    def _record_token_usage(self, role: str, resp: LLMResponse) -> None:
+        """Record token usage from an LLM response."""
+        try:
+            self._token_collector.record(role=role, resp=resp)
+        except Exception:
+            pass  # Don't fail on token tracking errors
 
     def _format_context(self, snap: Snapshot, goal: str) -> str:
         """
@@ -2069,6 +2192,7 @@ class PlannerExecutorAgent:
                 temperature=self.config.planner_temperature,
                 max_new_tokens=max_tokens,
             )
+            self._record_token_usage("planner", resp)
             last_output = resp.content
 
             if self.config.verbose:
@@ -2169,6 +2293,7 @@ Return JSON patch:
                 temperature=self.config.planner_temperature,
                 max_new_tokens=1024,
             )
+            self._record_token_usage("replan", resp)
             last_output = resp.content
 
             try:
@@ -2327,6 +2452,7 @@ Return JSON patch:
                     temperature=self.config.executor_temperature,
                     max_new_tokens=self.config.executor_max_tokens,
                 )
+                self._record_token_usage("executor", resp)
                 parsed_action, parsed_args = self._parse_action(resp.content)
 
                 if parsed_action == "CLICK" and parsed_args:
@@ -2398,6 +2524,7 @@ Return JSON patch:
                             temperature=self.config.executor_temperature,
                             max_new_tokens=self.config.executor_max_tokens,
                         )
+                        self._record_token_usage("executor", resp)
                         parsed_action, parsed_args = self._parse_action(resp.content)
                         if parsed_action == "CLICK" and parsed_args:
                             element_id = parsed_args[0]
@@ -2917,6 +3044,7 @@ Return JSON patch:
                         temperature=self.config.executor_temperature,
                         max_new_tokens=self.config.executor_max_tokens,
                     )
+                    self._record_token_usage("executor", resp)
                     llm_response = resp.content
 
                     if self.config.verbose:
@@ -3467,6 +3595,7 @@ Return JSON patch:
             step_outcomes=step_outcomes,
             total_duration_ms=int((time.time() - start_time) * 1000),
             error=error,
+            token_usage=self.get_token_stats(),
         )
 
         # Emit run end

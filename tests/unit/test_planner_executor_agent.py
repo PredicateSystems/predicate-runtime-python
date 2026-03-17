@@ -1351,3 +1351,197 @@ class TestModalDismissalAfterSuccessfulClick:
         assert hasattr(config, "role_filter")
         assert hasattr(config, "max_attempts")
         assert hasattr(config, "min_new_elements")
+
+
+# ---------------------------------------------------------------------------
+# Test Token Usage Tracking
+# ---------------------------------------------------------------------------
+
+
+class TestTokenUsageTracking:
+    """Tests for token usage tracking in PlannerExecutorAgent."""
+
+    def test_token_usage_totals_add(self) -> None:
+        """TokenUsageTotals should accumulate tokens correctly."""
+        from predicate.agents.planner_executor_agent import TokenUsageTotals
+        from predicate.llm_provider import LLMResponse
+
+        totals = TokenUsageTotals()
+        assert totals.calls == 0
+        assert totals.prompt_tokens == 0
+        assert totals.completion_tokens == 0
+        assert totals.total_tokens == 0
+
+        # Add first response
+        resp1 = LLMResponse(
+            content="test",
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+        )
+        totals.add(resp1)
+        assert totals.calls == 1
+        assert totals.prompt_tokens == 100
+        assert totals.completion_tokens == 50
+        assert totals.total_tokens == 150
+
+        # Add second response
+        resp2 = LLMResponse(
+            content="test2",
+            prompt_tokens=200,
+            completion_tokens=75,
+            total_tokens=275,
+        )
+        totals.add(resp2)
+        assert totals.calls == 2
+        assert totals.prompt_tokens == 300
+        assert totals.completion_tokens == 125
+        assert totals.total_tokens == 425
+
+    def test_token_usage_totals_handles_none_values(self) -> None:
+        """TokenUsageTotals should handle None token counts gracefully."""
+        from predicate.agents.planner_executor_agent import TokenUsageTotals
+        from predicate.llm_provider import LLMResponse
+
+        totals = TokenUsageTotals()
+        resp = LLMResponse(
+            content="test",
+            prompt_tokens=None,
+            completion_tokens=None,
+            total_tokens=None,
+        )
+        totals.add(resp)
+        assert totals.calls == 1
+        assert totals.prompt_tokens == 0
+        assert totals.completion_tokens == 0
+        assert totals.total_tokens == 0
+
+    def test_token_usage_collector_records_by_role(self) -> None:
+        """_TokenUsageCollector should track tokens by role."""
+        from predicate.agents.planner_executor_agent import _TokenUsageCollector
+        from predicate.llm_provider import LLMResponse
+
+        collector = _TokenUsageCollector()
+
+        resp_planner = LLMResponse(
+            content="plan",
+            prompt_tokens=500,
+            completion_tokens=200,
+            total_tokens=700,
+            model_name="gpt-4o",
+        )
+        collector.record(role="planner", resp=resp_planner)
+
+        resp_executor = LLMResponse(
+            content="action",
+            prompt_tokens=100,
+            completion_tokens=20,
+            total_tokens=120,
+            model_name="gpt-4o-mini",
+        )
+        collector.record(role="executor", resp=resp_executor)
+
+        summary = collector.summary()
+
+        # Check total
+        assert summary["total"]["calls"] == 2
+        assert summary["total"]["prompt_tokens"] == 600
+        assert summary["total"]["completion_tokens"] == 220
+        assert summary["total"]["total_tokens"] == 820
+
+        # Check by_role
+        assert "planner" in summary["by_role"]
+        assert summary["by_role"]["planner"]["calls"] == 1
+        assert summary["by_role"]["planner"]["total_tokens"] == 700
+
+        assert "executor" in summary["by_role"]
+        assert summary["by_role"]["executor"]["calls"] == 1
+        assert summary["by_role"]["executor"]["total_tokens"] == 120
+
+    def test_token_usage_collector_records_by_model(self) -> None:
+        """_TokenUsageCollector should track tokens by model name."""
+        from predicate.agents.planner_executor_agent import _TokenUsageCollector
+        from predicate.llm_provider import LLMResponse
+
+        collector = _TokenUsageCollector()
+
+        resp1 = LLMResponse(
+            content="test",
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            model_name="gpt-4o",
+        )
+        collector.record(role="planner", resp=resp1)
+
+        resp2 = LLMResponse(
+            content="test",
+            prompt_tokens=50,
+            completion_tokens=25,
+            total_tokens=75,
+            model_name="gpt-4o-mini",
+        )
+        collector.record(role="executor", resp=resp2)
+
+        summary = collector.summary()
+
+        # Check by_model
+        assert "gpt-4o" in summary["by_model"]
+        assert summary["by_model"]["gpt-4o"]["total_tokens"] == 150
+
+        assert "gpt-4o-mini" in summary["by_model"]
+        assert summary["by_model"]["gpt-4o-mini"]["total_tokens"] == 75
+
+    def test_token_usage_collector_reset(self) -> None:
+        """_TokenUsageCollector reset should clear all data."""
+        from predicate.agents.planner_executor_agent import _TokenUsageCollector
+        from predicate.llm_provider import LLMResponse
+
+        collector = _TokenUsageCollector()
+        resp = LLMResponse(
+            content="test",
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+        )
+        collector.record(role="planner", resp=resp)
+        assert collector.summary()["total"]["calls"] == 1
+
+        collector.reset()
+        summary = collector.summary()
+        assert summary["total"]["calls"] == 0
+        assert summary["total"]["total_tokens"] == 0
+        assert summary["by_role"] == {}
+        assert summary["by_model"] == {}
+
+    def test_run_outcome_has_token_usage_field(self) -> None:
+        """RunOutcome should have token_usage field."""
+        from predicate.agents.planner_executor_agent import RunOutcome
+
+        outcome = RunOutcome(
+            run_id="test-run",
+            task="test task",
+            success=True,
+            steps_completed=3,
+            steps_total=3,
+            replans_used=0,
+        )
+        # Default should be None
+        assert outcome.token_usage is None
+
+        # Should accept token usage dict
+        outcome_with_tokens = RunOutcome(
+            run_id="test-run",
+            task="test task",
+            success=True,
+            steps_completed=3,
+            steps_total=3,
+            replans_used=0,
+            token_usage={
+                "total": {"calls": 5, "total_tokens": 1000},
+                "by_role": {"planner": {"calls": 2, "total_tokens": 700}},
+                "by_model": {"gpt-4o": {"calls": 2, "total_tokens": 700}},
+            },
+        )
+        assert outcome_with_tokens.token_usage is not None
+        assert outcome_with_tokens.token_usage["total"]["total_tokens"] == 1000
