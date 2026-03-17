@@ -14,6 +14,7 @@ Key features:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -45,7 +46,102 @@ from ..verification import (
     url_matches,
 )
 
+from .automation_task import AutomationTask, ExtractionSpec, SuccessCriteria, TaskCategory
 from .browser_agent import CaptchaConfig, VisionFallbackConfig
+from .composable_heuristics import ComposableHeuristics
+from .heuristic_spec import HeuristicHint
+from .recovery import RecoveryCheckpoint, RecoveryState
+
+
+# ---------------------------------------------------------------------------
+# Token Usage Tracking
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TokenUsageTotals:
+    """Accumulated token counts for a single role or model."""
+
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def add(self, resp: LLMResponse) -> None:
+        """Add token counts from an LLM response."""
+        self.calls += 1
+        pt = resp.prompt_tokens if isinstance(resp.prompt_tokens, int) else 0
+        ct = resp.completion_tokens if isinstance(resp.completion_tokens, int) else 0
+        tt = resp.total_tokens if isinstance(resp.total_tokens, int) else (pt + ct)
+        self.prompt_tokens += max(0, int(pt))
+        self.completion_tokens += max(0, int(ct))
+        self.total_tokens += max(0, int(tt))
+
+
+class _TokenUsageCollector:
+    """Collects token usage statistics by role (planner/executor) and model."""
+
+    def __init__(self) -> None:
+        self._by_role: dict[str, TokenUsageTotals] = {}
+        self._by_model: dict[str, TokenUsageTotals] = {}
+
+    def record(self, *, role: str, resp: LLMResponse) -> None:
+        """Record token usage from an LLM response."""
+        self._by_role.setdefault(role, TokenUsageTotals()).add(resp)
+        m = str(resp.model_name or "").strip() or "unknown"
+        self._by_model.setdefault(m, TokenUsageTotals()).add(resp)
+
+    def reset(self) -> None:
+        """Clear all recorded statistics."""
+        self._by_role.clear()
+        self._by_model.clear()
+
+    def summary(self) -> dict[str, Any]:
+        """
+        Get a summary of all token usage.
+
+        Returns:
+            Dictionary with:
+            - total: aggregate counts across all calls
+            - by_role: breakdown by role (planner, executor, replan)
+            - by_model: breakdown by model name
+        """
+        def _sum(items: dict[str, TokenUsageTotals]) -> TokenUsageTotals:
+            out = TokenUsageTotals()
+            for t in items.values():
+                out.calls += t.calls
+                out.prompt_tokens += t.prompt_tokens
+                out.completion_tokens += t.completion_tokens
+                out.total_tokens += t.total_tokens
+            return out
+
+        total = _sum(self._by_role)
+        return {
+            "total": {
+                "calls": total.calls,
+                "prompt_tokens": total.prompt_tokens,
+                "completion_tokens": total.completion_tokens,
+                "total_tokens": total.total_tokens,
+            },
+            "by_role": {
+                k: {
+                    "calls": v.calls,
+                    "prompt_tokens": v.prompt_tokens,
+                    "completion_tokens": v.completion_tokens,
+                    "total_tokens": v.total_tokens,
+                }
+                for k, v in self._by_role.items()
+            },
+            "by_model": {
+                k: {
+                    "calls": v.calls,
+                    "prompt_tokens": v.prompt_tokens,
+                    "completion_tokens": v.completion_tokens,
+                    "total_tokens": v.total_tokens,
+                }
+                for k, v in self._by_model.items()
+            },
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -210,12 +306,23 @@ class SnapshotEscalationConfig:
 
         # Larger initial limit, smaller steps
         config = SnapshotEscalationConfig(limit_base=100, limit_step=20, limit_max=180)
+
+        # Enable scroll-after-escalation to find elements below/above viewport
+        config = SnapshotEscalationConfig(scroll_after_escalation=True, scroll_directions=("down", "up"))
+
+        # Custom scroll amount as fraction of viewport height (default: 0.4 = 40%)
+        config = SnapshotEscalationConfig(scroll_viewport_fraction=0.5)  # 50% of viewport
     """
 
     enabled: bool = True
     limit_base: int = 60
     limit_step: int = 30
     limit_max: int = 200
+    # Scroll after exhausting limit escalation to find elements in different viewports
+    scroll_after_escalation: bool = True
+    scroll_max_attempts: int = 3  # Max scrolls per direction
+    scroll_directions: tuple[str, ...] = ("down", "up")  # Directions to try
+    scroll_viewport_fraction: float = 0.4  # Scroll by 40% of viewport height (adaptive to screen size)
 
 
 @dataclass(frozen=True)
@@ -251,6 +358,259 @@ class RecoveryNavigationConfig:
 
 
 @dataclass(frozen=True)
+class ModalDismissalConfig:
+    """
+    Configuration for automatic modal/drawer dismissal after DOM changes.
+
+    When a CLICK action triggers a DOM change (e.g., modal/drawer appears),
+    this feature attempts to dismiss blocking overlays using common patterns.
+
+    This handles common blocking scenarios:
+    - Product protection/warranty upsells (Amazon, etc.)
+    - Cookie consent banners
+    - Newsletter signup popups
+    - Promotional overlays
+    - Cart upsell drawers
+
+    The dismissal logic looks for buttons with common dismissal text patterns
+    and clicks them to clear the overlay.
+
+    Attributes:
+        enabled: If True, attempt to dismiss modals after DOM change detection.
+        dismiss_patterns: Text patterns to match dismissal buttons (case-insensitive).
+        role_filter: Element roles to consider for dismissal buttons.
+        max_attempts: Maximum dismissal attempts per modal.
+        min_new_elements: Minimum new DOM elements to trigger modal detection.
+
+    Example:
+        # Default: enabled with common dismissal patterns
+        config = ModalDismissalConfig()
+
+        # Disable modal dismissal
+        config = ModalDismissalConfig(enabled=False)
+
+        # Custom patterns (e.g., for non-English sites)
+        config = ModalDismissalConfig(
+            dismiss_patterns=("nein danke", "schließen", "abbrechen"),
+        )
+    """
+
+    enabled: bool = True
+    # Patterns that require word boundary matching (longer patterns)
+    # Ordered by preference: decline > close > accept (we prefer not to accept upsells)
+    dismiss_patterns: tuple[str, ...] = (
+        # Decline/Skip patterns (highest priority - user is declining an offer)
+        "no thanks",
+        "no, thanks",
+        "no thank you",
+        "not now",
+        "not interested",
+        "maybe later",
+        "skip",
+        "decline",
+        "reject",
+        "deny",
+        "continue without",
+        # Close patterns
+        "close",
+        "close dialog",
+        "close modal",
+        "close popup",
+        "dismiss",
+        "dismiss banner",
+        "dismiss dialog",
+        "cancel",
+        # Continue patterns (when modal offers upgrade vs continue)
+        "continue",
+        "continue to",
+        "proceed",
+    )
+    # Icon characters that require exact match (entire label is just this character)
+    dismiss_icons: tuple[str, ...] = (
+        "x",
+        "×",  # Unicode multiplication sign
+        "✕",  # Unicode X mark
+        "✖",  # Heavy multiplication X
+        "✗",  # Ballot X
+        "╳",  # Box drawings
+    )
+    role_filter: tuple[str, ...] = ("button", "link")
+    max_attempts: int = 2
+    min_new_elements: int = 5  # Same threshold as DOM change fallback
+
+
+@dataclass(frozen=True)
+class CheckoutDetectionConfig:
+    """
+    Configuration for checkout page detection.
+
+    After modal dismissal or action completion, the agent checks if the
+    current page is a checkout-relevant page. If detected, this triggers
+    a replan to continue the checkout flow.
+
+    This handles scenarios where:
+    - Agent clicks "Add to Cart" and modal is dismissed, but agent stops
+    - Agent lands on cart page but plan doesn't include checkout steps
+    - Agent reaches login page during checkout flow
+
+    Attributes:
+        enabled: If True, detect checkout pages and trigger continuation.
+        url_patterns: URL patterns that indicate checkout-relevant pages.
+        element_patterns: Element text patterns that indicate checkout pages.
+        trigger_replan: If True, trigger replanning when checkout page detected.
+
+    Example:
+        # Default: enabled with common checkout patterns
+        config = CheckoutDetectionConfig()
+
+        # Disable checkout detection
+        config = CheckoutDetectionConfig(enabled=False)
+
+        # Custom patterns
+        config = CheckoutDetectionConfig(
+            url_patterns=("/warenkorb", "/kasse"),  # German
+        )
+    """
+
+    enabled: bool = True
+    # URL patterns that indicate checkout-relevant pages
+    url_patterns: tuple[str, ...] = (
+        # Cart pages
+        "/cart",
+        "/basket",
+        "/bag",
+        "/shopping-cart",
+        "/gp/cart",  # Amazon
+        # Checkout pages
+        "/checkout",
+        "/buy",
+        "/order",
+        "/payment",
+        "/pay",
+        "/purchase",
+        "/gp/buy",  # Amazon
+        "/gp/checkout",  # Amazon
+        # Sign-in during checkout
+        "/signin",
+        "/sign-in",
+        "/login",
+        "/ap/signin",  # Amazon
+        "/auth",
+        "/authenticate",
+    )
+    # Element text patterns that indicate checkout pages (case-insensitive)
+    element_patterns: tuple[str, ...] = (
+        "proceed to checkout",
+        "proceed to buy",
+        "go to checkout",
+        "view cart",
+        "shopping cart",
+        "your cart",
+        "sign in to checkout",
+        "continue to payment",
+        "place your order",
+        "buy now",
+        "checkout",
+    )
+    # If True, trigger replanning when checkout page is detected
+    trigger_replan: bool = True
+
+
+@dataclass(frozen=True)
+class AuthBoundaryConfig:
+    """
+    Configuration for authentication boundary detection.
+
+    When the agent reaches a login/sign-in page and doesn't have credentials,
+    it should stop gracefully instead of failing or spinning endlessly.
+
+    This is a "terminal state" - the agent has successfully navigated as far
+    as possible without authentication.
+
+    Attributes:
+        enabled: If True, detect auth boundaries and stop gracefully.
+        url_patterns: URL patterns indicating authentication pages.
+        stop_on_auth: If True, mark run as successful when auth boundary reached.
+        auth_success_message: Message to include in outcome when stopping at auth.
+
+    Example:
+        # Default: enabled, stop gracefully at login pages
+        config = AuthBoundaryConfig()
+
+        # Disable (try to continue past auth pages)
+        config = AuthBoundaryConfig(enabled=False)
+    """
+
+    enabled: bool = True
+    # URL patterns that indicate authentication/login pages
+    url_patterns: tuple[str, ...] = (
+        "/signin",
+        "/sign-in",
+        "/login",
+        "/log-in",
+        "/auth",
+        "/authenticate",
+        "/ap/signin",  # Amazon sign-in
+        "/ap/register",  # Amazon registration
+        "/ax/claim",  # Amazon CAPTCHA/verification
+        "/account/login",
+        "/accounts/login",
+        "/user/login",
+    )
+    # If True, mark the run as successful when auth boundary is reached
+    # (since the agent did everything it could without credentials)
+    stop_on_auth: bool = True
+    # Message to include when stopping at auth boundary
+    auth_success_message: str = "Reached authentication boundary (login required)"
+
+
+@dataclass(frozen=True)
+class StepwisePlanningConfig:
+    """
+    Configuration for stepwise (ReAct-style) planning.
+
+    Instead of generating a full plan upfront, the agent plans one step at a time
+    based on the current page state. This allows the agent to adapt to unexpected
+    site layouts and flows.
+
+    Attributes:
+        max_steps: Maximum number of steps before giving up (safety limit)
+        action_history_limit: How many past actions to include in planning context
+        include_page_context: Whether to include compact element representation in prompts
+
+    Example:
+        config = StepwisePlanningConfig(
+            max_steps=20,
+            action_history_limit=5,
+        )
+    """
+
+    max_steps: int = 30
+    action_history_limit: int = 5
+    include_page_context: bool = True
+
+
+@dataclass
+class ActionRecord:
+    """
+    Record of an executed action for history tracking in stepwise planning.
+
+    Attributes:
+        step_num: Step number (1-indexed)
+        action: Action type (CLICK, TYPE_AND_SUBMIT, SCROLL, etc.)
+        target: Element description or URL
+        result: Outcome (success, failed)
+        url_after: URL after action completed
+    """
+
+    step_num: int
+    action: str
+    target: str | None
+    result: str
+    url_after: str | None
+
+
+@dataclass(frozen=True)
 class PlannerExecutorConfig:
     """
     High-level configuration for PlannerExecutorAgent.
@@ -260,6 +620,7 @@ class PlannerExecutorConfig:
     - Retry/verification settings
     - Vision fallback settings
     - Recovery navigation settings
+    - Modal dismissal settings
     - Planner/Executor LLM settings
     - Tracing settings
     """
@@ -284,6 +645,24 @@ class PlannerExecutorConfig:
     # Recovery navigation
     recovery: RecoveryNavigationConfig = RecoveryNavigationConfig()
 
+    # Modal dismissal (for blocking overlays after DOM changes)
+    modal: ModalDismissalConfig = ModalDismissalConfig()
+
+    # Checkout page detection (continue workflow when reaching checkout pages)
+    checkout: CheckoutDetectionConfig = CheckoutDetectionConfig()
+
+    # Authentication boundary detection (stop gracefully at login pages)
+    auth_boundary: AuthBoundaryConfig = AuthBoundaryConfig()
+
+    # Stepwise planning (ReAct-style, plan one step at a time)
+    stepwise: StepwisePlanningConfig = StepwisePlanningConfig()
+
+    # Auto-fallback: switch from upfront to stepwise planning on repeated failures
+    # When enabled, if upfront planning fails (max_replans exhausted), automatically
+    # retry with stepwise planning for better adaptability on unfamiliar sites.
+    auto_fallback_to_stepwise: bool = True
+    auto_fallback_replan_threshold: int = 1  # Fallback after this many replans fail
+
     # Planner LLM settings
     planner_max_tokens: int = 2048
     planner_temperature: float = 0.0
@@ -300,10 +679,18 @@ class PlannerExecutorConfig:
     # Pre-step verification (skip step if predicates already pass)
     pre_step_verification: bool = True
 
+    # Scroll-to-find: automatically scroll to find elements when not in viewport
+    scroll_to_find_enabled: bool = True
+    scroll_to_find_max_scrolls: int = 3  # Max scroll attempts per direction
+    scroll_to_find_directions: tuple[str, ...] = ("down", "up")  # Try down first, then up
+
     # Tracing
     trace_screenshots: bool = True
     trace_screenshot_format: str = "jpeg"
     trace_screenshot_quality: int = 80
+
+    # Verbose mode (print plan, prompts, and LLM responses to stdout)
+    verbose: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +721,10 @@ class PlanStep(BaseModel):
     required: bool = Field(True, description="If True, step failure triggers replan")
     stop_if_true: bool = Field(False, description="If True, stop execution when verification passes")
     optional_substeps: list["PlanStep"] = Field(default_factory=list, description="Optional fallback steps")
+    heuristic_hints: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Planner-generated hints for element selection",
+    )
 
     class Config:
         extra = "allow"
@@ -390,9 +781,10 @@ class SnapshotContext:
 
     def digest(self) -> str:
         """Compute a digest for loop/change detection."""
+        title = getattr(self.snapshot, "title", None) or ""
         parts = [
             self.snapshot.url[:200] if self.snapshot.url else "",
-            self.snapshot.title[:200] if self.snapshot.title else "",
+            title[:200] if title else "",
             f"count:{len(self.snapshot.elements or [])}",
         ]
         for el in (self.snapshot.elements or [])[:100]:
@@ -483,6 +875,8 @@ class RunOutcome:
     step_outcomes: list[StepOutcome] = field(default_factory=list)
     total_duration_ms: int = 0
     error: str | None = None
+    token_usage: dict[str, Any] | None = None  # Token usage summary from get_token_stats()
+    fallback_used: bool = False  # True if auto-fallback to stepwise was triggered
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +926,108 @@ def build_predicate(spec: PredicateSpec | dict[str, Any]) -> Predicate:
 # ---------------------------------------------------------------------------
 
 
+def _parse_string_predicate(pred_str: str) -> dict[str, Any] | None:
+    """
+    Parse a string predicate into a normalized dict.
+
+    LLMs sometimes output predicates as strings like:
+    - "url_contains('amazon.com')" -> {"predicate": "url_contains", "args": ["amazon.com"]}
+    - "url_matches(^https://www\\.amazon\\.com/.*)" -> {"predicate": "url_matches", "args": ["^https://www\\.amazon\\.com/.*"]}
+    - "exists(role=button)" -> {"predicate": "exists", "args": ["role=button"]}
+
+    Args:
+        pred_str: String representation of a predicate
+
+    Returns:
+        Normalized predicate dict or None if parsing fails
+    """
+    import re
+
+    pred_str = pred_str.strip()
+
+    # Try to match function-call style: predicate_name(args)
+    match = re.match(r'^(\w+)\s*\(\s*(.+?)\s*\)$', pred_str, re.DOTALL)
+    if match:
+        pred_name = match.group(1)
+        args_str = match.group(2)
+
+        # Strip quotes from args if present
+        args_str = args_str.strip()
+        if (args_str.startswith("'") and args_str.endswith("'")) or \
+           (args_str.startswith('"') and args_str.endswith('"')):
+            args_str = args_str[1:-1]
+
+        return {
+            "predicate": pred_name,
+            "args": [args_str],
+        }
+
+    # Try simple predicate name without args
+    if re.match(r'^[\w_]+$', pred_str):
+        return {
+            "predicate": pred_str,
+            "args": [],
+        }
+
+    return None
+
+
+def _normalize_verify_predicate(pred: dict[str, Any]) -> dict[str, Any]:
+    """
+    Normalize a verify predicate to the expected format.
+
+    LLMs may output predicates in various formats:
+    - {"url_contains": "amazon.com"} -> {"predicate": "url_contains", "args": ["amazon.com"]}
+    - {"exists": "text~'Logitech'"} -> {"predicate": "exists", "args": ["text~'Logitech'"]}
+    - {"predicate": "url_contains", "input": "x"} -> {"predicate": "url_contains", "args": ["x"]}
+    - {"type": "url_contains", "input": "x"} -> {"predicate": "url_contains", "args": ["x"]}
+
+    Args:
+        pred: Raw predicate dictionary
+
+    Returns:
+        Normalized predicate with "predicate" and "args" fields
+    """
+    # Handle "type" field as alternative to "predicate" (common LLM variation)
+    if "type" in pred and "predicate" not in pred:
+        pred["predicate"] = pred.pop("type")
+
+    # Already has predicate field - normalize args
+    if "predicate" in pred:
+        # Handle "input" field as alternative to "args"
+        if "args" not in pred or not pred["args"]:
+            if "input" in pred:
+                pred["args"] = [pred.pop("input")]
+            elif "value" in pred:
+                pred["args"] = [pred.pop("value")]
+            elif "pattern" in pred:  # For url_matches
+                pred["args"] = [pred.pop("pattern")]
+            elif "substring" in pred:  # For url_contains
+                pred["args"] = [pred.pop("substring")]
+            elif "selector" in pred:  # For exists/not_exists
+                pred["args"] = [pred.pop("selector")]
+        return pred
+
+    # Predicate type is a key in the dict (e.g., {"url_contains": "amazon.com"})
+    known_predicates = [
+        "url_contains", "url_equals", "url_matches",
+        "exists", "not_exists",
+        "element_count", "element_visible",
+        "any_of", "all_of",
+        "text_contains", "text_equals",
+    ]
+
+    for pred_type in known_predicates:
+        if pred_type in pred:
+            return {
+                "predicate": pred_type,
+                "args": [pred[pred_type]] if pred[pred_type] else [],
+            }
+
+    # Unknown format - return as-is and let validation fail with clear error
+    return pred
+
+
 def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
     """
     Normalize plan dictionary to handle LLM output variations.
@@ -540,6 +1036,7 @@ def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
     - url vs target field names
     - action aliases (click vs CLICK)
     - step id variations (string vs int)
+    - verify predicate format variations
 
     Args:
         plan_dict: Raw plan dictionary from LLM
@@ -580,6 +1077,24 @@ def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
                 except ValueError:
                     pass
 
+            # Normalize verify predicates
+            if "verify" in step and isinstance(step["verify"], list):
+                normalized_verify = []
+                for pred in step["verify"]:
+                    if isinstance(pred, dict):
+                        normalized_verify.append(_normalize_verify_predicate(pred))
+                    elif isinstance(pred, str):
+                        # Try to parse string predicates like "url_contains('text')"
+                        parsed = _parse_string_predicate(pred)
+                        if parsed:
+                            normalized_verify.append(parsed)
+                        else:
+                            # Keep as-is, let validation fail with clear error
+                            normalized_verify.append({"predicate": "unknown", "args": [pred]})
+                    else:
+                        normalized_verify.append(pred)
+                step["verify"] = normalized_verify
+
             # Normalize optional_substeps recursively
             if "optional_substeps" in step:
                 for substep in step["optional_substeps"]:
@@ -587,6 +1102,21 @@ def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
                         substep["action"] = substep["action"].upper()
                     if "url" in substep and "target" not in substep:
                         substep["target"] = substep.pop("url")
+                    # Normalize verify in substeps too
+                    if "verify" in substep and isinstance(substep["verify"], list):
+                        normalized_verify = []
+                        for pred in substep["verify"]:
+                            if isinstance(pred, dict):
+                                normalized_verify.append(_normalize_verify_predicate(pred))
+                            elif isinstance(pred, str):
+                                parsed = _parse_string_predicate(pred)
+                                if parsed:
+                                    normalized_verify.append(parsed)
+                                else:
+                                    normalized_verify.append({"predicate": "unknown", "args": [pred]})
+                            else:
+                                normalized_verify.append(pred)
+                        substep["verify"] = normalized_verify
 
     return plan_dict
 
@@ -669,31 +1199,97 @@ def build_planner_prompt(
     strict_note = "\nReturn ONLY a JSON object. No explanations, no code fences.\n" if strict else ""
     schema_note = f"\nSchema errors from last attempt:\n{schema_errors}\n" if schema_errors else ""
 
+    # Detect task type for domain-specific guidance
+    task_lower = task.lower()
+    is_ecommerce_task = any(keyword in task_lower for keyword in [
+        "buy", "purchase", "add to cart", "checkout", "order", "shop",
+        "amazon", "ebay", "walmart", "target", "bestbuy",
+        "cart", "mouse", "keyboard", "laptop", "product",
+    ])
+    is_search_task = any(keyword in task_lower for keyword in [
+        "search", "find", "look for", "look up", "google",
+    ])
+
+    # Build domain-specific planning guidance
+    domain_guidance = ""
+    if is_ecommerce_task:
+        domain_guidance = """
+
+IMPORTANT: E-Commerce Task Planning Rules
+=========================================
+For shopping/purchase tasks, include ALL necessary steps in order:
+1. NAVIGATE to the site (if not already there)
+2. TYPE_AND_SUBMIT search query in search box
+3. CLICK on specific product from results (not filters or categories)
+4. CLICK "Add to Cart" button on product page
+5. CLICK "Proceed to Checkout" or cart icon
+6. Handle login/signup if required (may need CLICK + TYPE_AND_SUBMIT)
+7. CLICK through checkout process
+
+Common mistakes to AVOID:
+- Do NOT skip "Add to Cart" step - clicking a product link is NOT adding to cart
+- Do NOT combine multiple distinct actions into one step
+- Do NOT confuse filter/category clicks with product selection
+- Each distinct user action should be its own step
+
+Intent hints are critical - use clear hints like:
+- intent: "Click Add to Cart button"
+- intent: "Click Proceed to Checkout"
+- intent: "Click on product title or image"
+- intent: "Click sign in button"
+"""
+    elif is_search_task:
+        domain_guidance = """
+
+IMPORTANT: Search Task Planning Rules
+=====================================
+For search tasks, include steps to:
+1. NAVIGATE to the search site (if not already there)
+2. TYPE_AND_SUBMIT the search query
+3. Wait for/verify search results
+4. If selecting a result: CLICK on specific result item
+"""
+
     system = f"""You are the PLANNER. Output a JSON execution plan for the web automation task.
 {strict_note}
-Your output must be a valid JSON object with:
-- task: string (the task description)
-- notes: list of strings (assumptions, constraints)
-- steps: list of step objects
+Your output must be a valid JSON object with this EXACT structure:
 
-Each step must have:
-- id: int (1-indexed, contiguous)
-- goal: string (human-readable goal)
-- action: string (NAVIGATE, CLICK, TYPE_AND_SUBMIT, or SCROLL)
-- verify: list of predicate specs
+{{
+  "task": "description of task",
+  "notes": ["assumption 1", "assumption 2"],
+  "steps": [
+    {{
+      "id": 1,
+      "goal": "Navigate to website",
+      "action": "NAVIGATE",
+      "target": "https://example.com",
+      "verify": [{{"predicate": "url_contains", "args": ["example.com"]}}]
+    }},
+    {{
+      "id": 2,
+      "goal": "Search for product",
+      "action": "TYPE_AND_SUBMIT",
+      "input": "search query",
+      "verify": [{{"predicate": "url_contains", "args": ["search"]}}]
+    }},
+    {{
+      "id": 3,
+      "goal": "Click on result",
+      "action": "CLICK",
+      "intent": "Click on product title",
+      "verify": [{{"predicate": "url_contains", "args": ["/product/"]}}]
+    }}
+  ]
+}}
 
-Available predicates:
-- url_contains(substring): URL contains the given string
-- url_matches(pattern): URL matches regex pattern
-- exists(selector): Element matching selector exists
-- not_exists(selector): Element matching selector does not exist
-- element_count(selector, min, max): Element count within range
-- any_of(predicates...): Any predicate is true
-- all_of(predicates...): All predicates are true
+CRITICAL: Each verify predicate MUST be an object with "predicate" and "args" keys:
+- {{"predicate": "url_contains", "args": ["substring"]}}
+- {{"predicate": "exists", "args": ["role=button"]}}
+- {{"predicate": "not_exists", "args": ["text~'error'"]}}
 
-Selectors: role=button, role=link, text~'text', role=textbox, etc.
-
-Return ONLY valid JSON. No prose, no code fences."""
+DO NOT use string format like "url_contains('text')" - use object format only.
+{domain_guidance}
+Return ONLY valid JSON. No prose, no code fences, no markdown."""
 
     user = f"""Task: {task}
 {schema_note}
@@ -701,7 +1297,81 @@ Starting URL: {start_url or "browser's current page"}
 Site type: {site_type}
 Auth state: {auth_state}
 
-Output a JSON plan to accomplish this task."""
+Output a JSON plan to accomplish this task. Each step should represent ONE distinct action."""
+
+    return system, user
+
+
+def build_stepwise_planner_prompt(
+    goal: str,
+    current_url: str,
+    page_context: str,
+    action_history: list["ActionRecord"],
+) -> tuple[str, str]:
+    """
+    Build system and user prompts for stepwise (ReAct-style) planning.
+
+    Instead of generating a full plan upfront, this prompt asks the LLM to
+    decide the next single action based on current page state and history.
+
+    Args:
+        goal: The overall task goal
+        current_url: Current page URL
+        page_context: Compact representation of page elements
+        action_history: List of previously executed actions
+
+    Returns:
+        (system_prompt, user_prompt)
+    """
+    # Build action history text
+    history_text = ""
+    if action_history:
+        history_text = "Actions taken so far:\n"
+        for rec in action_history:
+            target_str = f"({rec.target})" if rec.target else ""
+            history_text += f"  {rec.step_num}. {rec.action}{target_str} → {rec.result}"
+            if rec.url_after:
+                history_text += f" [URL: {rec.url_after[:60]}...]"
+            history_text += "\n"
+        history_text += "\n"
+
+    system = """You are a web automation agent using ReAct-style planning.
+Given the goal, current page state, and action history, decide the NEXT SINGLE ACTION.
+
+Available actions:
+- CLICK: Click an element. Provide "intent" to describe which element.
+- TYPE_AND_SUBMIT: Type text into an input and submit. Provide "input" (the text to type) and "intent" (which input field).
+- SCROLL: Scroll the page. Provide "direction" (up or down).
+- DONE: Task is complete. Use when the goal has been achieved.
+- STUCK: Cannot proceed (e.g., login required without credentials, CAPTCHA, unexpected error).
+
+Output ONLY a JSON object:
+{
+  "action": "CLICK" | "TYPE_AND_SUBMIT" | "SCROLL" | "DONE" | "STUCK",
+  "intent": "description of target element (required for CLICK, TYPE_AND_SUBMIT)",
+  "input": "text to type (required for TYPE_AND_SUBMIT)",
+  "direction": "up" | "down" (required for SCROLL)",
+  "reasoning": "brief explanation of why this action"
+}
+
+IMPORTANT RULES:
+1. Look at the ACTUAL page elements provided - don't assume what should be there
+2. If you don't see the expected element, try SCROLL or report STUCK
+3. For TYPE_AND_SUBMIT, find a text input (textbox, searchbox, combobox) and specify what text to type
+4. Use action history to avoid repeating failed actions
+5. When the goal is achieved (e.g., item in cart, on checkout page), return DONE
+6. If you need to login but have no credentials, return STUCK with explanation
+
+Return ONLY valid JSON. No prose, no code fences."""
+
+    user = f"""Goal: {goal}
+
+Current URL: {current_url}
+
+{history_text}Current page elements (ID|role|text|importance|clickable|...):
+{page_context}
+
+Based on the goal and current page state, what is the NEXT action to take?"""
 
     return system, user
 
@@ -710,14 +1380,22 @@ def build_executor_prompt(
     goal: str,
     intent: str | None,
     compact_context: str,
+    input_text: str | None = None,
 ) -> tuple[str, str]:
     """
     Build system and user prompts for the Executor LLM.
+
+    Args:
+        goal: Human-readable goal for this step
+        intent: Intent hint for element selection (optional)
+        compact_context: Compact representation of page elements
+        input_text: Text to type for TYPE_AND_SUBMIT actions (optional)
 
     Returns:
         (system_prompt, user_prompt)
     """
     intent_line = f"Intent: {intent}\n" if intent else ""
+    input_line = f"Text to type: \"{input_text}\"\n" if input_text else ""
 
     system = """You are a careful web automation executor.
 You must respond with exactly ONE action in this format:
@@ -732,7 +1410,7 @@ Output only the action. No explanations."""
     user = f"""You are controlling a browser via element IDs.
 
 Goal: {goal}
-{intent_line}
+{intent_line}{input_line}
 Elements (ID|role|text|importance|clickable|...):
 {compact_context}
 
@@ -858,21 +1536,291 @@ class PlannerExecutorAgent:
         self._run_id: str | None = None
         self._last_known_good_url: str | None = None
 
+        # Recovery state (initialized per-run)
+        self._recovery_state: RecoveryState | None = None
+
+        # Composable heuristics (wraps static heuristics with dynamic hints)
+        self._composable_heuristics: ComposableHeuristics | None = None
+
+        # Current automation task (for run-level context)
+        self._current_task: AutomationTask | None = None
+
+        # Token usage tracking
+        self._token_collector = _TokenUsageCollector()
+
+    def get_token_stats(self) -> dict[str, Any]:
+        """
+        Get token usage statistics for the agent session.
+
+        Returns:
+            Dictionary with:
+            - total: aggregate counts (calls, prompt_tokens, completion_tokens, total_tokens)
+            - by_role: breakdown by role (planner, executor, replan, vision)
+            - by_model: breakdown by model name
+
+        Example:
+            >>> stats = agent.get_token_stats()
+            >>> print(f"Total tokens: {stats['total']['total_tokens']}")
+            >>> print(f"Planner tokens: {stats['by_role'].get('planner', {}).get('total_tokens', 0)}")
+        """
+        return self._token_collector.summary()
+
+    def reset_token_stats(self) -> None:
+        """Reset token usage statistics to zero."""
+        self._token_collector.reset()
+
+    def _record_token_usage(self, role: str, resp: LLMResponse) -> None:
+        """Record token usage from an LLM response."""
+        try:
+            self._token_collector.record(role=role, resp=resp)
+        except Exception:
+            pass  # Don't fail on token tracking errors
+
     def _format_context(self, snap: Snapshot, goal: str) -> str:
-        """Format snapshot for LLM context."""
+        """
+        Format snapshot for LLM context.
+
+        Uses compact format: id|role|text|importance|is_primary|bg|clickable|nearby_text|ord|DG|href
+        Same format as documented in reddit_post_planner_executor_local_llm.md
+        """
         if self._context_formatter is not None:
             return self._context_formatter(snap, goal)
 
-        # Default compact format
+        import re
+
+        # Filter to interactive elements
+        interactive_roles = {
+            "button", "link", "textbox", "searchbox", "combobox",
+            "checkbox", "radio", "slider", "tab", "menuitem",
+            "option", "switch", "cell", "a", "input", "select", "textarea",
+        }
+
+        elements = []
+        for el in snap.elements:
+            role = (getattr(el, "role", "") or "").lower()
+            if role in interactive_roles or getattr(el, "clickable", False):
+                elements.append(el)
+
+        # Sort by importance
+        elements.sort(key=lambda el: getattr(el, "importance", 0) or 0, reverse=True)
+
+        # Build dominant group rank map
+        rank_in_group_map: dict[int, int] = {}
+        dg_key = getattr(snap, "dominant_group_key", None)
+        dg_elements = [el for el in elements if getattr(el, "in_dominant_group", False)]
+        if not dg_elements and dg_key:
+            dg_elements = [el for el in elements if getattr(el, "group_key", None) == dg_key]
+
+        # Sort dominant group by position
+        def rank_sort_key(el):
+            doc_y = getattr(el, "doc_y", None) or float("inf")
+            bbox = getattr(el, "bbox", None)
+            bbox_y = bbox.y if bbox else float("inf")
+            bbox_x = bbox.x if bbox else float("inf")
+            neg_imp = -(getattr(el, "importance", 0) or 0)
+            return (doc_y, bbox_y, bbox_x, neg_imp)
+
+        dg_elements.sort(key=rank_sort_key)
+        for rank, el in enumerate(dg_elements):
+            rank_in_group_map[el.id] = rank
+
+        # Format lines - take top elements by importance + from dominant group + by position
+        selected_ids: set[int] = set()
+        selected: list = []
+
+        # Top 40 by importance
+        for el in elements[:40]:
+            if el.id not in selected_ids:
+                selected_ids.add(el.id)
+                selected.append(el)
+
+        # Top 20 from dominant group
+        for el in dg_elements[:20]:
+            if el.id not in selected_ids:
+                selected_ids.add(el.id)
+                selected.append(el)
+
+        # Top 20 by position
+        elements_by_pos = sorted(elements, key=lambda el: (
+            getattr(el, "doc_y", None) or float("inf"),
+            -(getattr(el, "importance", 0) or 0)
+        ))
+        for el in elements_by_pos[:20]:
+            if el.id not in selected_ids:
+                selected_ids.add(el.id)
+                selected.append(el)
+
+        def compress_href(href: str | None) -> str:
+            if not href:
+                return ""
+            # Extract domain or last path segment
+            href = href.strip()
+            if href.startswith("/"):
+                parts = href.split("/")
+                return parts[-1][:20] if parts[-1] else ""
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(href)
+                if parsed.path and parsed.path != "/":
+                    parts = parsed.path.rstrip("/").split("/")
+                    return parts[-1][:20] if parts[-1] else parsed.netloc[:15]
+                return parsed.netloc[:15]
+            except Exception:
+                return href[:20]
+
+        def get_bg_color(el) -> str:
+            """Extract background color name from visual_cues."""
+            visual_cues = getattr(el, "visual_cues", None)
+            if not visual_cues:
+                return ""
+            # Try bg_color_name first, then bg_fallback
+            bg = getattr(visual_cues, "bg_color_name", None) or ""
+            if not bg:
+                bg = getattr(visual_cues, "bg_fallback", None) or ""
+            return bg[:10] if bg else ""
+
+        def get_nearby_text(el) -> str:
+            """Extract nearby text for context."""
+            nearby = getattr(el, "nearby_text", None) or ""
+            if not nearby:
+                # Try aria_label or placeholder as fallback
+                nearby = getattr(el, "aria_label", None) or ""
+            if not nearby:
+                nearby = getattr(el, "placeholder", None) or ""
+            # Truncate and normalize
+            nearby = re.sub(r"\s+", " ", nearby.strip())
+            return nearby[:20] if nearby else ""
+
         lines = []
-        for el in snap.elements[:120]:
-            eid = getattr(el, "id", "?")
-            role = getattr(el, "role", "")
-            text = (getattr(el, "text", "") or "")[:50]
-            importance = getattr(el, "importance", 0)
-            clickable = 1 if getattr(el, "clickable", False) else 0
-            lines.append(f"{eid}|{role}|{text}|{importance}|{clickable}")
+        for el in selected:
+            eid = el.id
+            role = getattr(el, "role", "") or ""
+            if getattr(el, "href", None):
+                role = "link"
+
+            # Truncate and normalize text
+            text = getattr(el, "text", "") or ""
+            text = re.sub(r"\s+", " ", text.strip())
+            if len(text) > 30:
+                text = text[:27] + "..."
+
+            importance = getattr(el, "importance", 0) or 0
+
+            # is_primary from visual_cues
+            is_primary = "0"
+            visual_cues = getattr(el, "visual_cues", None)
+            if visual_cues and getattr(visual_cues, "is_primary", False):
+                is_primary = "1"
+
+            # bg: background color
+            bg = get_bg_color(el)
+
+            # clickable flag
+            clickable = "1" if getattr(el, "clickable", False) else "0"
+
+            # nearby_text
+            nearby_text = get_nearby_text(el)
+
+            # in dominant group
+            in_dg = getattr(el, "in_dominant_group", False)
+            if not in_dg and dg_key:
+                in_dg = getattr(el, "group_key", None) == dg_key
+
+            # ord: rank in dominant group
+            ord_val = rank_in_group_map.get(eid, "") if in_dg else ""
+            dg_flag = "1" if in_dg else "0"
+
+            # href
+            href = compress_href(getattr(el, "href", None))
+
+            # Format: id|role|text|importance|is_primary|bg|clickable|nearby_text|ord|DG|href
+            line = f"{eid}|{role}|{text}|{importance}|{is_primary}|{bg}|{clickable}|{nearby_text}|{ord_val}|{dg_flag}|{href}"
+            lines.append(line)
+
         return "\n".join(lines)
+
+    async def _attempt_recovery(
+        self,
+        runtime: AgentRuntime,
+    ) -> bool:
+        """
+        Attempt to recover to the last known good state.
+
+        Navigates back to the checkpoint URL and verifies we're in a recoverable state.
+
+        Args:
+            runtime: AgentRuntime instance
+
+        Returns:
+            True if recovery succeeded, False otherwise
+        """
+        if self._recovery_state is None:
+            return False
+
+        checkpoint = self._recovery_state.consume_recovery_attempt()
+        if checkpoint is None:
+            return False
+
+        # Emit recovery event
+        if self.tracer:
+            self.tracer.emit(
+                "recovery_attempt",
+                {
+                    "target_url": checkpoint.url,
+                    "target_step_index": checkpoint.step_index,
+                    "attempt": self._recovery_state.recovery_attempts_used,
+                },
+            )
+
+        try:
+            # Navigate to checkpoint URL
+            await runtime.goto(checkpoint.url)
+
+            # Wait for page to settle
+            await runtime.stabilize()
+
+            # Verify we're at the expected URL (basic check)
+            snapshot = await runtime.snapshot()
+            current_url = snapshot.url or ""
+
+            # Check if URL matches (allowing for minor variations)
+            url_matches = (
+                checkpoint.url in current_url
+                or current_url in checkpoint.url
+                or checkpoint.url.rstrip("/") == current_url.rstrip("/")
+            )
+
+            if url_matches:
+                if self.tracer:
+                    self.tracer.emit(
+                        "recovery_success",
+                        {
+                            "recovered_to_url": checkpoint.url,
+                            "actual_url": current_url,
+                        },
+                    )
+                return True
+            else:
+                if self.tracer:
+                    self.tracer.emit(
+                        "recovery_url_mismatch",
+                        {
+                            "expected_url": checkpoint.url,
+                            "actual_url": current_url,
+                        },
+                    )
+                return False
+
+        except Exception as e:
+            if self.tracer:
+                self.tracer.emit(
+                    "recovery_failed",
+                    {
+                        "error": str(e),
+                        "checkpoint_url": checkpoint.url,
+                    },
+                )
+            return False
 
     def _extract_json(self, text: str) -> dict[str, Any]:
         """Extract JSON from LLM response, handling code fences and think tags."""
@@ -891,31 +1839,41 @@ class PlannerExecutorAgent:
         raise ValueError("No JSON object found in response")
 
     def _parse_action(self, text: str) -> tuple[str, list[Any]]:
-        """Parse action from executor response."""
+        """Parse action from executor response.
+
+        Handles various LLM output formats:
+        - CLICK(42)
+        - - CLICK(42)  (with leading dash/bullet)
+        - TYPE(42, "text")
+        - - TYPE(42, "Logitech mouse")
+        """
         text = text.strip()
 
+        # Strip common prefixes (bullets, dashes, asterisks)
+        text = re.sub(r"^[-*•]\s*", "", text)
+
         # CLICK(<id>)
-        match = re.match(r"CLICK\((\d+)\)", text)
+        match = re.search(r"CLICK\((\d+)\)", text)
         if match:
             return "CLICK", [int(match.group(1))]
 
-        # TYPE(<id>, "text")
-        match = re.match(r'TYPE\((\d+),\s*["\'](.+?)["\']\)', text)
+        # TYPE(<id>, "text") - also handle without quotes
+        match = re.search(r'TYPE\((\d+),\s*["\']?([^"\']+?)["\']?\)', text)
         if match:
-            return "TYPE", [int(match.group(1)), match.group(2)]
+            return "TYPE", [int(match.group(1)), match.group(2).strip()]
 
         # PRESS('key')
-        match = re.match(r"PRESS\(['\"](.+?)['\"]\)", text)
+        match = re.search(r"PRESS\(['\"]?(.+?)['\"]?\)", text)
         if match:
             return "PRESS", [match.group(1)]
 
         # SCROLL(direction)
-        match = re.match(r"SCROLL\((\w+)\)", text)
+        match = re.search(r"SCROLL\((\w+)\)", text)
         if match:
             return "SCROLL", [match.group(1)]
 
         # FINISH()
-        if text.startswith("FINISH"):
+        if "FINISH" in text:
             return "FINISH", []
 
         return "UNKNOWN", [text]
@@ -1107,15 +2065,25 @@ class PlannerExecutorAgent:
         runtime: AgentRuntime,
         goal: str,
         capture_screenshot: bool = True,
+        step: PlanStep | None = None,
     ) -> SnapshotContext:
         """
-        Capture snapshot with incremental limit escalation.
+        Capture snapshot with incremental limit escalation and optional scroll-to-find.
 
         Progressively increases snapshot limit if elements are missing or
         confidence is low. Escalation can be disabled via config.
 
+        After exhausting limit escalation, if scroll_after_escalation is enabled,
+        scrolls down/up to find elements that may be outside the current viewport.
+
         When escalation is disabled (config.snapshot.enabled=False), only a
         single snapshot at limit_base is captured.
+
+        Args:
+            runtime: AgentRuntime for capturing snapshots and scrolling
+            goal: Goal string for context formatting
+            capture_screenshot: Whether to capture screenshot
+            step: Optional PlanStep for goal-aware element detection during scroll
         """
         cfg = self.config.snapshot
         current_limit = cfg.limit_base
@@ -1132,6 +2100,7 @@ class PlannerExecutorAgent:
                     limit=current_limit,
                     screenshot=capture_screenshot,
                     goal=goal,
+                    show_overlay=True,  # Show visual overlay for debugging
                 )
                 if snap is None:
                     if not cfg.enabled:
@@ -1163,6 +2132,9 @@ class PlannerExecutorAgent:
                     break
 
                 # Check element count - if sufficient, no need to escalate
+                # NOTE: Limit escalation is based on element COUNT only, not on whether
+                # a specific target element was found. Intent heuristics are only used
+                # for scroll-after-escalation AFTER limit escalation is exhausted.
                 elements = getattr(snap, "elements", []) or []
                 if len(elements) >= 10:
                     break
@@ -1177,6 +2149,106 @@ class PlannerExecutorAgent:
                 if not cfg.enabled:
                     break  # No escalation on error
                 current_limit = min(current_limit + cfg.limit_step, max_limit + 1)
+
+        # Scroll-after-escalation: if we have a step and scroll is enabled,
+        # try scrolling to find elements that may be outside the viewport
+        #
+        # IMPORTANT: Only trigger scroll-after-escalation for CLICK actions with
+        # specific intents that suggest an element may be below the viewport
+        # (e.g., "add_to_cart", "checkout"). Do NOT scroll for TYPE_AND_SUBMIT
+        # or generic actions where elements are typically visible.
+        should_try_scroll = (
+            cfg.scroll_after_escalation
+            and step is not None
+            and last_snap is not None
+            and not requires_vision
+            and step.action == "CLICK"  # Only for CLICK actions
+            and step.intent  # Must have a specific intent
+            and self._intent_heuristics is not None  # Must have heuristics to detect
+        )
+
+        if should_try_scroll:
+            # Check if we can find the target element using intent heuristics
+            elements = getattr(last_snap, "elements", []) or []
+            url = getattr(last_snap, "url", "") or ""
+            found_element = await self._try_intent_heuristics(step, elements, url)
+
+            if found_element is None:
+                # Element not found in current viewport - try scrolling
+                if self.config.verbose:
+                    print(f"  [SNAPSHOT-ESCALATION] Target element not found, trying scroll-after-escalation...", flush=True)
+
+                # Get viewport height and calculate scroll delta
+                viewport_height = await runtime.get_viewport_height()
+                scroll_delta = viewport_height * cfg.scroll_viewport_fraction
+
+                for direction in cfg.scroll_directions:
+                    # Map direction to dy (pixels): down=positive, up=negative
+                    scroll_dy = scroll_delta if direction == "down" else -scroll_delta
+
+                    for scroll_num in range(cfg.scroll_max_attempts):
+                        if self.config.verbose:
+                            print(f"  [SNAPSHOT-ESCALATION] Scrolling {direction} ({scroll_num + 1}/{cfg.scroll_max_attempts})...", flush=True)
+
+                        # Scroll with deterministic verification
+                        # scroll_by() returns False if scroll had no effect (reached page boundary)
+                        scroll_effective = await runtime.scroll_by(
+                            dy=scroll_dy,
+                            verify=True,
+                            min_delta_px=50.0,
+                            js_fallback=True,
+                            required=False,  # Don't fail the task if scroll doesn't work
+                            timeout_s=5.0,
+                        )
+
+                        if not scroll_effective:
+                            if self.config.verbose:
+                                print(f"  [SNAPSHOT-ESCALATION] Scroll {direction} had no effect (reached boundary), skipping remaining attempts", flush=True)
+                            break  # No point trying more scrolls in this direction
+
+                        # Wait for stabilization after successful scroll
+                        if self.config.stabilize_enabled:
+                            await asyncio.sleep(self.config.stabilize_poll_s)
+
+                        # Take new snapshot at max limit (we already escalated)
+                        try:
+                            snap = await runtime.snapshot(
+                                limit=cfg.limit_max,
+                                screenshot=capture_screenshot,
+                                goal=goal,
+                                show_overlay=True,
+                            )
+                            if snap is None:
+                                continue
+
+                            last_snap = snap
+                            last_compact = self._format_context(snap, goal)
+
+                            # Extract screenshot
+                            if capture_screenshot:
+                                raw_screenshot = getattr(snap, "screenshot", None)
+                                if raw_screenshot:
+                                    screenshot_b64 = raw_screenshot
+
+                            # Check if target element is now visible
+                            elements = getattr(snap, "elements", []) or []
+                            url = getattr(snap, "url", "") or ""
+                            found_element = await self._try_intent_heuristics(step, elements, url)
+
+                            if found_element is not None:
+                                if self.config.verbose:
+                                    print(f"  [SNAPSHOT-ESCALATION] Found target element {found_element} after scrolling {direction}", flush=True)
+                                # Break out of both loops
+                                break
+                        except Exception:
+                            continue
+
+                    # If found, break out of direction loop
+                    if found_element is not None:
+                        break
+
+                if found_element is None and self.config.verbose:
+                    print(f"  [SNAPSHOT-ESCALATION] Target element not found after scrolling", flush=True)
 
         # Fallback for failed capture
         if last_snap is None:
@@ -1236,13 +2308,27 @@ class PlannerExecutorAgent:
                 schema_errors=last_errors or None,
             )
 
+            if self.config.verbose:
+                print("\n" + "=" * 60, flush=True)
+                print(f"[PLANNER] Attempt {attempt}/{max_attempts}", flush=True)
+                print("=" * 60, flush=True)
+                print(f"Task: {task}", flush=True)
+                print(f"Start URL: {start_url}", flush=True)
+                print("-" * 40, flush=True)
+
             resp = self.planner.generate(
                 sys_prompt,
                 user_prompt,
                 temperature=self.config.planner_temperature,
                 max_new_tokens=max_tokens,
             )
+            self._record_token_usage("planner", resp)
             last_output = resp.content
+
+            if self.config.verbose:
+                print("\n--- Planner Response ---", flush=True)
+                print(resp.content, flush=True)
+                print("--- End Response ---\n", flush=True)
 
             try:
                 plan_dict = self._extract_json(resp.content)
@@ -1266,10 +2352,18 @@ class PlannerExecutorAgent:
                 # Emit trace event
                 self._emit_plan_event(plan, last_output)
 
+                if self.config.verbose:
+                    import json
+                    print("\n=== PLAN GENERATED ===", flush=True)
+                    print(json.dumps(plan.model_dump(), indent=2, default=str), flush=True)
+                    print("=== END PLAN ===\n", flush=True)
+
                 return plan
 
             except Exception as e:
                 last_errors = str(e)
+                if self.config.verbose:
+                    print(f"[PLANNER] Parse error: {e}", flush=True)
                 continue
 
         raise RuntimeError(f"Planner failed after {max_attempts} attempts. Last output:\n{last_output[:500]}")
@@ -1329,6 +2423,7 @@ Return JSON patch:
                 temperature=self.config.planner_temperature,
                 max_new_tokens=1024,
             )
+            self._record_token_usage("replan", resp)
             last_output = resp.content
 
             try:
@@ -1426,6 +2521,86 @@ Return JSON patch:
         except Exception:
             return None
 
+    async def _scroll_to_find_element(
+        self,
+        runtime: AgentRuntime,
+        step: PlanStep,
+        goal: str,
+    ) -> tuple[int | None, "SnapshotContext | None"]:
+        """
+        Scroll the page to find an element that matches the step's goal/intent.
+
+        This is used when the initial snapshot doesn't contain the target element
+        (e.g., "Add to Cart" button below the viewport).
+
+        Returns:
+            (element_id, new_snapshot_context) if found, (None, None) otherwise
+        """
+        if not self.config.scroll_to_find_enabled:
+            return None, None
+
+        for direction in self.config.scroll_to_find_directions:
+            for scroll_num in range(self.config.scroll_to_find_max_scrolls):
+                if self.config.verbose:
+                    print(f"  [SCROLL-TO-FIND] Scrolling {direction} ({scroll_num + 1}/{self.config.scroll_to_find_max_scrolls})...", flush=True)
+
+                # Scroll
+                await runtime.scroll(direction)
+
+                # Wait for stabilization
+                if self.config.stabilize_enabled:
+                    await asyncio.sleep(self.config.stabilize_poll_s)
+
+                # Take new snapshot (don't pass step to avoid recursive scroll-to-find)
+                ctx = await self._snapshot_with_escalation(
+                    runtime,
+                    goal=goal,
+                    capture_screenshot=self.config.trace_screenshots,
+                    step=None,  # Avoid recursive scroll-after-escalation
+                )
+
+                # Try heuristics on new snapshot
+                elements = getattr(ctx.snapshot, "elements", []) or []
+                url = getattr(ctx.snapshot, "url", "") or ""
+                element_id = await self._try_intent_heuristics(step, elements, url)
+
+                if element_id is not None:
+                    if self.config.verbose:
+                        print(f"  [SCROLL-TO-FIND] Found element {element_id} after scrolling {direction}", flush=True)
+                    return element_id, ctx
+
+                # Try LLM executor on new snapshot
+                sys_prompt, user_prompt = build_executor_prompt(
+                    step.goal,
+                    step.intent,
+                    ctx.compact_representation,
+                    input_text=step.input,
+                )
+                resp = self.executor.generate(
+                    sys_prompt,
+                    user_prompt,
+                    temperature=self.config.executor_temperature,
+                    max_new_tokens=self.config.executor_max_tokens,
+                )
+                self._record_token_usage("executor", resp)
+                parsed_action, parsed_args = self._parse_action(resp.content)
+
+                if parsed_action == "CLICK" and parsed_args:
+                    element_id = parsed_args[0]
+                    # Verify element exists in snapshot
+                    if any(getattr(el, "id", None) == element_id for el in elements):
+                        if self.config.verbose:
+                            print(f"  [SCROLL-TO-FIND] LLM found element {element_id} after scrolling {direction}", flush=True)
+                        return element_id, ctx
+
+                # If LLM suggests SCROLL, it means element still not visible
+                if parsed_action == "SCROLL":
+                    continue
+
+        if self.config.verbose:
+            print(f"  [SCROLL-TO-FIND] Element not found after scrolling", flush=True)
+        return None, None
+
     async def _execute_optional_substeps(
         self,
         substeps: list[PlanStep],
@@ -1452,6 +2627,7 @@ Return JSON patch:
                     runtime,
                     goal=substep.goal,
                     capture_screenshot=False,
+                    step=substep,  # Enable scroll-after-escalation for substeps
                 )
 
                 # Determine element and action
@@ -1470,6 +2646,7 @@ Return JSON patch:
                             substep.goal,
                             substep.intent,
                             ctx.compact_representation,
+                            input_text=substep.input,
                         )
                         resp = self.executor.generate(
                             sys_prompt,
@@ -1477,6 +2654,7 @@ Return JSON patch:
                             temperature=self.config.executor_temperature,
                             max_new_tokens=self.config.executor_max_tokens,
                         )
+                        self._record_token_usage("executor", resp)
                         parsed_action, parsed_args = self._parse_action(resp.content)
                         if parsed_action == "CLICK" and parsed_args:
                             element_id = parsed_args[0]
@@ -1508,6 +2686,329 @@ Return JSON patch:
 
         return outcomes
 
+    def _word_boundary_match(self, pattern: str, text: str) -> bool:
+        """
+        Match pattern as a word boundary to avoid false positives.
+
+        For example, "x" should match "x" but not "mexico" or "boxer".
+        "close" should match "close" or "Close Dialog" but not "enclosed".
+        """
+        import re
+
+        if not pattern or not text:
+            return False
+
+        pattern_lower = pattern.lower()
+        text_lower = text.lower()
+
+        # For very short patterns (1-2 chars like "x", "×"), require exact match
+        if len(pattern) <= 2:
+            return text_lower == pattern_lower or text_lower.strip() == pattern_lower
+
+        # For longer patterns, use word boundary matching
+        try:
+            return bool(re.search(r'\b' + re.escape(pattern_lower) + r'\b', text_lower))
+        except re.error:
+            # Fall back to contains if regex fails
+            return pattern_lower in text_lower
+
+    async def _attempt_modal_dismissal(
+        self,
+        runtime: AgentRuntime,
+        post_snap: Any,
+    ) -> bool:
+        """
+        Attempt to dismiss a modal/drawer overlay after DOM change detection.
+
+        This handles common blocking scenarios like:
+        - Product protection/warranty upsells
+        - Cookie consent banners
+        - Newsletter signup popups
+        - Promotional overlays
+        - Cart upsell drawers
+
+        The method looks for buttons with common dismissal text patterns
+        and clicks them to clear the overlay.
+
+        Uses word boundary matching to avoid false positives like:
+        - "mexico" matching "x"
+        - "enclosed" matching "close"
+        - "boxer" matching "x"
+
+        Args:
+            runtime: The AgentRuntime for browser control
+            post_snap: The snapshot after DOM change was detected
+
+        Returns:
+            True if a dismissal was attempted, False otherwise
+        """
+        if not self.config.modal.enabled:
+            return False
+
+        cfg = self.config.modal
+        elements = getattr(post_snap, "elements", []) or []
+
+        # Find candidates that match dismissal patterns
+        candidates: list[tuple[int, int, str]] = []  # (element_id, score, matched_pattern)
+
+        for el in elements:
+            el_id = getattr(el, "id", None)
+            if el_id is None:
+                continue
+
+            role = (getattr(el, "role", "") or "").lower()
+            if role not in cfg.role_filter:
+                continue
+
+            # Get text and aria_label for matching
+            text = (getattr(el, "text", "") or "").lower().strip()
+            aria_label = (getattr(el, "aria_label", "") or getattr(el, "ariaLabel", "") or "").lower().strip()
+            labels = [lbl for lbl in [text, aria_label] if lbl]
+
+            if not labels:
+                continue
+
+            matched = False
+
+            # Check icon patterns first (require exact match)
+            for i, icon in enumerate(cfg.dismiss_icons):
+                icon_lower = icon.lower()
+                score = 200 + len(cfg.dismiss_icons) - i  # Icons get high priority
+
+                for lbl in labels:
+                    if lbl == icon_lower:
+                        candidates.append((el_id, score, icon))
+                        matched = True
+                        break
+                if matched:
+                    break
+
+            if matched:
+                continue
+
+            # Check word boundary patterns
+            for i, pattern in enumerate(cfg.dismiss_patterns):
+                score = len(cfg.dismiss_patterns) - i  # Higher score for earlier patterns
+
+                for lbl in labels:
+                    if self._word_boundary_match(pattern, lbl):
+                        candidates.append((el_id, score, pattern))
+                        matched = True
+                        break
+                if matched:
+                    break
+
+        if not candidates:
+            if self.config.verbose:
+                print("  [MODAL] No dismissal candidates found", flush=True)
+            return False
+
+        # Sort by score (highest first) and try the best candidates
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+        for attempt in range(min(cfg.max_attempts, len(candidates))):
+            el_id, score, pattern = candidates[attempt]
+            if self.config.verbose:
+                print(f"  [MODAL] Attempting dismissal: clicking element {el_id} (pattern: '{pattern}')", flush=True)
+
+            try:
+                await runtime.click(el_id)
+                # Wait briefly for modal to close
+                await asyncio.sleep(0.3)
+
+                # Check if modal was dismissed (DOM changed again)
+                try:
+                    new_snap = await runtime.snapshot(emit_trace=False)
+                    new_elements = set(getattr(el, "id", 0) for el in (new_snap.elements or []))
+                    post_elements = set(getattr(el, "id", 0) for el in (post_snap.elements or []))
+                    removed_elements = post_elements - new_elements
+
+                    if len(removed_elements) > 3:
+                        if self.config.verbose:
+                            print(f"  [MODAL] Dismissal successful ({len(removed_elements)} elements removed)", flush=True)
+                        return True
+                except Exception:
+                    pass  # Continue with next attempt
+
+            except Exception as e:
+                if self.config.verbose:
+                    print(f"  [MODAL] Dismissal click failed: {e}", flush=True)
+                continue
+
+        if self.config.verbose:
+            print("  [MODAL] All dismissal attempts exhausted", flush=True)
+        return False
+
+    async def _detect_checkout_page(
+        self,
+        runtime: AgentRuntime,
+        snapshot: Any | None = None,
+    ) -> tuple[bool, str | None]:
+        """
+        Detect if the current page is a checkout-relevant page.
+
+        This detects pages that indicate the agent should continue
+        the checkout flow, such as:
+        - Cart pages
+        - Checkout pages
+        - Sign-in pages during checkout
+
+        Args:
+            runtime: The AgentRuntime for browser control
+            snapshot: Optional snapshot to check (avoids re-capture)
+
+        Returns:
+            (is_checkout_page, page_type) - page_type is 'cart', 'checkout', 'login', etc.
+        """
+        if not self.config.checkout.enabled:
+            return False, None
+
+        cfg = self.config.checkout
+
+        # Get current URL
+        try:
+            current_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
+        except Exception:
+            current_url = None
+
+        if not current_url:
+            return False, None
+
+        url_lower = current_url.lower()
+
+        # Check URL patterns
+        for pattern in cfg.url_patterns:
+            if pattern.lower() in url_lower:
+                page_type = self._classify_checkout_page(pattern)
+                if self.config.verbose:
+                    print(f"  [CHECKOUT] Detected {page_type} page (URL: {pattern})", flush=True)
+                return True, page_type
+
+        # Check element patterns if we have a snapshot
+        if snapshot:
+            elements = getattr(snapshot, "elements", []) or []
+            for el in elements:
+                text = (getattr(el, "text", "") or "").lower()
+                for pattern in cfg.element_patterns:
+                    if pattern.lower() in text:
+                        page_type = self._classify_checkout_page(pattern)
+                        if self.config.verbose:
+                            print(f"  [CHECKOUT] Detected {page_type} page (element: '{pattern}')", flush=True)
+                        return True, page_type
+
+        return False, None
+
+    def _classify_checkout_page(self, pattern: str) -> str:
+        """Classify the type of checkout page based on the matched pattern."""
+        pattern_lower = pattern.lower()
+
+        if any(kw in pattern_lower for kw in ["cart", "basket", "bag"]):
+            return "cart"
+        elif any(kw in pattern_lower for kw in ["signin", "sign-in", "login", "auth"]):
+            return "login"
+        elif any(kw in pattern_lower for kw in ["payment", "pay"]):
+            return "payment"
+        elif any(kw in pattern_lower for kw in ["order", "place"]):
+            return "order"
+        else:
+            return "checkout"
+
+    def _should_continue_after_checkout_detection(
+        self,
+        page_type: str | None,
+        current_step_index: int,
+        total_steps: int,
+    ) -> bool:
+        """
+        Determine if the agent should trigger a replan after detecting a checkout page.
+
+        Returns True if:
+        - We're on the last step or near the end
+        - The page type indicates we need more steps (e.g., login, payment)
+        """
+        if not page_type:
+            return False
+
+        # If we're on the last few steps and detected checkout, we may need to continue
+        steps_remaining = total_steps - current_step_index - 1
+
+        # Always continue if we hit a login page (authentication required)
+        if page_type == "login":
+            return True
+
+        # Continue if we're on cart/checkout and have no more steps
+        if page_type in ("cart", "checkout", "payment", "order") and steps_remaining <= 1:
+            return True
+
+        return False
+
+    def _build_checkout_continuation_task(
+        self,
+        original_task: str,
+        page_type: str | None,
+    ) -> str:
+        """
+        Build a task description for continuing from a checkout page.
+
+        Args:
+            original_task: The original task description
+            page_type: Type of checkout page detected
+
+        Returns:
+            A new task description that continues from the current page
+        """
+        if page_type == "login":
+            return f"Continue from sign-in page: Complete sign-in if credentials are available, or proceed as guest if possible. Original task: {original_task}"
+        elif page_type == "cart":
+            return f"Continue from cart page: Proceed to checkout to complete the purchase. Original task: {original_task}"
+        elif page_type == "payment":
+            return f"Continue from payment page: Complete payment details and place order. Original task: {original_task}"
+        elif page_type == "order":
+            return f"Continue from order page: Review and place the order. Original task: {original_task}"
+        else:
+            return f"Continue checkout process from current page. Original task: {original_task}"
+
+    async def _detect_auth_boundary(
+        self,
+        runtime: AgentRuntime,
+    ) -> bool:
+        """
+        Detect if the current page is an authentication boundary.
+
+        An auth boundary is a login/sign-in page where the agent cannot
+        proceed without credentials. This is a terminal state.
+
+        Args:
+            runtime: The AgentRuntime for browser control
+
+        Returns:
+            True if on an authentication page, False otherwise
+        """
+        if not self.config.auth_boundary.enabled:
+            return False
+
+        cfg = self.config.auth_boundary
+
+        # Get current URL
+        try:
+            current_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
+        except Exception:
+            current_url = None
+
+        if not current_url:
+            return False
+
+        url_lower = current_url.lower()
+
+        # Check URL patterns
+        for pattern in cfg.url_patterns:
+            if pattern.lower() in url_lower:
+                if self.config.verbose:
+                    print(f"  [AUTH] Detected authentication boundary (URL: {pattern})", flush=True)
+                return True
+
+        return False
+
     async def _execute_step(
         self,
         step: PlanStep,
@@ -1518,6 +3019,16 @@ Return JSON patch:
         start_time = time.time()
         pre_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
         step_id = self._emit_step_start(step, step_index, pre_url)
+
+        if self.config.verbose:
+            print(f"\n[STEP {step.id}] {step.goal}", flush=True)
+            print(f"  Action: {step.action}", flush=True)
+            if step.intent:
+                print(f"  Intent: {step.intent}", flush=True)
+            if step.input:
+                print(f"  Input: {step.input}", flush=True)
+            if step.target:
+                print(f"  Target: {step.target}", flush=True)
 
         llm_response: str | None = None
         action_taken: str | None = None
@@ -1562,13 +3073,58 @@ Return JSON patch:
 
                     return outcome
 
-            # Capture snapshot with escalation
+            # Pre-step auth boundary check: stop early if on signin page without credentials
+            # This prevents executing login steps that would fail or use fake credentials
+            if self.config.auth_boundary.enabled and self.config.auth_boundary.stop_on_auth:
+                is_auth_page = await self._detect_auth_boundary(runtime)
+                if is_auth_page:
+                    if self.config.verbose:
+                        print(f"  [AUTH] Auth boundary detected at step start - stopping gracefully", flush=True)
+
+                    outcome = StepOutcome(
+                        step_id=step.id,
+                        goal=step.goal,
+                        status=StepStatus.SUCCESS,  # Graceful stop = success
+                        action_taken="AUTH_BOUNDARY_REACHED",
+                        verification_passed=True,
+                        error=self.config.auth_boundary.auth_success_message,
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        url_before=pre_url,
+                        url_after=pre_url,
+                    )
+
+                    self._emit_step_end(
+                        step_id=step_id,
+                        step_index=step_index,
+                        step=step,
+                        outcome=outcome,
+                        pre_url=pre_url,
+                        post_url=pre_url,
+                        llm_response=None,
+                        snapshot_digest=None,
+                    )
+
+                    # Return special outcome that signals run completion
+                    return outcome
+
+            # Wait for page to stabilize before snapshot
+            if self.config.stabilize_enabled:
+                await runtime.stabilize()
+
+            # Capture snapshot with escalation (includes scroll-after-escalation if enabled)
             ctx = await self._snapshot_with_escalation(
                 runtime,
                 goal=step.goal,
                 capture_screenshot=self.config.trace_screenshots,
+                step=step,  # Enable scroll-after-escalation to find elements outside viewport
             )
             self._snapshot_context = ctx
+
+            if self.config.verbose:
+                elements = getattr(ctx.snapshot, "elements", []) or []
+                print(f"  [SNAPSHOT] Elements: {len(elements)}, URL: {getattr(ctx.snapshot, 'url', 'N/A')}", flush=True)
+                if ctx.requires_vision:
+                    print(f"  [SNAPSHOT] Vision required: {ctx.requires_vision}", flush=True)
 
             # Emit snapshot trace
             self._emit_snapshot(ctx, step_id, step_index)
@@ -1582,8 +3138,10 @@ Return JSON patch:
                     # For now, fall through to standard executor
 
             # Determine element and action
+            original_action = step.action  # Keep original plan action for submit logic
             action_type = step.action
             element_id: int | None = None
+            executor_text: str | None = None  # Text from executor response (for TYPE actions)
 
             if action_type in ("CLICK", "TYPE_AND_SUBMIT"):
                 # Try intent heuristics first (if available)
@@ -1594,13 +3152,21 @@ Return JSON patch:
                 if element_id is not None:
                     used_heuristics = True
                     action_taken = f"{action_type}({element_id}) [heuristic]"
+                    if self.config.verbose:
+                        print(f"  [EXECUTOR] Using heuristic: {action_taken}", flush=True)
                 else:
                     # Fall back to LLM executor
                     sys_prompt, user_prompt = build_executor_prompt(
                         step.goal,
                         step.intent,
                         ctx.compact_representation,
+                        input_text=step.input,
                     )
+
+                    if self.config.verbose:
+                        print("\n--- Compact Context (Snapshot) ---", flush=True)
+                        print(ctx.compact_representation, flush=True)
+                        print("--- End Compact Context ---\n", flush=True)
 
                     resp = self.executor.generate(
                         sys_prompt,
@@ -1608,7 +3174,11 @@ Return JSON patch:
                         temperature=self.config.executor_temperature,
                         max_new_tokens=self.config.executor_max_tokens,
                     )
+                    self._record_token_usage("executor", resp)
                     llm_response = resp.content
+
+                    if self.config.verbose:
+                        print(f"  [EXECUTOR] LLM Response: {resp.content}", flush=True)
 
                     # Parse action
                     parsed_action, parsed_args = self._parse_action(resp.content)
@@ -1617,8 +3187,12 @@ Return JSON patch:
                         element_id = parsed_args[0]
                     elif parsed_action == "TYPE" and len(parsed_args) >= 2:
                         element_id = parsed_args[0]
+                        executor_text = parsed_args[1]  # Store text from executor response
 
                     action_taken = f"{action_type}({', '.join(str(a) for a in parsed_args)})"
+
+                    if self.config.verbose:
+                        print(f"  [EXECUTOR] Parsed action: {action_taken}", flush=True)
 
                     # Apply executor override if configured
                     if self._executor_override and element_id is not None:
@@ -1633,36 +3207,106 @@ Return JSON patch:
                                 if override_id is not None:
                                     element_id = override_id
                                     action_taken = f"{action_type}({element_id}) [override]"
+                                    if self.config.verbose:
+                                        print(f"  [EXECUTOR] Override: {action_taken}", flush=True)
                                 else:
                                     error = f"Executor override rejected: {reason}"
                         except Exception:
                             pass  # Ignore override errors
 
             elif action_type == "NAVIGATE":
-                action_taken = f"NAVIGATE({step.target})"
+                action_taken = f"NAVIGATE({step.target or 'current'})"
             elif action_type == "SCROLL":
                 action_taken = "SCROLL(down)"
             else:
                 action_taken = action_type
 
+            # If executor suggested SCROLL or selected a non-actionable element for CLICK,
+            # try scroll-to-find to locate the actual target element
+            if error is None and original_action == "CLICK":
+                should_scroll_to_find = False
+                reason = ""
+
+                if action_type == "SCROLL":
+                    # Executor explicitly said to scroll - element not visible
+                    should_scroll_to_find = True
+                    reason = "executor suggested SCROLL"
+                elif element_id is not None:
+                    # Check if selected element is a non-actionable type (input fields)
+                    selected_element = None
+                    for el in elements:
+                        if getattr(el, "id", None) == element_id:
+                            selected_element = el
+                            break
+                    if selected_element:
+                        role = (getattr(selected_element, "role", "") or "").lower()
+                        if role in {"searchbox", "textbox", "combobox", "input", "textarea"}:
+                            should_scroll_to_find = True
+                            reason = f"selected input element ({role})"
+
+                if should_scroll_to_find and self.config.scroll_to_find_enabled:
+                    if self.config.verbose:
+                        print(f"  [SCROLL-TO-FIND] Triggering because {reason}", flush=True)
+                    found_id, new_ctx = await self._scroll_to_find_element(runtime, step, step.goal)
+                    if found_id is not None and new_ctx is not None:
+                        element_id = found_id
+                        ctx = new_ctx
+                        action_type = "CLICK"
+                        action_taken = f"CLICK({element_id}) [scroll-to-find]"
+
             # Execute action via runtime
             if error is None:
                 if action_type == "CLICK" and element_id is not None:
                     await runtime.click(element_id)
+                    if self.config.verbose:
+                        print(f"  [ACTION] CLICK({element_id})", flush=True)
                 elif action_type == "TYPE" and element_id is not None:
-                    text = step.input or ""
+                    # Use text from executor response first, then fall back to step.input
+                    text = executor_text or step.input or ""
                     await runtime.type(element_id, text)
+                    # If original plan action was TYPE_AND_SUBMIT, press Enter to submit
+                    if original_action == "TYPE_AND_SUBMIT":
+                        await runtime.press("Enter")
+                        if self.config.verbose:
+                            print(f"  [ACTION] TYPE_AND_SUBMIT({element_id}, '{text}')", flush=True)
+                        await runtime.stabilize()
+                    elif self.config.verbose:
+                        print(f"  [ACTION] TYPE({element_id}, '{text[:30]}...')" if len(text) > 30 else f"  [ACTION] TYPE({element_id}, '{text}')", flush=True)
                 elif action_type == "TYPE_AND_SUBMIT" and element_id is not None:
-                    text = step.input or ""
+                    # Use text from executor response first, then step.input, then extract from goal
+                    text = executor_text or step.input or ""
+                    if not text:
+                        # Try to extract from goal like "Search for Logitech mouse"
+                        import re
+                        match = re.search(r"[Ss]earch\s+(?:for\s+)?['\"]?([^'\"]+)['\"]?", step.goal)
+                        if match:
+                            text = match.group(1).strip()
                     await runtime.type(element_id, text)
                     await runtime.press("Enter")
+                    if self.config.verbose:
+                        print(f"  [ACTION] TYPE_AND_SUBMIT({element_id}, '{text}')", flush=True)
+                    # Wait for page to load after submit
+                    await runtime.stabilize()
                 elif action_type == "PRESS":
                     key = "Enter"  # Default
                     await runtime.press(key)
+                    if self.config.verbose:
+                        print(f"  [ACTION] PRESS({key})", flush=True)
                 elif action_type == "SCROLL":
                     await runtime.scroll("down")
-                elif action_type == "NAVIGATE" and step.target:
-                    await runtime.goto(step.target)
+                    if self.config.verbose:
+                        print(f"  [ACTION] SCROLL(down)", flush=True)
+                elif action_type == "NAVIGATE":
+                    if step.target:
+                        await runtime.goto(step.target)
+                        if self.config.verbose:
+                            print(f"  [ACTION] NAVIGATE({step.target})", flush=True)
+                        # Wait for page to load after navigation
+                        await runtime.stabilize()
+                    else:
+                        # No target URL - we're already at the page, just verify
+                        if self.config.verbose:
+                            print(f"  [ACTION] NAVIGATE(skip - already at page)", flush=True)
                 elif action_type == "FINISH":
                     pass  # No action needed
                 elif action_type not in ("CLICK", "TYPE", "TYPE_AND_SUBMIT") or element_id is None:
@@ -1677,7 +3321,27 @@ Return JSON patch:
 
             # Run verifications
             if step.verify and error is None:
+                if self.config.verbose:
+                    print(f"  [VERIFY] Running {len(step.verify)} verification predicates...", flush=True)
                 verification_passed = await self._verify_step(runtime, step)
+                if self.config.verbose:
+                    print(f"  [VERIFY] Predicate result: {'PASS' if verification_passed else 'FAIL'}", flush=True)
+
+                # For successful CLICK actions, check if a modal/drawer appeared and dismiss it
+                # This handles cases like Amazon's "Add Protection" drawer after Add to Cart
+                # where verification passes (e.g., "Proceed to checkout" button exists in drawer)
+                # but we need to dismiss the overlay before continuing
+                if verification_passed and original_action == "CLICK" and self.config.modal.enabled:
+                    try:
+                        post_snap = await runtime.snapshot(emit_trace=False)
+                        pre_elements = set(getattr(el, "id", 0) for el in (ctx.snapshot.elements or []))
+                        post_elements = set(getattr(el, "id", 0) for el in (post_snap.elements or []))
+                        new_elements = post_elements - pre_elements
+                        if len(new_elements) >= self.config.modal.min_new_elements:
+                            # Significant DOM change after CLICK - might be a modal/drawer
+                            await self._attempt_modal_dismissal(runtime, post_snap)
+                    except Exception:
+                        pass  # Ignore snapshot errors
 
                 # If verification failed and we have optional substeps, try them
                 if not verification_passed and step.optional_substeps:
@@ -1689,8 +3353,60 @@ Return JSON patch:
                     # Re-run verification after substeps
                     if any(o.status == StepStatus.SUCCESS for o in substep_outcomes):
                         verification_passed = await self._verify_step(runtime, step)
+
+                # Fallback: For navigation-causing actions, if URL changed significantly,
+                # consider the action successful even if predicate verification failed.
+                # This handles cases where local LLMs generate imprecise predicates.
+                if not verification_passed and original_action in ("TYPE_AND_SUBMIT", "CLICK"):
+                    current_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
+                    if current_url and pre_url and current_url != pre_url:
+                        # URL changed - the action likely achieved navigation
+                        if self.config.verbose:
+                            print(f"  [VERIFY] Predicate failed but URL changed: {pre_url} -> {current_url}", flush=True)
+                            print(f"  [VERIFY] Accepting {original_action} as successful (URL change fallback)", flush=True)
+                        verification_passed = True
+                    elif original_action == "CLICK" and error is None and element_id is not None:
+                        # For CLICK actions that don't change URL, check if DOM changed
+                        # (e.g., modal appeared, cart drawer opened)
+                        # But first verify we clicked an actionable element, not an input field
+                        clicked_element = None
+                        for el in (ctx.snapshot.elements or []):
+                            if getattr(el, "id", None) == element_id:
+                                clicked_element = el
+                                break
+
+                        # Don't accept DOM change fallback for input/search elements
+                        # (clicking them causes focus changes but doesn't complete actions)
+                        clicked_role = (getattr(clicked_element, "role", "") or "").lower() if clicked_element else ""
+                        input_roles = {"searchbox", "textbox", "combobox", "input", "textarea"}
+                        if clicked_role in input_roles:
+                            if self.config.verbose:
+                                print(f"  [VERIFY] Clicked input element ({clicked_role}), not accepting DOM change fallback", flush=True)
+                        else:
+                            try:
+                                post_snap = await runtime.snapshot(emit_trace=False)
+                                pre_elements = set(getattr(el, "id", 0) for el in (ctx.snapshot.elements or []))
+                                post_elements = set(getattr(el, "id", 0) for el in (post_snap.elements or []))
+                                new_elements = post_elements - pre_elements
+                                if len(new_elements) >= self.config.modal.min_new_elements:  # Significant DOM change
+                                    if self.config.verbose:
+                                        print(f"  [VERIFY] Predicate failed but DOM changed ({len(new_elements)} new elements)", flush=True)
+                                        print(f"  [VERIFY] Accepting CLICK as successful (DOM change fallback)", flush=True)
+                                    verification_passed = True
+
+                                    # Attempt modal dismissal if enabled
+                                    # This handles blocking overlays like product protection drawers
+                                    if self.config.modal.enabled:
+                                        await self._attempt_modal_dismissal(runtime, post_snap)
+                            except Exception:
+                                pass  # Ignore snapshot errors
             else:
                 verification_passed = error is None
+                if self.config.verbose:
+                    if not step.verify:
+                        print(f"  [VERIFY] No predicates defined, using error check: {'PASS' if verification_passed else 'FAIL'}", flush=True)
+                    elif error:
+                        print(f"  [VERIFY] Skipped due to error: {error}", flush=True)
 
             # Track successful URL for recovery
             if verification_passed and self.config.recovery.track_successful_urls:
@@ -1749,6 +3465,12 @@ Return JSON patch:
             pred = build_predicate(verify_spec)
             label = f"verify_{step.id}"
 
+            # Log what predicate we're checking
+            if self.config.verbose:
+                import json
+                spec_str = json.dumps(verify_spec, default=str) if isinstance(verify_spec, dict) else str(verify_spec)
+                print(f"  [VERIFY] Checking predicate: {spec_str[:100]}...", flush=True)
+
             # Use runtime's check with eventually for required verifications
             if step.required:
                 ok = await runtime.check(pred, label=label, required=True).eventually(
@@ -1760,7 +3482,12 @@ Return JSON patch:
                 ok = runtime.assert_(pred, label=label, required=False)
 
             if not ok:
+                if self.config.verbose:
+                    print(f"  [VERIFY] Predicate FAILED", flush=True)
                 return False
+            else:
+                if self.config.verbose:
+                    print(f"  [VERIFY] Predicate PASSED", flush=True)
 
         return True
 
@@ -1771,7 +3498,7 @@ Return JSON patch:
     async def run(
         self,
         runtime: AgentRuntime,
-        task: str,
+        task: AutomationTask | str,
         *,
         start_url: str | None = None,
         run_id: str | None = None,
@@ -1781,42 +3508,150 @@ Return JSON patch:
 
         Args:
             runtime: AgentRuntime instance
-            task: Task description
-            start_url: Starting URL (optional)
+            task: AutomationTask instance or task description string
+            start_url: Starting URL (only needed if task is a string)
             run_id: Run ID for tracing (optional)
 
         Returns:
             RunOutcome with execution results
+
+        Example with AutomationTask:
+            task = AutomationTask(
+                task_id="purchase-laptop",
+                starting_url="https://amazon.com",
+                task="Find a laptop under $1000 and add to cart",
+                category=TaskCategory.TRANSACTION,
+            )
+            result = await agent.run(runtime, task)
+
+        Example with string:
+            result = await agent.run(
+                runtime,
+                "Search for laptops",
+                start_url="https://amazon.com",
+            )
         """
-        self._run_id = run_id or str(uuid.uuid4())
+        # Normalize task to AutomationTask
+        if isinstance(task, str):
+            if start_url is None:
+                raise ValueError("start_url is required when task is a string")
+            automation_task = AutomationTask(
+                task_id=run_id or str(uuid.uuid4()),
+                starting_url=start_url,
+                task=task,
+            )
+        else:
+            automation_task = task
+            if start_url is None:
+                start_url = automation_task.starting_url
+
+        self._current_task = automation_task
+        self._run_id = run_id or automation_task.task_id
         self._replans_used = 0
         self._vision_calls = 0
         start_time = time.time()
 
+        # Initialize recovery state if enabled
+        if automation_task.enable_recovery:
+            self._recovery_state = RecoveryState(
+                max_recovery_attempts=automation_task.max_recovery_attempts,
+            )
+        else:
+            self._recovery_state = None
+
+        # Initialize composable heuristics
+        self._composable_heuristics = ComposableHeuristics(
+            static_heuristics=self._intent_heuristics,
+            task_category=automation_task.category,
+        )
+
+        # Use task description for planning
+        task_description = automation_task.task
+
         # Emit run start
-        self._emit_run_start(task, start_url)
+        self._emit_run_start(task_description, start_url)
 
         step_outcomes: list[StepOutcome] = []
         error: str | None = None
 
         try:
             # Generate plan
-            plan = await self.plan(task, start_url=start_url)
+            plan = await self.plan(task_description, start_url=start_url)
 
             # Execute steps
             step_index = 0
             while step_index < len(plan.steps):
                 step = plan.steps[step_index]
 
+                # Set step-specific heuristic hints
+                if self._composable_heuristics and step.heuristic_hints:
+                    self._composable_heuristics.set_step_hints(step.heuristic_hints)
+
                 outcome = await self._execute_step(step, runtime, step_index)
                 step_outcomes.append(outcome)
 
+                # Check if auth boundary was reached at step start (graceful termination)
+                if outcome.action_taken == "AUTH_BOUNDARY_REACHED":
+                    if self.config.verbose:
+                        print(f"  [AUTH] Run completed at authentication boundary", flush=True)
+                    break  # Graceful termination - no error
+
+                # Record checkpoint on success (for recovery)
+                if outcome.status in (StepStatus.SUCCESS, StepStatus.VISION_FALLBACK):
+                    if self._recovery_state is not None and outcome.url_after:
+                        self._recovery_state.record_checkpoint(
+                            url=outcome.url_after,
+                            step_index=step_index,
+                            snapshot_digest=hashlib.sha256(
+                                (outcome.url_after or "").encode()
+                            ).hexdigest()[:16],
+                            predicates_passed=[],
+                        )
+
                 # Handle failure
                 if outcome.status == StepStatus.FAILED and step.required:
+                    # Check if we've reached an authentication boundary
+                    # This is a graceful terminal state - agent did all it could
+                    if self.config.auth_boundary.enabled:
+                        is_auth_page = await self._detect_auth_boundary(runtime)
+                        if is_auth_page and self.config.auth_boundary.stop_on_auth:
+                            if self.config.verbose:
+                                print(f"  [AUTH] Stopping at authentication boundary", flush=True)
+                            # Mark as success since we reached the auth page successfully
+                            # The "failure" is just that we can't proceed without credentials
+                            error = None  # Clear any error
+                            # Update the outcome to indicate auth boundary
+                            outcome = StepOutcome(
+                                step_id=outcome.step_id,
+                                goal=outcome.goal,
+                                status=StepStatus.SUCCESS,  # Treat as success
+                                action_taken=outcome.action_taken,
+                                verification_passed=True,
+                                used_vision=outcome.used_vision,
+                                error=self.config.auth_boundary.auth_success_message,
+                                duration_ms=outcome.duration_ms,
+                                url_before=outcome.url_before,
+                                url_after=outcome.url_after,
+                            )
+                            step_outcomes[-1] = outcome  # Replace the failed outcome
+                            break  # Stop execution gracefully
+
+                    # Try recovery first if available
+                    if self._recovery_state and self._recovery_state.can_recover():
+                        recovered = await self._attempt_recovery(runtime)
+                        if recovered:
+                            # Resume from checkpoint step
+                            checkpoint = self._recovery_state.current_recovery_target
+                            if checkpoint:
+                                step_index = checkpoint.step_index + 1
+                                self._recovery_state.clear_recovery_target()
+                                continue
+
+                    # Try replanning
                     if self._replans_used < self.config.retry.max_replans:
                         try:
                             plan = await self.replan(
-                                task,
+                                task_description,
                                 step,
                                 outcome.error or "verification_failed",
                             )
@@ -1826,14 +3661,83 @@ Return JSON patch:
                             error = f"Replan failed: {e}"
                             break
                     else:
-                        error = f"Step {step.id} failed: {outcome.error}"
-                        break
+                        # Replanning exhausted - check if we should fallback to stepwise
+                        if (
+                            self.config.auto_fallback_to_stepwise
+                            and self._replans_used >= self.config.auto_fallback_replan_threshold
+                        ):
+                            if self.config.verbose:
+                                print(
+                                    f"\n[FALLBACK] Upfront planning failed after {self._replans_used} replans. "
+                                    f"Switching to stepwise planning...",
+                                    flush=True,
+                                )
+                            # Run stepwise planning as fallback
+                            # This will handle the rest of the task adaptively
+                            stepwise_result = await self.run_stepwise(
+                                runtime,
+                                automation_task,
+                                run_id=self._run_id,
+                            )
+                            # Combine outcomes: existing steps + stepwise steps
+                            combined_outcomes = step_outcomes + stepwise_result.step_outcomes
+                            return RunOutcome(
+                                run_id=self._run_id,
+                                task=task_description,
+                                success=stepwise_result.success,
+                                steps_completed=len(combined_outcomes),
+                                steps_total=len(combined_outcomes),
+                                replans_used=self._replans_used,
+                                step_outcomes=combined_outcomes,
+                                total_duration_ms=int((time.time() - start_time) * 1000),
+                                error=stepwise_result.error,
+                                token_usage=self.get_token_stats(),
+                                fallback_used=True,
+                            )
+                        else:
+                            error = f"Step {step.id} failed: {outcome.error}"
+                            break
 
                 # Check stop condition
                 if step.stop_if_true and outcome.verification_passed:
                     break
 
                 step_index += 1
+
+                # Check for checkout page detection at end of plan
+                # This handles cases where modal dismissal leaves us on a checkout page
+                # but the plan has no more steps
+                if (
+                    self.config.checkout.enabled
+                    and self.config.checkout.trigger_replan
+                    and step_index >= len(plan.steps)  # Just finished last step
+                    and outcome.status in (StepStatus.SUCCESS, StepStatus.VISION_FALLBACK)
+                    and self._replans_used < self.config.retry.max_replans
+                ):
+                    # Check if we're on a checkout-relevant page
+                    is_checkout, page_type = await self._detect_checkout_page(runtime)
+                    if is_checkout and self._should_continue_after_checkout_detection(
+                        page_type, step_index - 1, len(plan.steps)
+                    ):
+                        if self.config.verbose:
+                            print(f"  [CHECKOUT] Triggering replan for {page_type} page", flush=True)
+                        try:
+                            # Replan with context about where we are
+                            continuation_task = self._build_checkout_continuation_task(
+                                task_description, page_type
+                            )
+                            plan = await self.plan(continuation_task, start_url=None)
+                            step_index = 0  # Start from beginning of new plan
+                            self._replans_used += 1
+                            continue
+                        except Exception as e:
+                            if self.config.verbose:
+                                print(f"  [CHECKOUT] Replan failed: {e}", flush=True)
+                            # Continue without replanning
+
+                # Clear step hints for next iteration
+                if self._composable_heuristics:
+                    self._composable_heuristics.clear_step_hints()
 
         except Exception as e:
             error = str(e)
@@ -1847,7 +3751,7 @@ Return JSON patch:
 
         run_outcome = RunOutcome(
             run_id=self._run_id,
-            task=task,
+            task=task_description,
             success=success,
             steps_completed=len(step_outcomes),
             steps_total=len(self._current_plan.steps) if self._current_plan else 0,
@@ -1855,12 +3759,443 @@ Return JSON patch:
             step_outcomes=step_outcomes,
             total_duration_ms=int((time.time() - start_time) * 1000),
             error=error,
+            token_usage=self.get_token_stats(),
         )
 
         # Emit run end
         self._emit_run_end(run_outcome)
 
         return run_outcome
+
+    # -------------------------------------------------------------------------
+    # Stepwise Planning (ReAct-style)
+    # -------------------------------------------------------------------------
+
+    async def _plan_next_step(
+        self,
+        goal: str,
+        current_url: str,
+        page_context: str,
+        action_history: list[ActionRecord],
+    ) -> dict[str, Any]:
+        """
+        Use the planner LLM to decide the next action based on current page state.
+
+        Args:
+            goal: The overall task goal
+            current_url: Current page URL
+            page_context: Compact representation of page elements
+            action_history: List of previously executed actions
+
+        Returns:
+            Dictionary with action details:
+            {
+                "action": "CLICK" | "TYPE_AND_SUBMIT" | "SCROLL" | "DONE" | "STUCK",
+                "intent": "description of target element",
+                "input": "text to type",
+                "direction": "up" | "down",
+                "reasoning": "explanation"
+            }
+        """
+        sys_prompt, user_prompt = build_stepwise_planner_prompt(
+            goal=goal,
+            current_url=current_url,
+            page_context=page_context,
+            action_history=action_history,
+        )
+
+        if self.config.verbose:
+            print("\n" + "=" * 60, flush=True)
+            print("[STEPWISE PLANNER] Deciding next action", flush=True)
+            print("=" * 60, flush=True)
+            print(f"Goal: {goal}", flush=True)
+            print(f"URL: {current_url}", flush=True)
+            print(f"History: {len(action_history)} actions", flush=True)
+
+        resp = self.planner.generate(
+            sys_prompt,
+            user_prompt,
+            max_tokens=self.config.planner_max_tokens,
+            temperature=self.config.planner_temperature,
+        )
+
+        # Track token usage
+        self._token_collector.record(role="stepwise_planner", resp=resp)
+
+        raw_text = resp.content.strip()
+
+        if self.config.verbose:
+            print(f"\n--- Stepwise Planner Response ---", flush=True)
+            print(raw_text, flush=True)
+            print("--- End Response ---\n", flush=True)
+
+        # Parse JSON response
+        try:
+            # Handle code fences if present
+            if raw_text.startswith("```"):
+                lines = raw_text.split("\n")
+                # Find start and end of JSON
+                start_idx = 1 if lines[0].startswith("```") else 0
+                end_idx = len(lines)
+                for i in range(len(lines) - 1, -1, -1):
+                    if lines[i].strip() == "```":
+                        end_idx = i
+                        break
+                raw_text = "\n".join(lines[start_idx:end_idx])
+
+            action_data = json.loads(raw_text)
+            return action_data
+        except json.JSONDecodeError as e:
+            # Try to extract JSON from the response
+            import re
+            json_match = re.search(r'\{[^{}]*\}', raw_text, re.DOTALL)
+            if json_match:
+                try:
+                    return json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    pass
+
+            return {
+                "action": "STUCK",
+                "reasoning": f"Failed to parse planner response: {e}",
+            }
+
+    async def run_stepwise(
+        self,
+        runtime: AgentRuntime,
+        task: AutomationTask | str,
+        *,
+        start_url: str | None = None,
+        run_id: str | None = None,
+    ) -> RunOutcome:
+        """
+        Execute task using stepwise (ReAct-style) planning.
+
+        Instead of generating a full plan upfront, the agent plans one step at
+        a time based on the current page state. This allows adaptation to
+        unexpected site layouts and flows.
+
+        Args:
+            runtime: AgentRuntime instance
+            task: AutomationTask instance or task description string
+            start_url: Starting URL (only needed if task is a string)
+            run_id: Run ID for tracing (optional)
+
+        Returns:
+            RunOutcome with execution results
+
+        Example:
+            result = await agent.run_stepwise(
+                runtime,
+                "Find a laptop and add to cart",
+                start_url="https://example.com",
+            )
+        """
+        # Normalize task to AutomationTask
+        if isinstance(task, str):
+            if start_url is None:
+                raise ValueError("start_url is required when task is a string")
+            automation_task = AutomationTask(
+                task_id=run_id or str(uuid.uuid4()),
+                starting_url=start_url,
+                task=task,
+            )
+        else:
+            automation_task = task
+            if start_url is None:
+                start_url = automation_task.starting_url
+
+        self._current_task = automation_task
+        self._run_id = run_id or automation_task.task_id
+        self._replans_used = 0
+        self._vision_calls = 0
+        start_time = time.time()
+
+        # Initialize recovery state if enabled
+        if automation_task.enable_recovery:
+            self._recovery_state = RecoveryState(
+                max_recovery_attempts=automation_task.max_recovery_attempts,
+            )
+        else:
+            self._recovery_state = None
+
+        # Initialize composable heuristics
+        self._composable_heuristics = ComposableHeuristics(
+            static_heuristics=self._intent_heuristics,
+            task_category=automation_task.category,
+        )
+
+        task_description = automation_task.task
+        stepwise_cfg = self.config.stepwise
+
+        # Emit run start
+        self._emit_run_start(task_description, start_url)
+
+        action_history: list[ActionRecord] = []
+        step_outcomes: list[StepOutcome] = []
+        error: str | None = None
+        step_num = 0
+
+        if self.config.verbose:
+            print("\n" + "=" * 60, flush=True)
+            print("[STEPWISE] Starting stepwise execution", flush=True)
+            print("=" * 60, flush=True)
+            print(f"Task: {task_description}", flush=True)
+            print(f"Start URL: {start_url}", flush=True)
+            print(f"Max steps: {stepwise_cfg.max_steps}", flush=True)
+            print("=" * 60 + "\n", flush=True)
+
+        try:
+            while step_num < stepwise_cfg.max_steps:
+                step_num += 1
+
+                if self.config.verbose:
+                    print(f"\n[STEP {step_num}] Planning next action...", flush=True)
+
+                # 1. Take snapshot with escalation
+                self._snapshot_context = await self._snapshot_with_escalation(
+                    runtime,
+                    goal=task_description,
+                )
+                current_url = await runtime.get_url() if hasattr(runtime, "get_url") else ""
+
+                # 2. Build page context
+                if stepwise_cfg.include_page_context:
+                    page_context = self._snapshot_context.compact_representation or "(no elements captured)"
+                else:
+                    page_context = "(page context disabled)"
+
+                # 3. Get recent action history
+                recent_history = action_history[-stepwise_cfg.action_history_limit:]
+
+                # 4. Ask planner for next action
+                next_action = await self._plan_next_step(
+                    goal=task_description,
+                    current_url=current_url,
+                    page_context=page_context,
+                    action_history=recent_history,
+                )
+
+                action_type = next_action.get("action", "STUCK").upper()
+                reasoning = next_action.get("reasoning", "")
+
+                if self.config.verbose:
+                    print(f"  [PLANNER] Action: {action_type}", flush=True)
+                    print(f"  [PLANNER] Reasoning: {reasoning}", flush=True)
+
+                # 5. Check for terminal states
+                if action_type == "DONE":
+                    if self.config.verbose:
+                        print(f"\n[STEPWISE] Task completed: {reasoning}", flush=True)
+                    break
+
+                if action_type == "STUCK":
+                    error = f"Agent stuck: {reasoning}"
+                    if self.config.verbose:
+                        print(f"\n[STEPWISE] Agent stuck: {reasoning}", flush=True)
+
+                    # Check if this is an auth boundary
+                    if self.config.auth_boundary.enabled:
+                        is_auth = await self._detect_auth_boundary(runtime)
+                        if is_auth:
+                            if self.config.verbose:
+                                print(f"  [AUTH] Detected auth boundary - treating as success", flush=True)
+                            error = None  # Clear error - this is a graceful stop
+                    break
+
+                # 6. Convert action to PlanStep and execute
+                plan_step = self._action_to_plan_step(next_action, step_num)
+
+                if self.config.verbose:
+                    print(f"  [EXECUTE] {plan_step.action}", flush=True)
+                    if plan_step.intent:
+                        print(f"  [EXECUTE] Intent: {plan_step.intent}", flush=True)
+                    if plan_step.input:
+                        print(f"  [EXECUTE] Input: {plan_step.input}", flush=True)
+
+                # Execute the step
+                outcome = await self._execute_step(plan_step, runtime, step_num - 1)
+                step_outcomes.append(outcome)
+
+                # 7. Record action in history
+                action_record = ActionRecord(
+                    step_num=step_num,
+                    action=action_type,
+                    target=next_action.get("intent") or next_action.get("input") or next_action.get("direction"),
+                    result="success" if outcome.verification_passed else "failed",
+                    url_after=outcome.url_after,
+                )
+                action_history.append(action_record)
+
+                if self.config.verbose:
+                    status = "OK" if outcome.verification_passed else "FAIL"
+                    print(f"  [RESULT] {status}", flush=True)
+
+                # 8. Record checkpoint on success (for recovery)
+                if outcome.status in (StepStatus.SUCCESS, StepStatus.VISION_FALLBACK):
+                    if self._recovery_state and outcome.url_after:
+                        self._recovery_state.record_checkpoint(
+                            url=outcome.url_after,
+                            step_index=step_num - 1,
+                            snapshot_digest=hashlib.sha256(
+                                (outcome.url_after or "").encode()
+                            ).hexdigest()[:16],
+                            predicates_passed=[],
+                        )
+
+                    # 8.1 Modal dismissal after successful CLICK actions
+                    # Handles drawer/popup overlays (e.g., Amazon's "Add Protection" drawer after Add to Cart)
+                    if action_type == "CLICK" and self.config.modal.enabled:
+                        try:
+                            post_snap = await runtime.snapshot(emit_trace=False)
+                            pre_elements = set(getattr(el, "id", 0) for el in (snap.elements or []))
+                            post_elements = set(getattr(el, "id", 0) for el in (post_snap.elements or []))
+                            new_elements = post_elements - pre_elements
+                            if len(new_elements) >= self.config.modal.min_new_elements:
+                                # Significant DOM change after CLICK - might be a modal/drawer
+                                if self.config.verbose:
+                                    print(f"  [MODAL] Detected {len(new_elements)} new elements after CLICK, checking for dismissible overlay...", flush=True)
+                                dismissed = await self._attempt_modal_dismissal(runtime, post_snap)
+                                if dismissed and self.config.verbose:
+                                    print(f"  [MODAL] Dismissed overlay", flush=True)
+                        except Exception:
+                            pass  # Ignore snapshot errors
+
+                # 9. Handle failure
+                if outcome.status == StepStatus.FAILED:
+                    # Check for auth boundary
+                    if self.config.auth_boundary.enabled:
+                        is_auth = await self._detect_auth_boundary(runtime)
+                        if is_auth and self.config.auth_boundary.stop_on_auth:
+                            if self.config.verbose:
+                                print(f"  [AUTH] Stopping at authentication boundary", flush=True)
+                            # Update the outcome to indicate auth boundary
+                            outcome = StepOutcome(
+                                step_id=outcome.step_id,
+                                goal=outcome.goal,
+                                status=StepStatus.SUCCESS,
+                                action_taken=outcome.action_taken,
+                                verification_passed=True,
+                                used_vision=outcome.used_vision,
+                                error=self.config.auth_boundary.auth_success_message,
+                                duration_ms=outcome.duration_ms,
+                                url_before=outcome.url_before,
+                                url_after=outcome.url_after,
+                            )
+                            step_outcomes[-1] = outcome
+                            break
+
+                    # Try recovery if available
+                    if self._recovery_state and self._recovery_state.can_recover():
+                        if self.config.verbose:
+                            print(f"  [RECOVERY] Attempting recovery to last known good state...", flush=True)
+                        recovered = await self._attempt_recovery(runtime)
+                        if recovered:
+                            checkpoint = self._recovery_state.current_recovery_target
+                            if checkpoint:
+                                # Roll back action history to checkpoint
+                                action_history = [
+                                    a for a in action_history
+                                    if a.step_num <= checkpoint.step_index + 1
+                                ]
+                                self._recovery_state.clear_recovery_target()
+                                if self.config.verbose:
+                                    print(f"  [RECOVERY] Recovered to step {checkpoint.step_index + 1}", flush=True)
+                                continue
+
+                    # If action failed, the stepwise planner will see it in history
+                    # and adapt on the next iteration (no explicit replan needed)
+                    if self.config.verbose:
+                        print(f"  [STEPWISE] Action failed, will adapt on next iteration", flush=True)
+
+        except Exception as e:
+            error = str(e)
+            if self.config.verbose:
+                print(f"\n[STEPWISE] Exception: {error}", flush=True)
+
+        # Build final outcome
+        success = error is None and step_num > 0
+
+        # If we exited due to DONE, it's a success
+        # If we exited due to STUCK with auth boundary, it's a success
+        # If we hit max_steps, it's a failure
+        if step_num >= stepwise_cfg.max_steps and error is None:
+            error = f"Max steps ({stepwise_cfg.max_steps}) reached without completing task"
+            success = False
+
+        run_outcome = RunOutcome(
+            run_id=self._run_id,
+            task=task_description,
+            success=success,
+            steps_completed=len(step_outcomes),
+            steps_total=step_num,
+            replans_used=0,  # Stepwise doesn't use replanning
+            step_outcomes=step_outcomes,
+            total_duration_ms=int((time.time() - start_time) * 1000),
+            error=error,
+            token_usage=self.get_token_stats(),
+        )
+
+        # Emit run end
+        self._emit_run_end(run_outcome)
+
+        if self.config.verbose:
+            print("\n" + "=" * 60, flush=True)
+            print("[STEPWISE] Run Complete", flush=True)
+            print("=" * 60, flush=True)
+            print(f"Success: {success}", flush=True)
+            print(f"Steps: {len(step_outcomes)}", flush=True)
+            print(f"Duration: {run_outcome.total_duration_ms}ms", flush=True)
+            if error:
+                print(f"Error: {error}", flush=True)
+            print("=" * 60 + "\n", flush=True)
+
+        return run_outcome
+
+    def _action_to_plan_step(self, action_data: dict[str, Any], step_id: int) -> PlanStep:
+        """
+        Convert a stepwise planner action to a PlanStep for execution.
+
+        Args:
+            action_data: Dictionary from stepwise planner
+            step_id: Step ID number
+
+        Returns:
+            PlanStep object
+        """
+        action_type = action_data.get("action", "").upper()
+        intent = action_data.get("intent")
+        input_text = action_data.get("input")
+        direction = action_data.get("direction")
+        reasoning = action_data.get("reasoning", "")
+
+        # Map action type
+        if action_type == "TYPE_AND_SUBMIT":
+            action = "TYPE_AND_SUBMIT"
+            goal = f"Type '{input_text}' and submit"
+        elif action_type == "CLICK":
+            action = "CLICK"
+            goal = f"Click: {intent}" if intent else "Click element"
+        elif action_type == "SCROLL":
+            action = "SCROLL"
+            goal = f"Scroll {direction}"
+        else:
+            action = action_type
+            goal = reasoning or action_type
+
+        return PlanStep(
+            id=step_id,
+            goal=goal,
+            action=action,
+            target=None,
+            intent=intent,
+            input=input_text,
+            verify=[],  # Stepwise mode doesn't use predefined verification
+            required=True,
+            stop_if_true=False,
+            optional_substeps=[],
+            heuristic_hints=[],
+        )
 
     async def step(
         self,

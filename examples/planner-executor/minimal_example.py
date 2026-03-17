@@ -52,9 +52,23 @@ async def main() -> None:
     print(f"Task: {task}")
     print("=" * 60)
 
+    # Grant common permissions to avoid browser permission prompts.
+    # This prevents dialogs like "Allow this site to access your location?"
+    # from interrupting the automation.
+    permission_policy = {
+        "auto_grant": [
+            "geolocation",      # Store locators, local inventory
+            "notifications",    # Push notification prompts
+            "clipboard-read",   # Paste coupon codes
+            "clipboard-write",  # Copy product info
+        ],
+        "geolocation": {"latitude": 47.6762, "longitude": -122.2057},  # Kirkland, WA
+    }
+
     async with AsyncPredicateBrowser(
         api_key=predicate_api_key,
         headless=False,
+        permission_policy=permission_policy,
     ) as browser:
         page = await browser.new_page()
         await page.goto("https://example.com")
