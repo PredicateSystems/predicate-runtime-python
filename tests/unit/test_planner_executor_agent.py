@@ -1545,3 +1545,144 @@ class TestTokenUsageTracking:
         )
         assert outcome_with_tokens.token_usage is not None
         assert outcome_with_tokens.token_usage["total"]["total_tokens"] == 1000
+
+
+# ---------------------------------------------------------------------------
+# Test StepwisePlanningConfig
+# ---------------------------------------------------------------------------
+
+
+class TestStepwisePlanningConfig:
+    """Tests for StepwisePlanningConfig."""
+
+    def test_default_values(self) -> None:
+        from predicate.agents.planner_executor_agent import StepwisePlanningConfig
+
+        config = StepwisePlanningConfig()
+        assert config.max_steps == 30
+        assert config.action_history_limit == 5
+        assert config.include_page_context is True
+
+    def test_custom_values(self) -> None:
+        from predicate.agents.planner_executor_agent import StepwisePlanningConfig
+
+        config = StepwisePlanningConfig(
+            max_steps=50,
+            action_history_limit=10,
+            include_page_context=False,
+        )
+        assert config.max_steps == 50
+        assert config.action_history_limit == 10
+        assert config.include_page_context is False
+
+
+# ---------------------------------------------------------------------------
+# Test Auto-Fallback Configuration
+# ---------------------------------------------------------------------------
+
+
+class TestAutoFallbackConfig:
+    """Tests for auto-fallback to stepwise planning configuration."""
+
+    def test_auto_fallback_enabled_by_default(self) -> None:
+        """Auto-fallback should be enabled by default."""
+        config = PlannerExecutorConfig()
+        assert config.auto_fallback_to_stepwise is True
+        assert config.auto_fallback_replan_threshold == 1
+
+    def test_auto_fallback_can_be_disabled(self) -> None:
+        """Auto-fallback can be disabled."""
+        config = PlannerExecutorConfig(auto_fallback_to_stepwise=False)
+        assert config.auto_fallback_to_stepwise is False
+
+    def test_custom_fallback_threshold(self) -> None:
+        """Custom replan threshold for fallback."""
+        config = PlannerExecutorConfig(
+            auto_fallback_to_stepwise=True,
+            auto_fallback_replan_threshold=2,
+        )
+        assert config.auto_fallback_replan_threshold == 2
+
+    def test_run_outcome_has_fallback_used_field(self) -> None:
+        """RunOutcome should have fallback_used field."""
+        from predicate.agents.planner_executor_agent import RunOutcome
+
+        outcome = RunOutcome(
+            run_id="test-run",
+            task="test task",
+            success=True,
+            steps_completed=3,
+            steps_total=3,
+            replans_used=0,
+        )
+        # Default should be False
+        assert outcome.fallback_used is False
+
+        # Can be set to True
+        outcome_with_fallback = RunOutcome(
+            run_id="test-run",
+            task="test task",
+            success=True,
+            steps_completed=5,
+            steps_total=5,
+            replans_used=1,
+            fallback_used=True,
+        )
+        assert outcome_with_fallback.fallback_used is True
+
+    def test_stepwise_config_in_planner_executor_config(self) -> None:
+        """StepwisePlanningConfig should be accessible in PlannerExecutorConfig."""
+        from predicate.agents.planner_executor_agent import StepwisePlanningConfig
+
+        config = PlannerExecutorConfig(
+            stepwise=StepwisePlanningConfig(
+                max_steps=20,
+                action_history_limit=3,
+            ),
+        )
+        assert config.stepwise.max_steps == 20
+        assert config.stepwise.action_history_limit == 3
+
+
+# ---------------------------------------------------------------------------
+# Test Stepwise Modal Dismissal
+# ---------------------------------------------------------------------------
+
+
+class TestStepwiseModalDismissal:
+    """Tests for modal dismissal in stepwise planning mode."""
+
+    def test_modal_config_used_in_stepwise(self) -> None:
+        """Modal dismissal config should be available for stepwise planning."""
+        config = PlannerExecutorConfig(
+            modal=ModalDismissalConfig(
+                enabled=True,
+                min_new_elements=5,
+            ),
+        )
+        # Verify the config is correctly set up for stepwise use
+        assert config.modal.enabled is True
+        assert config.modal.min_new_elements == 5
+        # Should have default dismiss patterns for drawers
+        assert "no thanks" in config.modal.dismiss_patterns
+        assert "close" in config.modal.dismiss_patterns
+        assert "dismiss" in config.modal.dismiss_patterns
+
+    def test_modal_dismissal_patterns_cover_cart_drawers(self) -> None:
+        """Default patterns should handle common cart/upsell drawer scenarios."""
+        config = ModalDismissalConfig()
+        # These patterns are commonly found in e-commerce drawers
+        patterns_lower = [p.lower() for p in config.dismiss_patterns]
+        assert "no thanks" in patterns_lower  # Amazon protection drawer
+        assert "close" in patterns_lower  # Generic close buttons
+        assert "continue" in patterns_lower  # "Continue shopping"
+        assert "skip" in patterns_lower  # "Skip for now"
+
+    def test_modal_dismissal_disabled_does_not_affect_stepwise(self) -> None:
+        """When modal is disabled, stepwise should still work (no dismissal)."""
+        config = PlannerExecutorConfig(
+            modal=ModalDismissalConfig(enabled=False),
+        )
+        assert config.modal.enabled is False
+        # Stepwise config should still be valid
+        assert config.stepwise.max_steps == 30

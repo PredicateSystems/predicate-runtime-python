@@ -5,19 +5,25 @@ The `PlannerExecutorAgent` is a two-tier agent architecture for browser automati
 - **Planner**: Generates JSON execution plans with verification predicates (uses 7B+ model)
 - **Executor**: Executes each step with snapshot-first verification (uses 3B-7B model)
 
+**Planning Modes:**
+- **Upfront Planning** (`agent.run()`): Generates full plan before execution. Best for well-known sites.
+- **Stepwise Planning** (`agent.run_stepwise()`): Plans one action at a time. Best for unfamiliar sites.
+- **Auto-Fallback** (default): Starts with upfront, automatically switches to stepwise on failure.
+
 ## Table of Contents
 
 1. [Quick Start](#quick-start)
 2. [Core Concepts](#core-concepts)
 3. [AutomationTask](#automationtask)
 4. [Configuration](#configuration)
-5. [CAPTCHA Handling](#captcha-handling)
-6. [Permissions](#permissions)
-7. [Modal and Dialog Handling](#modal-and-dialog-handling)
-8. [Recovery and Rollback](#recovery-and-rollback)
-9. [Custom Heuristics](#custom-heuristics)
-10. [Tracing](#tracing)
-11. [Examples](#examples)
+5. [Planning Modes](#planning-modes)
+6. [CAPTCHA Handling](#captcha-handling)
+7. [Permissions](#permissions)
+8. [Modal and Dialog Handling](#modal-and-dialog-handling)
+9. [Recovery and Rollback](#recovery-and-rollback)
+10. [Custom Heuristics](#custom-heuristics)
+11. [Tracing](#tracing)
+12. [Examples](#examples)
 
 ---
 
@@ -291,6 +297,194 @@ agent = PlannerExecutorAgent(
 
 ---
 
+## Planning Modes
+
+The agent supports two planning modes: **Upfront Planning** (default) and **Stepwise Planning** (ReAct-style).
+
+### Upfront Planning (Default)
+
+The planner generates a complete multi-step plan before execution begins:
+
+```python
+# Default behavior - upfront planning
+result = await agent.run(runtime, task)
+```
+
+**Pros:**
+- Efficient for well-known sites (e.g., Amazon, eBay)
+- Fewer LLM calls during execution
+- Better for predictable workflows
+
+**Cons:**
+- Assumes site structure before seeing actual page
+- May fail on unfamiliar sites with different layouts
+- Less adaptive to dynamic content
+
+### Stepwise Planning (ReAct-style)
+
+The planner decides one action at a time based on the current page state. This is more adaptive for unfamiliar sites.
+
+```python
+from predicate.agents import StepwisePlanningConfig
+
+# Configure stepwise planning
+config = PlannerExecutorConfig(
+    stepwise=StepwisePlanningConfig(
+        max_steps=30,              # Maximum steps before stopping
+        action_history_limit=5,    # Recent actions to include in context
+        include_page_context=True, # Include page elements in planner prompt
+    ),
+)
+
+agent = PlannerExecutorAgent(
+    planner=planner,
+    executor=executor,
+    config=config,
+)
+
+# Run with stepwise planning
+result = await agent.run_stepwise(runtime, task)
+```
+
+**How Stepwise Planning Works:**
+
+1. Take a snapshot of the current page
+2. Send page context + action history to planner
+3. Planner decides the next action (CLICK, TYPE_AND_SUBMIT, SCROLL, DONE, STUCK)
+4. Execute the action and verify
+5. Repeat until DONE or max_steps reached
+
+**Planner Response Format:**
+
+```json
+{
+  "action": "TYPE_AND_SUBMIT",
+  "intent": "Search box",
+  "input": "laptop",
+  "reasoning": "Need to search for products first"
+}
+```
+
+Available actions:
+- `CLICK` - Click an element (requires `intent`)
+- `TYPE_AND_SUBMIT` - Type text and submit (requires `intent` and `input`)
+- `SCROLL` - Scroll the page (requires `direction`: "up" or "down")
+- `DONE` - Task completed successfully
+- `STUCK` - Cannot proceed, needs recovery
+
+**Action History:**
+
+The planner receives a history of recent actions to avoid loops:
+
+```
+Recent actions:
+1. TYPE_AND_SUBMIT "grass mower" in Search box -> OK (now at /search?q=grass%20mower)
+2. CLICK ADD TO CART button -> OK (now at /search?q=grass%20mower)
+```
+
+### StepwisePlanningConfig
+
+```python
+@dataclass(frozen=True)
+class StepwisePlanningConfig:
+    max_steps: int = 30              # Maximum steps before stopping
+    action_history_limit: int = 5    # Recent actions in planner context
+    include_page_context: bool = True  # Include page elements
+```
+
+### When to Use Each Mode
+
+| Scenario | Recommended Mode |
+|----------|------------------|
+| Well-known e-commerce sites (Amazon, eBay) | Upfront |
+| Unfamiliar or dynamic sites | Stepwise |
+| Simple, predictable workflows | Upfront |
+| Complex, exploratory tasks | Stepwise |
+| Sites with unexpected modals/popups | Stepwise |
+
+### Auto-Fallback to Stepwise
+
+By default, the agent automatically falls back to stepwise planning when upfront planning fails. This provides the best of both worlds:
+- Start with efficient upfront planning
+- Automatically switch to adaptive stepwise when needed
+
+```python
+# Default: auto-fallback is enabled
+config = PlannerExecutorConfig()
+print(config.auto_fallback_to_stepwise)  # True
+print(config.auto_fallback_replan_threshold)  # 1
+
+# Disable auto-fallback (always use upfront)
+config = PlannerExecutorConfig(
+    auto_fallback_to_stepwise=False,
+)
+
+# Custom threshold: fallback after 2 failed replans
+config = PlannerExecutorConfig(
+    auto_fallback_to_stepwise=True,
+    auto_fallback_replan_threshold=2,
+)
+```
+
+**How Auto-Fallback Works:**
+
+1. Agent starts with upfront planning (`agent.run()`)
+2. If a step fails, agent attempts replanning (up to `max_replans`)
+3. If replanning is exhausted and `auto_fallback_to_stepwise=True`:
+   - Agent switches to stepwise planning (`run_stepwise()`)
+   - Continues from current state with adaptive planning
+4. `RunOutcome.fallback_used` indicates if fallback was triggered
+
+```python
+result = await agent.run(runtime, task)
+if result.fallback_used:
+    print("Fallback to stepwise planning was used")
+```
+
+### Example: Stepwise on Unfamiliar Site
+
+```python
+from predicate.agents import (
+    PlannerExecutorAgent,
+    PlannerExecutorConfig,
+    AutomationTask,
+    StepwisePlanningConfig,
+)
+from predicate.llm_provider import OpenAIProvider
+
+planner = OpenAIProvider(model="gpt-4o")
+executor = OpenAIProvider(model="gpt-4o-mini")
+
+config = PlannerExecutorConfig(
+    stepwise=StepwisePlanningConfig(
+        max_steps=30,
+        action_history_limit=5,
+    ),
+)
+
+agent = PlannerExecutorAgent(
+    planner=planner,
+    executor=executor,
+    config=config,
+)
+
+task = AutomationTask(
+    task_id="buy-mower",
+    starting_url="https://www.acehardware.com",
+    task="buy a grass mower",
+)
+
+async with AsyncPredicateBrowser() as browser:
+    runtime = AgentRuntime.from_browser(browser)
+    await browser.page.goto(task.starting_url)
+
+    # Use stepwise planning for unfamiliar site
+    result = await agent.run_stepwise(runtime, task)
+    print(f"Success: {result.success}, Steps: {result.steps_completed}")
+```
+
+---
+
 ## CAPTCHA Handling
 
 The SDK provides flexible CAPTCHA handling through the `CaptchaConfig` system.
@@ -469,35 +663,96 @@ def solve_with_2captcha(ctx: CaptchaContext):
 
 ## Permissions
 
-Chrome browser permissions (geolocation, notifications, etc.) are handled at two levels:
+Chrome browser permissions (geolocation, notifications, etc.) can block automation when permission dialogs appear. The SDK provides ways to pre-grant permissions to prevent these dialogs.
 
-### Startup Permissions
+### Dismissing Chrome Permission Dialogs
 
-Applied at browser/context creation:
+Permission dialogs (e.g., "Allow this site to access your location?") can interrupt automation. To prevent this, grant permissions when creating the browser:
+
+```python
+from predicate import AsyncPredicateBrowser
+
+# Grant common permissions to avoid browser permission prompts
+permission_policy = {
+    "auto_grant": [
+        "geolocation",      # Location access (store locators)
+        "notifications",    # Push notification prompts
+        "clipboard-read",   # Read clipboard (paste coupons)
+        "clipboard-write",  # Write to clipboard (copy info)
+    ],
+    # Mock geolocation coordinates (required when granting geolocation)
+    "geolocation": {"latitude": 47.6762, "longitude": -122.2057},  # Kirkland, WA
+}
+
+async with AsyncPredicateBrowser(
+    permission_policy=permission_policy,
+) as browser:
+    # Automation runs without permission dialogs
+    runtime = AgentRuntime.from_browser(browser)
+    result = await agent.run(runtime, task)
+```
+
+### Common Permissions for E-commerce
+
+For e-commerce automation, these permissions are most commonly needed:
+
+```python
+# E-commerce permission policy
+permission_policy = {
+    "auto_grant": [
+        "geolocation",      # Store locators, local inventory
+        "notifications",    # Push notification prompts
+        "clipboard-read",   # Paste coupon codes
+        "clipboard-write",  # Copy product info
+    ],
+    "geolocation": {"latitude": 40.7128, "longitude": -74.0060},  # New York
+}
+```
+
+### Using PermissionPolicy Dataclass
+
+For more control, use the `PermissionPolicy` dataclass:
 
 ```python
 from predicate.permissions import PermissionPolicy
 
 policy = PermissionPolicy(
-    default="grant",  # "clear" | "deny" | "grant"
-    auto_grant=["geolocation", "notifications", "camera", "microphone"],
-    geolocation={"latitude": 37.7749, "longitude": -122.4194},  # Mock location
-    origin="https://example.com",
+    default="clear",   # "clear" | "deny" | "grant"
+    auto_grant=["geolocation", "notifications"],
+    geolocation={"latitude": 37.7749, "longitude": -122.4194},  # San Francisco
+    origin="https://example.com",  # Optional: restrict to specific origin
 )
 
-# Apply via browser configuration (implementation-dependent)
+async with AsyncPredicateBrowser(
+    permission_policy=policy,
+) as browser:
+    # ...
 ```
+
+### All Supported Permissions
+
+Supported permissions may vary by browser and browser version. Common permissions:
+
+| Permission | Description | Common Use Case |
+|------------|-------------|-----------------|
+| `geolocation` | Device location access | Store locators, local inventory |
+| `notifications` | Push notifications | Prevent "Allow notifications?" prompts |
+| `clipboard-read` | Read clipboard content | Paste coupon codes |
+| `clipboard-write` | Write to clipboard | Copy product info |
+| `camera` | Camera access | QR code scanning |
+| `microphone` | Microphone access | Voice search |
+| `midi` | MIDI device access | Music apps |
+| `background-sync` | Background sync | Offline support |
+| `storage-access` | Storage access | Third-party cookies |
+
+See [Playwright grant_permissions documentation](https://playwright.dev/python/docs/api/class-browsercontext#browser-context-grant-permissions) for the full list.
 
 ### Recovery Permissions
 
-For handling permission prompts during automation:
+For handling permission prompts that appear during automation (after browser creation):
 
 ```python
 from predicate.agents.browser_agent import PermissionRecoveryConfig
-
-config = PlannerExecutorConfig(
-    # Other config...
-)
 
 # PermissionRecoveryConfig is used at agent level
 permission_recovery = PermissionRecoveryConfig(
@@ -509,16 +764,60 @@ permission_recovery = PermissionRecoveryConfig(
 )
 ```
 
-### Common Permissions
+### Complete Example: E-commerce with Permissions
 
-| Permission | Description |
-|------------|-------------|
-| `geolocation` | Access to device location |
-| `notifications` | Push notification access |
-| `camera` | Camera access |
-| `microphone` | Microphone access |
-| `clipboard-read` | Read clipboard |
-| `clipboard-write` | Write clipboard |
+```python
+from predicate import AsyncPredicateBrowser
+from predicate.agents import (
+    PlannerExecutorAgent,
+    PlannerExecutorConfig,
+    AutomationTask,
+    StepwisePlanningConfig,
+)
+from predicate.agent_runtime import AgentRuntime
+from predicate.llm_provider import OpenAIProvider
+
+# Setup
+planner = OpenAIProvider(model="gpt-4o")
+executor = OpenAIProvider(model="gpt-4o-mini")
+
+config = PlannerExecutorConfig(
+    stepwise=StepwisePlanningConfig(max_steps=30),
+)
+
+agent = PlannerExecutorAgent(
+    planner=planner,
+    executor=executor,
+    config=config,
+)
+
+task = AutomationTask(
+    task_id="buy-mower",
+    starting_url="https://www.acehardware.com",
+    task="buy a grass mower",
+)
+
+# Grant permissions to prevent dialogs
+permission_policy = {
+    "auto_grant": [
+        "geolocation",
+        "notifications",
+        "clipboard-read",
+        "clipboard-write",
+    ],
+    "geolocation": {"latitude": 47.6762, "longitude": -122.2057},
+}
+
+async with AsyncPredicateBrowser(
+    permission_policy=permission_policy,
+) as browser:
+    await browser.page.goto(task.starting_url)
+    runtime = AgentRuntime.from_browser(browser)
+
+    # Run without permission dialogs interrupting
+    result = await agent.run_stepwise(runtime, task)
+    print(f"Success: {result.success}")
+```
 
 ---
 
@@ -628,6 +927,12 @@ The agent includes automatic modal/drawer dismissal that triggers after DOM chan
 - Newsletter signup popups
 - Promotional overlays
 - Cart upsell drawers
+
+**Works in Both Planning Modes:**
+
+Modal dismissal is fully supported in both upfront and stepwise planning:
+- **Upfront mode**: After each successful CLICK step
+- **Stepwise mode**: After each successful CLICK action (added in v0.12.x)
 
 **How It Works:**
 

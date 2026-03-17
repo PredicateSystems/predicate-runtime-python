@@ -565,6 +565,52 @@ class AuthBoundaryConfig:
 
 
 @dataclass(frozen=True)
+class StepwisePlanningConfig:
+    """
+    Configuration for stepwise (ReAct-style) planning.
+
+    Instead of generating a full plan upfront, the agent plans one step at a time
+    based on the current page state. This allows the agent to adapt to unexpected
+    site layouts and flows.
+
+    Attributes:
+        max_steps: Maximum number of steps before giving up (safety limit)
+        action_history_limit: How many past actions to include in planning context
+        include_page_context: Whether to include compact element representation in prompts
+
+    Example:
+        config = StepwisePlanningConfig(
+            max_steps=20,
+            action_history_limit=5,
+        )
+    """
+
+    max_steps: int = 30
+    action_history_limit: int = 5
+    include_page_context: bool = True
+
+
+@dataclass
+class ActionRecord:
+    """
+    Record of an executed action for history tracking in stepwise planning.
+
+    Attributes:
+        step_num: Step number (1-indexed)
+        action: Action type (CLICK, TYPE_AND_SUBMIT, SCROLL, etc.)
+        target: Element description or URL
+        result: Outcome (success, failed)
+        url_after: URL after action completed
+    """
+
+    step_num: int
+    action: str
+    target: str | None
+    result: str
+    url_after: str | None
+
+
+@dataclass(frozen=True)
 class PlannerExecutorConfig:
     """
     High-level configuration for PlannerExecutorAgent.
@@ -607,6 +653,15 @@ class PlannerExecutorConfig:
 
     # Authentication boundary detection (stop gracefully at login pages)
     auth_boundary: AuthBoundaryConfig = AuthBoundaryConfig()
+
+    # Stepwise planning (ReAct-style, plan one step at a time)
+    stepwise: StepwisePlanningConfig = StepwisePlanningConfig()
+
+    # Auto-fallback: switch from upfront to stepwise planning on repeated failures
+    # When enabled, if upfront planning fails (max_replans exhausted), automatically
+    # retry with stepwise planning for better adaptability on unfamiliar sites.
+    auto_fallback_to_stepwise: bool = True
+    auto_fallback_replan_threshold: int = 1  # Fallback after this many replans fail
 
     # Planner LLM settings
     planner_max_tokens: int = 2048
@@ -821,6 +876,7 @@ class RunOutcome:
     total_duration_ms: int = 0
     error: str | None = None
     token_usage: dict[str, Any] | None = None  # Token usage summary from get_token_stats()
+    fallback_used: bool = False  # True if auto-fallback to stepwise was triggered
 
 
 # ---------------------------------------------------------------------------
@@ -1242,6 +1298,80 @@ Site type: {site_type}
 Auth state: {auth_state}
 
 Output a JSON plan to accomplish this task. Each step should represent ONE distinct action."""
+
+    return system, user
+
+
+def build_stepwise_planner_prompt(
+    goal: str,
+    current_url: str,
+    page_context: str,
+    action_history: list["ActionRecord"],
+) -> tuple[str, str]:
+    """
+    Build system and user prompts for stepwise (ReAct-style) planning.
+
+    Instead of generating a full plan upfront, this prompt asks the LLM to
+    decide the next single action based on current page state and history.
+
+    Args:
+        goal: The overall task goal
+        current_url: Current page URL
+        page_context: Compact representation of page elements
+        action_history: List of previously executed actions
+
+    Returns:
+        (system_prompt, user_prompt)
+    """
+    # Build action history text
+    history_text = ""
+    if action_history:
+        history_text = "Actions taken so far:\n"
+        for rec in action_history:
+            target_str = f"({rec.target})" if rec.target else ""
+            history_text += f"  {rec.step_num}. {rec.action}{target_str} → {rec.result}"
+            if rec.url_after:
+                history_text += f" [URL: {rec.url_after[:60]}...]"
+            history_text += "\n"
+        history_text += "\n"
+
+    system = """You are a web automation agent using ReAct-style planning.
+Given the goal, current page state, and action history, decide the NEXT SINGLE ACTION.
+
+Available actions:
+- CLICK: Click an element. Provide "intent" to describe which element.
+- TYPE_AND_SUBMIT: Type text into an input and submit. Provide "input" (the text to type) and "intent" (which input field).
+- SCROLL: Scroll the page. Provide "direction" (up or down).
+- DONE: Task is complete. Use when the goal has been achieved.
+- STUCK: Cannot proceed (e.g., login required without credentials, CAPTCHA, unexpected error).
+
+Output ONLY a JSON object:
+{
+  "action": "CLICK" | "TYPE_AND_SUBMIT" | "SCROLL" | "DONE" | "STUCK",
+  "intent": "description of target element (required for CLICK, TYPE_AND_SUBMIT)",
+  "input": "text to type (required for TYPE_AND_SUBMIT)",
+  "direction": "up" | "down" (required for SCROLL)",
+  "reasoning": "brief explanation of why this action"
+}
+
+IMPORTANT RULES:
+1. Look at the ACTUAL page elements provided - don't assume what should be there
+2. If you don't see the expected element, try SCROLL or report STUCK
+3. For TYPE_AND_SUBMIT, find a text input (textbox, searchbox, combobox) and specify what text to type
+4. Use action history to avoid repeating failed actions
+5. When the goal is achieved (e.g., item in cart, on checkout page), return DONE
+6. If you need to login but have no credentials, return STUCK with explanation
+
+Return ONLY valid JSON. No prose, no code fences."""
+
+    user = f"""Goal: {goal}
+
+Current URL: {current_url}
+
+{history_text}Current page elements (ID|role|text|importance|clickable|...):
+{page_context}
+
+Based on the goal and current page state, what is the NEXT action to take?"""
 
     return system, user
 
@@ -3531,8 +3661,42 @@ Return JSON patch:
                             error = f"Replan failed: {e}"
                             break
                     else:
-                        error = f"Step {step.id} failed: {outcome.error}"
-                        break
+                        # Replanning exhausted - check if we should fallback to stepwise
+                        if (
+                            self.config.auto_fallback_to_stepwise
+                            and self._replans_used >= self.config.auto_fallback_replan_threshold
+                        ):
+                            if self.config.verbose:
+                                print(
+                                    f"\n[FALLBACK] Upfront planning failed after {self._replans_used} replans. "
+                                    f"Switching to stepwise planning...",
+                                    flush=True,
+                                )
+                            # Run stepwise planning as fallback
+                            # This will handle the rest of the task adaptively
+                            stepwise_result = await self.run_stepwise(
+                                runtime,
+                                automation_task,
+                                run_id=self._run_id,
+                            )
+                            # Combine outcomes: existing steps + stepwise steps
+                            combined_outcomes = step_outcomes + stepwise_result.step_outcomes
+                            return RunOutcome(
+                                run_id=self._run_id,
+                                task=task_description,
+                                success=stepwise_result.success,
+                                steps_completed=len(combined_outcomes),
+                                steps_total=len(combined_outcomes),
+                                replans_used=self._replans_used,
+                                step_outcomes=combined_outcomes,
+                                total_duration_ms=int((time.time() - start_time) * 1000),
+                                error=stepwise_result.error,
+                                token_usage=self.get_token_stats(),
+                                fallback_used=True,
+                            )
+                        else:
+                            error = f"Step {step.id} failed: {outcome.error}"
+                            break
 
                 # Check stop condition
                 if step.stop_if_true and outcome.verification_passed:
@@ -3602,6 +3766,436 @@ Return JSON patch:
         self._emit_run_end(run_outcome)
 
         return run_outcome
+
+    # -------------------------------------------------------------------------
+    # Stepwise Planning (ReAct-style)
+    # -------------------------------------------------------------------------
+
+    async def _plan_next_step(
+        self,
+        goal: str,
+        current_url: str,
+        page_context: str,
+        action_history: list[ActionRecord],
+    ) -> dict[str, Any]:
+        """
+        Use the planner LLM to decide the next action based on current page state.
+
+        Args:
+            goal: The overall task goal
+            current_url: Current page URL
+            page_context: Compact representation of page elements
+            action_history: List of previously executed actions
+
+        Returns:
+            Dictionary with action details:
+            {
+                "action": "CLICK" | "TYPE_AND_SUBMIT" | "SCROLL" | "DONE" | "STUCK",
+                "intent": "description of target element",
+                "input": "text to type",
+                "direction": "up" | "down",
+                "reasoning": "explanation"
+            }
+        """
+        sys_prompt, user_prompt = build_stepwise_planner_prompt(
+            goal=goal,
+            current_url=current_url,
+            page_context=page_context,
+            action_history=action_history,
+        )
+
+        if self.config.verbose:
+            print("\n" + "=" * 60, flush=True)
+            print("[STEPWISE PLANNER] Deciding next action", flush=True)
+            print("=" * 60, flush=True)
+            print(f"Goal: {goal}", flush=True)
+            print(f"URL: {current_url}", flush=True)
+            print(f"History: {len(action_history)} actions", flush=True)
+
+        resp = self.planner.generate(
+            sys_prompt,
+            user_prompt,
+            max_tokens=self.config.planner_max_tokens,
+            temperature=self.config.planner_temperature,
+        )
+
+        # Track token usage
+        self._token_collector.record(role="stepwise_planner", resp=resp)
+
+        raw_text = resp.content.strip()
+
+        if self.config.verbose:
+            print(f"\n--- Stepwise Planner Response ---", flush=True)
+            print(raw_text, flush=True)
+            print("--- End Response ---\n", flush=True)
+
+        # Parse JSON response
+        try:
+            # Handle code fences if present
+            if raw_text.startswith("```"):
+                lines = raw_text.split("\n")
+                # Find start and end of JSON
+                start_idx = 1 if lines[0].startswith("```") else 0
+                end_idx = len(lines)
+                for i in range(len(lines) - 1, -1, -1):
+                    if lines[i].strip() == "```":
+                        end_idx = i
+                        break
+                raw_text = "\n".join(lines[start_idx:end_idx])
+
+            action_data = json.loads(raw_text)
+            return action_data
+        except json.JSONDecodeError as e:
+            # Try to extract JSON from the response
+            import re
+            json_match = re.search(r'\{[^{}]*\}', raw_text, re.DOTALL)
+            if json_match:
+                try:
+                    return json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    pass
+
+            return {
+                "action": "STUCK",
+                "reasoning": f"Failed to parse planner response: {e}",
+            }
+
+    async def run_stepwise(
+        self,
+        runtime: AgentRuntime,
+        task: AutomationTask | str,
+        *,
+        start_url: str | None = None,
+        run_id: str | None = None,
+    ) -> RunOutcome:
+        """
+        Execute task using stepwise (ReAct-style) planning.
+
+        Instead of generating a full plan upfront, the agent plans one step at
+        a time based on the current page state. This allows adaptation to
+        unexpected site layouts and flows.
+
+        Args:
+            runtime: AgentRuntime instance
+            task: AutomationTask instance or task description string
+            start_url: Starting URL (only needed if task is a string)
+            run_id: Run ID for tracing (optional)
+
+        Returns:
+            RunOutcome with execution results
+
+        Example:
+            result = await agent.run_stepwise(
+                runtime,
+                "Find a laptop and add to cart",
+                start_url="https://example.com",
+            )
+        """
+        # Normalize task to AutomationTask
+        if isinstance(task, str):
+            if start_url is None:
+                raise ValueError("start_url is required when task is a string")
+            automation_task = AutomationTask(
+                task_id=run_id or str(uuid.uuid4()),
+                starting_url=start_url,
+                task=task,
+            )
+        else:
+            automation_task = task
+            if start_url is None:
+                start_url = automation_task.starting_url
+
+        self._current_task = automation_task
+        self._run_id = run_id or automation_task.task_id
+        self._replans_used = 0
+        self._vision_calls = 0
+        start_time = time.time()
+
+        # Initialize recovery state if enabled
+        if automation_task.enable_recovery:
+            self._recovery_state = RecoveryState(
+                max_recovery_attempts=automation_task.max_recovery_attempts,
+            )
+        else:
+            self._recovery_state = None
+
+        # Initialize composable heuristics
+        self._composable_heuristics = ComposableHeuristics(
+            static_heuristics=self._intent_heuristics,
+            task_category=automation_task.category,
+        )
+
+        task_description = automation_task.task
+        stepwise_cfg = self.config.stepwise
+
+        # Emit run start
+        self._emit_run_start(task_description, start_url)
+
+        action_history: list[ActionRecord] = []
+        step_outcomes: list[StepOutcome] = []
+        error: str | None = None
+        step_num = 0
+
+        if self.config.verbose:
+            print("\n" + "=" * 60, flush=True)
+            print("[STEPWISE] Starting stepwise execution", flush=True)
+            print("=" * 60, flush=True)
+            print(f"Task: {task_description}", flush=True)
+            print(f"Start URL: {start_url}", flush=True)
+            print(f"Max steps: {stepwise_cfg.max_steps}", flush=True)
+            print("=" * 60 + "\n", flush=True)
+
+        try:
+            while step_num < stepwise_cfg.max_steps:
+                step_num += 1
+
+                if self.config.verbose:
+                    print(f"\n[STEP {step_num}] Planning next action...", flush=True)
+
+                # 1. Take snapshot with escalation
+                self._snapshot_context = await self._snapshot_with_escalation(
+                    runtime,
+                    goal=task_description,
+                )
+                current_url = await runtime.get_url() if hasattr(runtime, "get_url") else ""
+
+                # 2. Build page context
+                if stepwise_cfg.include_page_context:
+                    page_context = self._snapshot_context.compact_representation or "(no elements captured)"
+                else:
+                    page_context = "(page context disabled)"
+
+                # 3. Get recent action history
+                recent_history = action_history[-stepwise_cfg.action_history_limit:]
+
+                # 4. Ask planner for next action
+                next_action = await self._plan_next_step(
+                    goal=task_description,
+                    current_url=current_url,
+                    page_context=page_context,
+                    action_history=recent_history,
+                )
+
+                action_type = next_action.get("action", "STUCK").upper()
+                reasoning = next_action.get("reasoning", "")
+
+                if self.config.verbose:
+                    print(f"  [PLANNER] Action: {action_type}", flush=True)
+                    print(f"  [PLANNER] Reasoning: {reasoning}", flush=True)
+
+                # 5. Check for terminal states
+                if action_type == "DONE":
+                    if self.config.verbose:
+                        print(f"\n[STEPWISE] Task completed: {reasoning}", flush=True)
+                    break
+
+                if action_type == "STUCK":
+                    error = f"Agent stuck: {reasoning}"
+                    if self.config.verbose:
+                        print(f"\n[STEPWISE] Agent stuck: {reasoning}", flush=True)
+
+                    # Check if this is an auth boundary
+                    if self.config.auth_boundary.enabled:
+                        is_auth = await self._detect_auth_boundary(runtime)
+                        if is_auth:
+                            if self.config.verbose:
+                                print(f"  [AUTH] Detected auth boundary - treating as success", flush=True)
+                            error = None  # Clear error - this is a graceful stop
+                    break
+
+                # 6. Convert action to PlanStep and execute
+                plan_step = self._action_to_plan_step(next_action, step_num)
+
+                if self.config.verbose:
+                    print(f"  [EXECUTE] {plan_step.action}", flush=True)
+                    if plan_step.intent:
+                        print(f"  [EXECUTE] Intent: {plan_step.intent}", flush=True)
+                    if plan_step.input:
+                        print(f"  [EXECUTE] Input: {plan_step.input}", flush=True)
+
+                # Execute the step
+                outcome = await self._execute_step(plan_step, runtime, step_num - 1)
+                step_outcomes.append(outcome)
+
+                # 7. Record action in history
+                action_record = ActionRecord(
+                    step_num=step_num,
+                    action=action_type,
+                    target=next_action.get("intent") or next_action.get("input") or next_action.get("direction"),
+                    result="success" if outcome.verification_passed else "failed",
+                    url_after=outcome.url_after,
+                )
+                action_history.append(action_record)
+
+                if self.config.verbose:
+                    status = "OK" if outcome.verification_passed else "FAIL"
+                    print(f"  [RESULT] {status}", flush=True)
+
+                # 8. Record checkpoint on success (for recovery)
+                if outcome.status in (StepStatus.SUCCESS, StepStatus.VISION_FALLBACK):
+                    if self._recovery_state and outcome.url_after:
+                        self._recovery_state.record_checkpoint(
+                            url=outcome.url_after,
+                            step_index=step_num - 1,
+                            snapshot_digest=hashlib.sha256(
+                                (outcome.url_after or "").encode()
+                            ).hexdigest()[:16],
+                            predicates_passed=[],
+                        )
+
+                    # 8.1 Modal dismissal after successful CLICK actions
+                    # Handles drawer/popup overlays (e.g., Amazon's "Add Protection" drawer after Add to Cart)
+                    if action_type == "CLICK" and self.config.modal.enabled:
+                        try:
+                            post_snap = await runtime.snapshot(emit_trace=False)
+                            pre_elements = set(getattr(el, "id", 0) for el in (snap.elements or []))
+                            post_elements = set(getattr(el, "id", 0) for el in (post_snap.elements or []))
+                            new_elements = post_elements - pre_elements
+                            if len(new_elements) >= self.config.modal.min_new_elements:
+                                # Significant DOM change after CLICK - might be a modal/drawer
+                                if self.config.verbose:
+                                    print(f"  [MODAL] Detected {len(new_elements)} new elements after CLICK, checking for dismissible overlay...", flush=True)
+                                dismissed = await self._attempt_modal_dismissal(runtime, post_snap)
+                                if dismissed and self.config.verbose:
+                                    print(f"  [MODAL] Dismissed overlay", flush=True)
+                        except Exception:
+                            pass  # Ignore snapshot errors
+
+                # 9. Handle failure
+                if outcome.status == StepStatus.FAILED:
+                    # Check for auth boundary
+                    if self.config.auth_boundary.enabled:
+                        is_auth = await self._detect_auth_boundary(runtime)
+                        if is_auth and self.config.auth_boundary.stop_on_auth:
+                            if self.config.verbose:
+                                print(f"  [AUTH] Stopping at authentication boundary", flush=True)
+                            # Update the outcome to indicate auth boundary
+                            outcome = StepOutcome(
+                                step_id=outcome.step_id,
+                                goal=outcome.goal,
+                                status=StepStatus.SUCCESS,
+                                action_taken=outcome.action_taken,
+                                verification_passed=True,
+                                used_vision=outcome.used_vision,
+                                error=self.config.auth_boundary.auth_success_message,
+                                duration_ms=outcome.duration_ms,
+                                url_before=outcome.url_before,
+                                url_after=outcome.url_after,
+                            )
+                            step_outcomes[-1] = outcome
+                            break
+
+                    # Try recovery if available
+                    if self._recovery_state and self._recovery_state.can_recover():
+                        if self.config.verbose:
+                            print(f"  [RECOVERY] Attempting recovery to last known good state...", flush=True)
+                        recovered = await self._attempt_recovery(runtime)
+                        if recovered:
+                            checkpoint = self._recovery_state.current_recovery_target
+                            if checkpoint:
+                                # Roll back action history to checkpoint
+                                action_history = [
+                                    a for a in action_history
+                                    if a.step_num <= checkpoint.step_index + 1
+                                ]
+                                self._recovery_state.clear_recovery_target()
+                                if self.config.verbose:
+                                    print(f"  [RECOVERY] Recovered to step {checkpoint.step_index + 1}", flush=True)
+                                continue
+
+                    # If action failed, the stepwise planner will see it in history
+                    # and adapt on the next iteration (no explicit replan needed)
+                    if self.config.verbose:
+                        print(f"  [STEPWISE] Action failed, will adapt on next iteration", flush=True)
+
+        except Exception as e:
+            error = str(e)
+            if self.config.verbose:
+                print(f"\n[STEPWISE] Exception: {error}", flush=True)
+
+        # Build final outcome
+        success = error is None and step_num > 0
+
+        # If we exited due to DONE, it's a success
+        # If we exited due to STUCK with auth boundary, it's a success
+        # If we hit max_steps, it's a failure
+        if step_num >= stepwise_cfg.max_steps and error is None:
+            error = f"Max steps ({stepwise_cfg.max_steps}) reached without completing task"
+            success = False
+
+        run_outcome = RunOutcome(
+            run_id=self._run_id,
+            task=task_description,
+            success=success,
+            steps_completed=len(step_outcomes),
+            steps_total=step_num,
+            replans_used=0,  # Stepwise doesn't use replanning
+            step_outcomes=step_outcomes,
+            total_duration_ms=int((time.time() - start_time) * 1000),
+            error=error,
+            token_usage=self.get_token_stats(),
+        )
+
+        # Emit run end
+        self._emit_run_end(run_outcome)
+
+        if self.config.verbose:
+            print("\n" + "=" * 60, flush=True)
+            print("[STEPWISE] Run Complete", flush=True)
+            print("=" * 60, flush=True)
+            print(f"Success: {success}", flush=True)
+            print(f"Steps: {len(step_outcomes)}", flush=True)
+            print(f"Duration: {run_outcome.total_duration_ms}ms", flush=True)
+            if error:
+                print(f"Error: {error}", flush=True)
+            print("=" * 60 + "\n", flush=True)
+
+        return run_outcome
+
+    def _action_to_plan_step(self, action_data: dict[str, Any], step_id: int) -> PlanStep:
+        """
+        Convert a stepwise planner action to a PlanStep for execution.
+
+        Args:
+            action_data: Dictionary from stepwise planner
+            step_id: Step ID number
+
+        Returns:
+            PlanStep object
+        """
+        action_type = action_data.get("action", "").upper()
+        intent = action_data.get("intent")
+        input_text = action_data.get("input")
+        direction = action_data.get("direction")
+        reasoning = action_data.get("reasoning", "")
+
+        # Map action type
+        if action_type == "TYPE_AND_SUBMIT":
+            action = "TYPE_AND_SUBMIT"
+            goal = f"Type '{input_text}' and submit"
+        elif action_type == "CLICK":
+            action = "CLICK"
+            goal = f"Click: {intent}" if intent else "Click element"
+        elif action_type == "SCROLL":
+            action = "SCROLL"
+            goal = f"Scroll {direction}"
+        else:
+            action = action_type
+            goal = reasoning or action_type
+
+        return PlanStep(
+            id=step_id,
+            goal=goal,
+            action=action,
+            target=None,
+            intent=intent,
+            input=input_text,
+            verify=[],  # Stepwise mode doesn't use predefined verification
+            required=True,
+            stop_if_true=False,
+            optional_substeps=[],
+            heuristic_hints=[],
+        )
 
     async def step(
         self,

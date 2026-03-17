@@ -38,6 +38,7 @@ from .browser_agent import (
 from .composable_heuristics import ComposableHeuristics
 from .heuristic_spec import COMMON_HINTS, HeuristicHint, get_common_hint
 from .planner_executor_agent import (
+    ActionRecord,
     AuthBoundaryConfig,
     CheckoutDetectionConfig,
     ExecutorOverride,
@@ -55,6 +56,7 @@ from .planner_executor_agent import (
     SnapshotEscalationConfig,
     StepOutcome,
     StepStatus,
+    StepwisePlanningConfig,
     normalize_plan,
     validate_plan_smoothness,
 )
@@ -78,6 +80,7 @@ __all__ = [
     "HeuristicHint",
     "get_common_hint",
     # Planner + Executor Agent
+    "ActionRecord",
     "AuthBoundaryConfig",
     "CheckoutDetectionConfig",
     "ExecutorOverride",
@@ -95,6 +98,7 @@ __all__ = [
     "SnapshotEscalationConfig",
     "StepOutcome",
     "StepStatus",
+    "StepwisePlanningConfig",
     "normalize_plan",
     "validate_plan_smoothness",
     # Recovery
