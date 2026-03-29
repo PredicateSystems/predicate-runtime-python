@@ -17,20 +17,24 @@ from predicate.agents.planner_executor_agent import PlannerExecutorAgent, Planne
 from predicate.llm_provider import OllamaProvider
 from predicate.tracing import Tracer
 
-# Optional imports for cloud providers
+# Check if optional cloud provider packages are installed
+# Note: The provider classes exist but require their respective packages at runtime
 try:
-    from predicate.llm_provider import OpenAIProvider
+    import openai  # noqa: F401
 
     HAS_OPENAI = True
 except ImportError:
     HAS_OPENAI = False
 
 try:
-    from predicate.llm_provider import AnthropicProvider
+    import anthropic  # noqa: F401
 
     HAS_ANTHROPIC = True
 except ImportError:
     HAS_ANTHROPIC = False
+
+# Import provider classes (they exist but need packages at instantiation time)
+from predicate.llm_provider import AnthropicProvider, OpenAIProvider
 
 
 class TestDetectProvider:
