@@ -205,6 +205,10 @@ class Tracer:
     _step_successes: int = field(default=0, init=False)
     _step_failures: int = field(default=0, init=False)
     _has_errors: bool = field(default=False, init=False)
+    # Callback for cleanup notification (set by tracer_factory for atexit cleanup)
+    _on_close_callback: Callable[["Tracer"], None] | None = field(default=None, init=False)
+    # Track if already closed to prevent double-close
+    _closed: bool = field(default=False, init=False)
 
     def emit(
         self,
@@ -478,11 +482,27 @@ class Tracer:
 
     def close(self, **kwargs) -> None:
         """
-        Close the underlying sink.
+        Close the underlying sink and upload trace data.
+
+        This method is idempotent - calling it multiple times is safe.
+        It's automatically called when using the tracer as a context manager,
+        and as a safety net via atexit when the process exits.
 
         Args:
             **kwargs: Passed through to sink.close() (e.g., blocking=True for CloudTraceSink)
         """
+        # Prevent double-close
+        if self._closed:
+            return
+        self._closed = True
+
+        # Notify cleanup registry (unregister from atexit)
+        if self._on_close_callback is not None:
+            try:
+                self._on_close_callback(self)
+            except Exception:
+                pass  # Don't let callback errors prevent close
+
         # Auto-infer final_status if not explicitly set and we have step outcomes
         if self.final_status == "unknown" and (
             self._step_successes > 0 or self._step_failures > 0 or self._has_errors
@@ -507,5 +527,14 @@ class Tracer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager cleanup."""
+        self.close()
+        return False
+
+    async def __aenter__(self):
+        """Async context manager support for use with 'async with'."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager cleanup."""
         self.close()
         return False

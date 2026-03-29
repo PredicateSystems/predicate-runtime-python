@@ -376,6 +376,281 @@ class DeepInfraProvider(OpenAIProvider):
         return super().supports_vision()
 
 
+class OllamaProvider(LLMProvider):
+    """
+    Ollama local LLM provider via OpenAI-compatible API.
+
+    Ollama serves models locally and provides an OpenAI-compatible endpoint at /v1.
+    This provider uses HTTP requests directly without requiring the openai package.
+
+    Example:
+        >>> from predicate.llm_provider import OllamaProvider
+        >>> llm = OllamaProvider(model="qwen3:8b")
+        >>> response = llm.generate("You are helpful", "Hello!")
+        >>> print(response.content)
+
+    Example with custom base URL:
+        >>> llm = OllamaProvider(model="llama3:8b", base_url="http://192.168.1.100:11434")
+    """
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str = "http://localhost:11434",
+        timeout_seconds: float = 120.0,
+        **kwargs,
+    ):
+        """
+        Initialize Ollama provider.
+
+        Args:
+            model: Ollama model name (e.g., "qwen3:8b", "llama3:8b", "mistral:7b")
+            base_url: Ollama server URL (default: http://localhost:11434)
+            timeout_seconds: Request timeout in seconds (default: 120)
+            **kwargs: Additional parameters (reserved for future use)
+        """
+        super().__init__(model)
+        self._ollama_base_url = base_url.rstrip("/")
+        self._api_base_url = f"{self._ollama_base_url}/v1"
+        self._timeout_seconds = timeout_seconds
+
+    def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        json_mode: bool = False,
+        **kwargs,
+    ) -> LLMResponse:
+        """
+        Generate response using Ollama's OpenAI-compatible API.
+
+        Args:
+            system_prompt: System instruction
+            user_prompt: User query
+            temperature: Sampling temperature (0.0 = deterministic, 1.0 = creative)
+            max_tokens: Maximum tokens to generate
+            json_mode: Enable JSON response format (model-dependent support)
+            **kwargs: Additional API parameters (max_new_tokens is mapped to max_tokens)
+
+        Returns:
+            LLMResponse object
+        """
+        import json
+        import urllib.request
+        import urllib.error
+
+        # Handle max_new_tokens -> max_tokens mapping for cross-provider compatibility
+        if "max_new_tokens" in kwargs:
+            if max_tokens is None:
+                max_tokens = kwargs.pop("max_new_tokens")
+            else:
+                kwargs.pop("max_new_tokens")  # max_tokens takes precedence
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+
+        # Build API parameters
+        api_params: dict[str, Any] = {
+            "model": self._model_name,
+            "messages": messages,
+            "temperature": temperature,
+        }
+
+        if max_tokens:
+            api_params["max_tokens"] = max_tokens
+
+        if json_mode and self.supports_json_mode():
+            api_params["response_format"] = {"type": "json_object"}
+
+        # Merge additional parameters (excluding internal ones)
+        for key, value in kwargs.items():
+            if key not in api_params:
+                api_params[key] = value
+
+        # Make HTTP request to Ollama's OpenAI-compatible endpoint
+        url = f"{self._api_base_url}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer ollama",  # Ollama doesn't require a real API key
+        }
+
+        try:
+            request_data = json.dumps(api_params).encode("utf-8")
+            req = urllib.request.Request(url, data=request_data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=self._timeout_seconds) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.URLError as e:
+            raise RuntimeError(
+                f"Failed to connect to Ollama at {self._ollama_base_url}. "
+                f"Ensure Ollama is running: {e}"
+            ) from e
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(
+                f"Ollama API error: {e.code} - {e.reason}"
+            ) from e
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Failed to parse Ollama response: {e}") from e
+
+        # Parse response
+        choice = response_data.get("choices", [{}])[0]
+        usage = response_data.get("usage", {})
+        message = choice.get("message", {})
+
+        return LLMResponseBuilder.from_openai_format(
+            content=message.get("content", ""),
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            total_tokens=usage.get("total_tokens"),
+            model_name=response_data.get("model", self._model_name),
+            finish_reason=choice.get("finish_reason"),
+        )
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    @property
+    def ollama_base_url(self) -> str:
+        """Return the Ollama server base URL."""
+        return self._ollama_base_url
+
+    @property
+    def is_local(self) -> bool:
+        """Ollama runs locally."""
+        return True
+
+    @property
+    def provider_name(self) -> str:
+        """Provider identifier."""
+        return "ollama"
+
+    def supports_json_mode(self) -> bool:
+        """
+        JSON mode support varies by Ollama model.
+
+        Most instruction-tuned models (qwen, llama, mistral) can output JSON
+        with proper prompting, but native JSON mode is model-dependent.
+        """
+        # Conservative default: rely on prompt engineering for JSON
+        return False
+
+    def supports_vision(self) -> bool:
+        """
+        Vision support varies by Ollama model.
+
+        Models like llava, bakllava support vision. Check model capabilities.
+        """
+        model_lower = self._model_name.lower()
+        return any(x in model_lower for x in ["llava", "bakllava", "moondream"])
+
+    def generate_with_image(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_base64: str,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        **kwargs,
+    ) -> LLMResponse:
+        """
+        Generate response with image input using Ollama's vision models.
+
+        Args:
+            system_prompt: System instruction
+            user_prompt: User query
+            image_base64: Base64-encoded image (PNG or JPEG)
+            temperature: Sampling temperature (0.0 = deterministic)
+            max_tokens: Maximum tokens to generate
+            **kwargs: Additional API parameters
+
+        Returns:
+            LLMResponse object
+
+        Raises:
+            NotImplementedError: If model doesn't support vision
+        """
+        import json
+        import urllib.request
+        import urllib.error
+
+        if not self.supports_vision():
+            raise NotImplementedError(
+                f"Model {self._model_name} does not support vision. "
+                "Use llava, bakllava, or moondream models."
+            )
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        # Vision message format with image_url
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_base64}"},
+                    },
+                ],
+            }
+        )
+
+        # Build API parameters
+        api_params: dict[str, Any] = {
+            "model": self._model_name,
+            "messages": messages,
+            "temperature": temperature,
+        }
+
+        if max_tokens:
+            api_params["max_tokens"] = max_tokens
+
+        # Merge additional parameters
+        for key, value in kwargs.items():
+            if key not in api_params:
+                api_params[key] = value
+
+        # Make HTTP request
+        url = f"{self._api_base_url}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer ollama",
+        }
+
+        try:
+            request_data = json.dumps(api_params).encode("utf-8")
+            req = urllib.request.Request(url, data=request_data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=self._timeout_seconds) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.URLError as e:
+            raise RuntimeError(
+                f"Failed to connect to Ollama at {self._ollama_base_url}. "
+                f"Ensure Ollama is running: {e}"
+            ) from e
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"Ollama API error: {e.code} - {e.reason}") from e
+
+        # Parse response
+        choice = response_data.get("choices", [{}])[0]
+        usage = response_data.get("usage", {})
+        message = choice.get("message", {})
+
+        return LLMResponseBuilder.from_openai_format(
+            content=message.get("content", ""),
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            total_tokens=usage.get("total_tokens"),
+            model_name=response_data.get("model", self._model_name),
+            finish_reason=choice.get("finish_reason"),
+        )
+
+
 class AnthropicProvider(LLMProvider):
     """
     Anthropic provider implementation (Claude 3 Opus, Sonnet, Haiku, etc.)
