@@ -2,34 +2,36 @@
 
 import pytest
 
-from predicate.llm_provider import OllamaProvider, OpenAIProvider
+from predicate.llm_provider import OllamaProvider, LLMProvider
 
 
 class TestOllamaProvider:
     """Test suite for OllamaProvider."""
 
-    def test_ollama_provider_is_subclass_of_openai(self):
-        """OllamaProvider should inherit from OpenAIProvider."""
-        assert issubclass(OllamaProvider, OpenAIProvider)
+    def test_ollama_provider_is_subclass_of_llm_provider(self):
+        """OllamaProvider should inherit from LLMProvider (not OpenAIProvider)."""
+        assert issubclass(OllamaProvider, LLMProvider)
 
     def test_ollama_provider_default_base_url(self):
         """OllamaProvider should use default localhost:11434 base URL."""
         provider = OllamaProvider(model="qwen3:8b")
-        # The internal client should have base_url set to /v1 endpoint
+        # The internal base URL should be set correctly
         assert provider._ollama_base_url == "http://localhost:11434"
+        assert provider.ollama_base_url == "http://localhost:11434"
 
     def test_ollama_provider_custom_base_url(self):
         """OllamaProvider should accept custom base URL."""
         provider = OllamaProvider(model="llama3:8b", base_url="http://192.168.1.100:11434")
         assert provider._ollama_base_url == "http://192.168.1.100:11434"
+        assert provider.ollama_base_url == "http://192.168.1.100:11434"
 
     def test_ollama_provider_strips_trailing_slash(self):
         """OllamaProvider should strip trailing slash from base URL."""
         provider = OllamaProvider(model="mistral:7b", base_url="http://localhost:11434/")
-        # The /v1 should be appended correctly without double slash
-        assert provider._ollama_base_url == "http://localhost:11434/"
-        # The actual OpenAI client base_url should be properly formed
-        # (trailing slash stripped before /v1 is appended)
+        # The trailing slash should be stripped
+        assert provider._ollama_base_url == "http://localhost:11434"
+        # The API base URL should be properly formed
+        assert provider._api_base_url == "http://localhost:11434/v1"
 
     def test_ollama_provider_is_local_property(self):
         """OllamaProvider.is_local should return True."""
