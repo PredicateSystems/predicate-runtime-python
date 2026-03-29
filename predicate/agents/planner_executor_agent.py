@@ -802,7 +802,19 @@ def detect_snapshot_failure(snap: Snapshot) -> tuple[bool, str | None]:
 
     Returns:
         (should_use_vision, reason)
+
+    Note: If we have sufficient elements (10+), we should NOT trigger vision
+    fallback even if diagnostics suggest it. This handles cases where the
+    API incorrectly flags normal HTML pages as requiring vision.
     """
+    elements = getattr(snap, "elements", []) or []
+    element_count = len(elements)
+
+    # If we have sufficient elements, the snapshot is usable
+    # regardless of what diagnostics say
+    if element_count >= 10:
+        return False, None
+
     # Check explicit status field (tri-state: success, error, require_vision)
     status = getattr(snap, "status", "success")
     if status == "require_vision":
@@ -820,13 +832,16 @@ def detect_snapshot_failure(snap: Snapshot) -> tuple[bool, str | None]:
             return True, "low_confidence"
 
         has_canvas = getattr(diag, "has_canvas", False)
-        elements = getattr(snap, "elements", []) or []
-        if has_canvas and len(elements) < 5:
+        if has_canvas and element_count < 5:
             return True, "canvas_page"
 
+        # Check diagnostics.requires_vision only if few elements
+        requires_vision = getattr(diag, "requires_vision", False)
+        if requires_vision and element_count < 5:
+            return True, "diagnostics_requires_vision"
+
     # Very few elements usually indicates a problem
-    elements = getattr(snap, "elements", []) or []
-    if len(elements) < 3:
+    if element_count < 3:
         return True, "too_few_elements"
 
     return False, None
@@ -1335,34 +1350,25 @@ def build_stepwise_planner_prompt(
             history_text += "\n"
         history_text += "\n"
 
-    system = """You are a web automation agent using ReAct-style planning.
-Given the goal, current page state, and action history, decide the NEXT SINGLE ACTION.
+    # Tight prompt optimized for small local models (7B)
+    system = """You are a browser automation planner. Decide the NEXT action.
 
-Available actions:
-- CLICK: Click an element. Provide "intent" to describe which element.
-- TYPE_AND_SUBMIT: Type text into an input and submit. Provide "input" (the text to type) and "intent" (which input field).
-- SCROLL: Scroll the page. Provide "direction" (up or down).
-- DONE: Task is complete. Use when the goal has been achieved.
-- STUCK: Cannot proceed (e.g., login required without credentials, CAPTCHA, unexpected error).
+Actions:
+- CLICK: Click an element. Set "intent" to element text/description.
+- TYPE_AND_SUBMIT: Type and submit. Set "intent" and "input".
+- SCROLL: Scroll page. Set "direction" to "up" or "down".
+- DONE: Goal achieved.
 
-Output ONLY a JSON object:
-{
-  "action": "CLICK" | "TYPE_AND_SUBMIT" | "SCROLL" | "DONE" | "STUCK",
-  "intent": "description of target element (required for CLICK, TYPE_AND_SUBMIT)",
-  "input": "text to type (required for TYPE_AND_SUBMIT)",
-  "direction": "up" | "down" (required for SCROLL)",
-  "reasoning": "brief explanation of why this action"
-}
+Output ONLY JSON:
+{"action":"CLICK","intent":"button text","reasoning":"why"}
+{"action":"TYPE_AND_SUBMIT","intent":"search box","input":"query","reasoning":"why"}
+{"action":"DONE","intent":"completed","reasoning":"why"}
 
-IMPORTANT RULES:
-1. Look at the ACTUAL page elements provided - don't assume what should be there
-2. If you don't see the expected element, try SCROLL or report STUCK
-3. For TYPE_AND_SUBMIT, find a text input (textbox, searchbox, combobox) and specify what text to type
-4. Use action history to avoid repeating failed actions
-5. When the goal is achieved (e.g., item in cart, on checkout page), return DONE
-6. If you need to login but have no credentials, return STUCK with explanation
-
-Return ONLY valid JSON. No prose, no code fences."""
+RULES:
+1. Look at ACTUAL elements shown - pick one that matches your intent
+2. Do NOT repeat actions that already succeeded
+3. If goal is done, return DONE immediately
+4. No <think> tags, no markdown, no prose - ONLY JSON"""
 
     user = f"""Goal: {goal}
 
@@ -1397,24 +1403,36 @@ def build_executor_prompt(
     intent_line = f"Intent: {intent}\n" if intent else ""
     input_line = f"Text to type: \"{input_text}\"\n" if input_text else ""
 
-    system = """You are a careful web automation executor.
-You must respond with exactly ONE action in this format:
-- CLICK(<id>)
-- TYPE(<id>, "text")
-- PRESS('key')
-- SCROLL(direction)
-- FINISH()
+    # Tight prompt optimized for small local models (4B-7B)
+    # Key: explicit format, no reasoning, clear failure consequence
+    if input_text:
+        # TYPE action needed
+        system = (
+            "You are an executor for browser automation.\n"
+            "Return ONLY: TYPE(<id>, \"text\") or CLICK(<id>)\n"
+            "If you output anything else, the action fails.\n"
+            "Do NOT output <think> or any reasoning.\n"
+            "No prose, no markdown, no extra whitespace.\n"
+            "Example: TYPE(42, \"hello world\")"
+        )
+    else:
+        # CLICK action (most common)
+        system = (
+            "You are an executor for browser automation.\n"
+            "Return ONLY a single-line CLICK(id) action.\n"
+            "If you output anything else, the action fails.\n"
+            "Do NOT output <think> or any reasoning.\n"
+            "No prose, no markdown, no extra whitespace.\n"
+            "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
+            "Example: CLICK(12)"
+        )
 
-Output only the action. No explanations."""
-
-    user = f"""You are controlling a browser via element IDs.
-
-Goal: {goal}
+    user = f"""Goal: {goal}
 {intent_line}{input_line}
-Elements (ID|role|text|importance|clickable|...):
+Elements:
 {compact_context}
 
-Return ONLY the action to take."""
+Return CLICK(id):"""
 
     return system, user
 
@@ -2116,16 +2134,17 @@ class PlannerExecutorAgent:
                     if raw_screenshot:
                         screenshot_b64 = raw_screenshot
 
+                # Format context FIRST - we always want the compact representation
+                # even if vision fallback is required, so the planner can see available elements
+                compact = self._format_context(snap, goal)
+                last_compact = compact
+
                 # Check for vision fallback
                 needs_vision, reason = detect_snapshot_failure(snap)
                 if needs_vision:
                     requires_vision = True
                     vision_reason = reason
                     break
-
-                # Format context
-                compact = self._format_context(snap, goal)
-                last_compact = compact
 
                 # If escalation disabled, we're done after first successful snapshot
                 if not cfg.enabled:
@@ -3952,11 +3971,24 @@ Return JSON patch:
                 if self.config.verbose:
                     print(f"\n[STEP {step_num}] Planning next action...", flush=True)
 
+                # 0. Stabilize before taking snapshot (wait for DOM to settle)
+                # This is critical for pages with delayed hydration/rendering
+                if self.config.stabilize_enabled:
+                    await runtime.stabilize()
+
                 # 1. Take snapshot with escalation
                 self._snapshot_context = await self._snapshot_with_escalation(
                     runtime,
                     goal=task_description,
                 )
+
+                # Debug: log snapshot context details
+                if self.config.verbose:
+                    snap = self._snapshot_context.snapshot
+                    elem_count = len(snap.elements) if snap and snap.elements else 0
+                    compact_len = len(self._snapshot_context.compact_representation) if self._snapshot_context.compact_representation else 0
+                    requires_vision = self._snapshot_context.requires_vision
+                    print(f"  [STEPWISE-SNAPSHOT] Elements: {elem_count}, Compact len: {compact_len}, Requires vision: {requires_vision}", flush=True)
                 current_url = await runtime.get_url() if hasattr(runtime, "get_url") else ""
 
                 # 2. Build page context
@@ -3964,6 +3996,18 @@ Return JSON patch:
                     page_context = self._snapshot_context.compact_representation or "(no elements captured)"
                 else:
                     page_context = "(page context disabled)"
+
+                # Debug: print page context for stepwise planning
+                if self.config.verbose and stepwise_cfg.include_page_context:
+                    print("\n--- Stepwise Page Context ---", flush=True)
+                    # Truncate to first 20 lines for readability
+                    context_lines = page_context.split("\n")
+                    if len(context_lines) > 20:
+                        print("\n".join(context_lines[:20]), flush=True)
+                        print(f"... ({len(context_lines) - 20} more lines)", flush=True)
+                    else:
+                        print(page_context, flush=True)
+                    print("--- End Page Context ---\n", flush=True)
 
                 # 3. Get recent action history
                 recent_history = action_history[-stepwise_cfg.action_history_limit:]

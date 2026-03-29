@@ -376,6 +376,76 @@ class DeepInfraProvider(OpenAIProvider):
         return super().supports_vision()
 
 
+class OllamaProvider(OpenAIProvider):
+    """
+    Ollama local LLM provider via OpenAI-compatible API.
+
+    Ollama serves models locally and provides an OpenAI-compatible endpoint at /v1.
+    This provider wraps OpenAIProvider with sensible defaults for local inference.
+
+    Example:
+        >>> from predicate.llm_provider import OllamaProvider
+        >>> llm = OllamaProvider(model="qwen3:8b")
+        >>> response = llm.generate("You are helpful", "Hello!")
+        >>> print(response.content)
+
+    Example with custom base URL:
+        >>> llm = OllamaProvider(model="llama3:8b", base_url="http://192.168.1.100:11434")
+    """
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str = "http://localhost:11434",
+        **kwargs,
+    ):
+        """
+        Initialize Ollama provider.
+
+        Args:
+            model: Ollama model name (e.g., "qwen3:8b", "llama3:8b", "mistral:7b")
+            base_url: Ollama server URL (default: http://localhost:11434)
+            **kwargs: Additional parameters passed to OpenAIProvider
+        """
+        # Ollama serves OpenAI-compatible API at /v1
+        super().__init__(
+            model=model,
+            base_url=f"{base_url.rstrip('/')}/v1",
+            api_key="ollama",  # Ollama doesn't require a real API key
+            **kwargs,
+        )
+        self._ollama_base_url = base_url
+
+    @property
+    def is_local(self) -> bool:
+        """Ollama runs locally."""
+        return True
+
+    @property
+    def provider_name(self) -> str:
+        """Provider identifier."""
+        return "ollama"
+
+    def supports_json_mode(self) -> bool:
+        """
+        JSON mode support varies by Ollama model.
+
+        Most instruction-tuned models (qwen, llama, mistral) can output JSON
+        with proper prompting, but native JSON mode is model-dependent.
+        """
+        # Conservative default: rely on prompt engineering for JSON
+        return False
+
+    def supports_vision(self) -> bool:
+        """
+        Vision support varies by Ollama model.
+
+        Models like llava, bakllava support vision. Check model capabilities.
+        """
+        model_lower = self._model_name.lower()
+        return any(x in model_lower for x in ["llava", "bakllava", "moondream"])
+
+
 class AnthropicProvider(LLMProvider):
     """
     Anthropic provider implementation (Claude 3 Opus, Sonnet, Haiku, etc.)

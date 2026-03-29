@@ -61,6 +61,11 @@ from .planner_executor_agent import (
     validate_plan_smoothness,
 )
 from .recovery import RecoveryCheckpoint, RecoveryState
+from .agent_factory import (
+    ConfigPreset,
+    create_planner_executor_agent,
+    get_config_preset,
+)
 
 __all__ = [
     # Automation Task
@@ -104,4 +109,8 @@ __all__ = [
     # Recovery
     "RecoveryCheckpoint",
     "RecoveryState",
+    # Agent Factory
+    "ConfigPreset",
+    "create_planner_executor_agent",
+    "get_config_preset",
 ]
