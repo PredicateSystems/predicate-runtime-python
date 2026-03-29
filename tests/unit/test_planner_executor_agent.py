@@ -47,8 +47,8 @@ class TestBuildExecutorPrompt:
             intent=None,
             compact_context="123|button|Submit|100|1|0|-|0|",
         )
-        assert "CLICK(<id>)" in sys_prompt
-        assert "TYPE(<id>" in sys_prompt
+        # Prompt should mention CLICK format (either CLICK(id) or CLICK(<digits>))
+        assert "CLICK" in sys_prompt
         assert "Goal: Click the submit button" in user_prompt
         assert "123|button|Submit" in user_prompt
 

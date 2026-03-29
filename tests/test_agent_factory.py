@@ -14,8 +14,23 @@ from predicate.agents.agent_factory import (
     get_config_preset,
 )
 from predicate.agents.planner_executor_agent import PlannerExecutorAgent, PlannerExecutorConfig
-from predicate.llm_provider import AnthropicProvider, OllamaProvider, OpenAIProvider
+from predicate.llm_provider import OllamaProvider
 from predicate.tracing import Tracer
+
+# Optional imports for cloud providers
+try:
+    from predicate.llm_provider import OpenAIProvider
+
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+
+try:
+    from predicate.llm_provider import AnthropicProvider
+
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
 
 
 class TestDetectProvider:
@@ -88,6 +103,7 @@ class TestCreateProvider:
         assert isinstance(provider, OllamaProvider)
         assert provider.model_name == "qwen3:8b"
 
+    @pytest.mark.skipif(not HAS_OPENAI, reason="openai package not installed")
     def test_create_openai_provider(self):
         """Should create OpenAIProvider for openai."""
         provider = _create_provider(
@@ -100,6 +116,7 @@ class TestCreateProvider:
         assert isinstance(provider, OpenAIProvider)
         assert provider.model_name == "gpt-4o"
 
+    @pytest.mark.skipif(not HAS_ANTHROPIC, reason="anthropic package not installed")
     def test_create_anthropic_provider(self):
         """Should create AnthropicProvider for anthropic."""
         provider = _create_provider(
@@ -267,6 +284,7 @@ class TestCreatePlannerExecutorAgent:
         )
         assert isinstance(agent, PlannerExecutorAgent)
 
+    @pytest.mark.skipif(not HAS_OPENAI, reason="openai package not installed")
     def test_create_agent_mixed_providers(self):
         """Should support mixed cloud/local configuration."""
         agent = create_planner_executor_agent(

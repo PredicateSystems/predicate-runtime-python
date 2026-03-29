@@ -2,11 +2,19 @@
 Tracer factory with automatic tier detection.
 
 Provides convenient factory function for creating tracers with cloud upload support.
+
+Key Features:
+- Automatic cloud upload when API key is provided
+- Auto-close on process exit (atexit) to prevent data loss
+- Context manager support for both sync and async workflows
+- Orphaned trace recovery from previous crashes
 """
 
+import atexit
 import gzip
 import os
 import uuid
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Optional
@@ -16,6 +24,60 @@ import requests
 from predicate.cloud_tracing import CloudTraceSink, SentienceLogger
 from predicate.constants import PREDICATE_API_URL
 from predicate.tracing import JsonlTraceSink, Tracer
+
+# Global registry of active tracers for atexit cleanup
+# Using a set of tracer IDs mapped to weak references
+_active_tracers: dict[int, weakref.ref[Tracer]] = {}
+_atexit_registered = False
+
+
+def _cleanup_tracers_on_exit() -> None:
+    """
+    Cleanup handler called on process exit.
+
+    Closes all active tracers to ensure trace data is uploaded to cloud.
+    This prevents data loss when users forget to call tracer.close().
+    """
+    for tracer_id, tracer_ref in list(_active_tracers.items()):
+        tracer = tracer_ref()
+        if tracer is not None:
+            try:
+                tracer.close()
+            except Exception:
+                pass  # Best effort - don't raise during exit
+
+
+def _register_tracer_for_cleanup(tracer: Tracer) -> None:
+    """
+    Register a tracer for automatic cleanup on process exit.
+
+    Args:
+        tracer: Tracer instance to register
+    """
+    global _atexit_registered
+
+    # Use id() as key to avoid hashability issues
+    tracer_id = id(tracer)
+    _active_tracers[tracer_id] = weakref.ref(tracer)
+
+    # Set callback on tracer so it unregisters itself when closed
+    tracer._on_close_callback = _unregister_tracer
+
+    # Register atexit handler on first tracer creation
+    if not _atexit_registered:
+        atexit.register(_cleanup_tracers_on_exit)
+        _atexit_registered = True
+
+
+def _unregister_tracer(tracer: Tracer) -> None:
+    """
+    Unregister a tracer from cleanup (called when tracer.close() is invoked).
+
+    Args:
+        tracer: Tracer instance to unregister
+    """
+    tracer_id = id(tracer)
+    _active_tracers.pop(tracer_id, None)
 
 
 def _emit_run_start(
@@ -58,11 +120,16 @@ def create_tracer(
     auto_emit_run_start: bool = True,
 ) -> Tracer:
     """
-    Create tracer with automatic tier detection.
+    Create tracer with automatic tier detection and auto-cleanup.
 
     Tier Detection:
     - If api_key is provided: Try to initialize CloudTraceSink (Pro/Enterprise)
     - If cloud init fails or no api_key: Fall back to JsonlTraceSink (Free tier)
+
+    Auto-Cleanup:
+    - Tracers are automatically registered for cleanup on process exit (atexit)
+    - This ensures trace data is uploaded even if tracer.close() is not called
+    - For best practice, still call tracer.close() explicitly or use context manager
 
     Args:
         api_key: Sentience API key (e.g., "sk_pro_xxxxx")
@@ -92,7 +159,21 @@ def create_tracer(
         Tracer configured with appropriate sink
 
     Example:
-        >>> # Pro tier user with goal
+        >>> # RECOMMENDED: Use as context manager (auto-closes on exit)
+        >>> with create_tracer(api_key="sk_pro_xyz", goal="Add to cart") as tracer:
+        ...     agent = SentienceAgent(browser, llm, tracer=tracer)
+        ...     agent.act("Click search")
+        >>> # tracer.close() called automatically
+        >>>
+        >>> # ALTERNATIVE: Manual close (still safe - atexit cleanup as fallback)
+        >>> tracer = create_tracer(api_key="sk_pro_xyz", goal="Add to cart")
+        >>> try:
+        ...     agent = SentienceAgent(browser, llm, tracer=tracer)
+        ...     agent.act("Click search")
+        ... finally:
+        ...     tracer.close()  # Best practice: explicit close
+        >>>
+        >>> # Pro tier with all metadata
         >>> tracer = create_tracer(
         ...     api_key="sk_pro_xyz",
         ...     run_id="demo",
@@ -101,8 +182,6 @@ def create_tracer(
         ...     llm_model="gpt-4-turbo",
         ...     start_url="https://amazon.com"
         ... )
-        >>> # Returns: Tracer with CloudTraceSink
-        >>> # run_start event is automatically emitted
         >>>
         >>> # With screenshot processor for PII redaction
         >>> def redact_pii(screenshot_base64: str) -> str:
@@ -113,20 +192,9 @@ def create_tracer(
         ...     api_key="sk_pro_xyz",
         ...     screenshot_processor=redact_pii
         ... )
-        >>> # Screenshots will be processed before upload
         >>>
-        >>> # Free tier user
+        >>> # Free tier user (local-only traces)
         >>> tracer = create_tracer(run_id="demo")
-        >>> # Returns: Tracer with JsonlTraceSink (local-only)
-        >>>
-        >>> # Disable auto-emit for manual control
-        >>> tracer = create_tracer(run_id="demo", auto_emit_run_start=False)
-        >>> tracer.emit_run_start("MyAgent", "gpt-4o")  # Manual emit
-        >>>
-        >>> # Use with agent
-        >>> agent = SentienceAgent(browser, llm, tracer=tracer)
-        >>> agent.act("Click search")
-        >>> tracer.close()  # Uploads to cloud if Pro tier
     """
     if run_id is None:
         run_id = str(uuid.uuid4())
@@ -187,6 +255,8 @@ def create_tracer(
                         ),
                         screenshot_processor=screenshot_processor,
                     )
+                    # Register for atexit cleanup (safety net for forgotten close())
+                    _register_tracer_for_cleanup(tracer)
                     # Auto-emit run_start for complete trace structure
                     if auto_emit_run_start:
                         _emit_run_start(tracer, agent_type, llm_model, goal, start_url)
@@ -253,6 +323,9 @@ def create_tracer(
         sink=JsonlTraceSink(str(local_path)),
         screenshot_processor=screenshot_processor,
     )
+
+    # Register for atexit cleanup (ensures file is properly closed)
+    _register_tracer_for_cleanup(tracer)
 
     # Auto-emit run_start for complete trace structure
     if auto_emit_run_start:
