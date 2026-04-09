@@ -1354,21 +1354,24 @@ def build_stepwise_planner_prompt(
     system = """You are a browser automation planner. Decide the NEXT action.
 
 Actions:
-- CLICK: Click an element. Set "intent" to element text/description.
-- TYPE_AND_SUBMIT: Type and submit. Set "intent" and "input".
+- CLICK: Click an element. Set "intent" to element type/role (e.g., "invoice link", "submit button"). Optionally set "input" to the specific text to match.
+- TYPE_AND_SUBMIT: Type and submit. Set "intent" to element type and "input" to text to type.
 - SCROLL: Scroll page. Set "direction" to "up" or "down".
-- DONE: Goal achieved.
+- DONE: Goal achieved. Return this when the goal is complete.
 
-Output ONLY JSON:
-{"action":"CLICK","intent":"button text","reasoning":"why"}
-{"action":"TYPE_AND_SUBMIT","intent":"search box","input":"query","reasoning":"why"}
-{"action":"DONE","intent":"completed","reasoning":"why"}
+Output ONLY valid JSON (no markdown, no ```):
+{"action":"CLICK","intent":"invoice link","input":"INV-2024-001","reasoning":"click first invoice"}
+{"action":"CLICK","intent":"submit button","reasoning":"submit the form"}
+{"action":"TYPE_AND_SUBMIT","intent":"search box","input":"wireless keyboard","reasoning":"search for product"}
+{"action":"DONE","intent":"completed","reasoning":"goal achieved"}
 
 RULES:
 1. Look at ACTUAL elements shown - pick one that matches your intent
-2. Do NOT repeat actions that already succeeded
-3. If goal is done, return DONE immediately
-4. No <think> tags, no markdown, no prose - ONLY JSON"""
+2. For CLICK: "intent" = element type (link, button, etc.), "input" = specific text (optional)
+3. CRITICAL: Do NOT repeat the same action twice. If history shows an action was already done (e.g., "CLICK Route To Review"), do NOT do it again.
+4. CRITICAL: If the goal is to click a button (e.g., "click Route to Review") and history shows you already clicked it, return DONE immediately.
+5. Return DONE when: (a) you clicked the target button, (b) you typed/submitted text, (c) page state shows goal is achieved
+6. Output ONLY JSON - no <think> tags, no markdown, no prose"""
 
     user = f"""Goal: {goal}
 
@@ -1406,10 +1409,12 @@ def build_executor_prompt(
     # Tight prompt optimized for small local models (4B-7B)
     # Key: explicit format, no reasoning, clear failure consequence
     if input_text:
-        # TYPE action needed
+        # TYPE action needed - find the INPUT element (textbox/combobox), not the submit button
         system = (
             "You are an executor for browser automation.\n"
-            "Return ONLY: TYPE(<id>, \"text\") or CLICK(<id>)\n"
+            "Task: Find the INPUT element (textbox, combobox, searchbox) to type into.\n"
+            "Return ONLY ONE line: TYPE(<id>, \"text\")\n"
+            "IMPORTANT: Return the ID of the INPUT/TEXTBOX element, NOT the submit button.\n"
             "If you output anything else, the action fails.\n"
             "Do NOT output <think> or any reasoning.\n"
             "No prose, no markdown, no extra whitespace.\n"
@@ -1427,12 +1432,19 @@ def build_executor_prompt(
             "Example: CLICK(12)"
         )
 
+    # Choose the appropriate closing instruction based on action type
+    if input_text:
+        # For TYPE actions, explicitly ask for TYPE with the text
+        action_instruction = f'Return TYPE(id, "{input_text}"):'
+    else:
+        action_instruction = "Return CLICK(id):"
+
     user = f"""Goal: {goal}
 {intent_line}{input_line}
 Elements:
 {compact_context}
 
-Return CLICK(id):"""
+{action_instruction}"""
 
     return system, user
 
@@ -1866,6 +1878,11 @@ class PlannerExecutorAgent:
         - - TYPE(42, "Logitech mouse")
         """
         text = text.strip()
+
+        # Strip <think>...</think> tags (Qwen/DeepSeek reasoning output)
+        text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+        # If <think> never closed, strip from first <think> to end
+        text = re.sub(r"<think>[\s\S]*$", "", text, flags=re.IGNORECASE).strip()
 
         # Strip common prefixes (bullets, dashes, asterisks)
         text = re.sub(r"^[-*•]\s*", "", text)
@@ -2767,6 +2784,39 @@ Return JSON patch:
         cfg = self.config.modal
         elements = getattr(post_snap, "elements", []) or []
 
+        # CRITICAL: Check if this drawer/modal contains CLICKABLE checkout-related elements.
+        # Only skip dismissal if there's an actual button/link the user should interact with.
+        # Informational text like "Added to cart" or "Subtotal" doesn't count.
+        checkout_button_patterns = (
+            "checkout", "check out", "proceed to checkout", "go to checkout",
+            "view cart", "view bag", "shopping cart", "shopping bag",
+            "continue to checkout", "secure checkout",
+            "go to cart", "see cart", "go to bag",
+        )
+
+        # Check for clickable checkout buttons/links
+        for el in elements:
+            role = (getattr(el, "role", "") or "").lower()
+            if role not in ("button", "link"):
+                continue
+
+            text = (getattr(el, "text", "") or "").lower()
+            aria_label = (getattr(el, "aria_label", "") or getattr(el, "ariaLabel", "") or "").lower()
+            href = (getattr(el, "href", "") or "").lower()
+
+            # Check text/aria-label for checkout patterns
+            for pattern in checkout_button_patterns:
+                if pattern in text or pattern in aria_label:
+                    if self.config.verbose:
+                        print(f"  [MODAL] Skipping dismissal - found clickable checkout element: '{pattern}' in {role}", flush=True)
+                    return False
+
+            # Check href for cart/checkout links
+            if "cart" in href or "checkout" in href or "bag" in href:
+                if self.config.verbose:
+                    print(f"  [MODAL] Skipping dismissal - found cart/checkout link: '{href}'", flush=True)
+                return False
+
         # Find candidates that match dismissal patterns
         candidates: list[tuple[int, int, str]] = []  # (element_id, score, matched_pattern)
 
@@ -2856,6 +2906,44 @@ Return JSON patch:
 
         if self.config.verbose:
             print("  [MODAL] All dismissal attempts exhausted", flush=True)
+        return False
+
+    def _looks_like_overlay_dismiss_intent(self, *, goal: str, intent: str) -> bool:
+        """
+        Detect steps that are dismissing overlays, modals, cookie banners, or popups.
+        These clicks should verify that the page state changed (modal was dismissed).
+        """
+        g = (goal or "").lower()
+        i = (intent or "").lower()
+        text = f"{g} {i}"
+        # Overlay/modal/popup dismissal patterns
+        overlay_keywords = (
+            "cookie",
+            "consent",
+            "gdpr",
+            "privacy",
+            "accept",
+            "dismiss",
+            "close",
+            "overlay",
+            "modal",
+            "popup",
+            "pop-up",
+            "banner",
+            "dialog",
+            "notification",
+            "newsletter",
+            "subscribe",
+        )
+        dismiss_verbs = ("accept", "dismiss", "close", "clear", "decline", "reject", "got it", "ok", "okay")
+        has_overlay_keyword = any(kw in text for kw in overlay_keywords)
+        has_dismiss_verb = any(v in text for v in dismiss_verbs)
+        # Match if both overlay context and dismiss intent are present
+        if has_overlay_keyword and has_dismiss_verb:
+            return True
+        # Also match explicit overlay/modal/banner mentions
+        if any(kw in text for kw in ("overlay", "modal", "banner", "popup", "pop-up", "dialog")):
+            return True
         return False
 
     async def _detect_checkout_page(
@@ -3279,12 +3367,15 @@ Return JSON patch:
                     await runtime.click(element_id)
                     if self.config.verbose:
                         print(f"  [ACTION] CLICK({element_id})", flush=True)
+                    # Wait for page to respond to click (JS navigation, etc.)
+                    await runtime.stabilize()
                 elif action_type == "TYPE" and element_id is not None:
                     # Use text from executor response first, then fall back to step.input
                     text = executor_text or step.input or ""
                     await runtime.type(element_id, text)
                     # If original plan action was TYPE_AND_SUBMIT, press Enter to submit
                     if original_action == "TYPE_AND_SUBMIT":
+                        # Press Enter to submit (WebBench approach - simpler and more reliable)
                         await runtime.press("Enter")
                         if self.config.verbose:
                             print(f"  [ACTION] TYPE_AND_SUBMIT({element_id}, '{text}')", flush=True)
@@ -3300,10 +3391,16 @@ Return JSON patch:
                         match = re.search(r"[Ss]earch\s+(?:for\s+)?['\"]?([^'\"]+)['\"]?", step.goal)
                         if match:
                             text = match.group(1).strip()
+
+                    # Type the text
                     await runtime.type(element_id, text)
+
+                    # Press Enter to submit (WebBench approach)
                     await runtime.press("Enter")
+
                     if self.config.verbose:
                         print(f"  [ACTION] TYPE_AND_SUBMIT({element_id}, '{text}')", flush=True)
+
                     # Wait for page to load after submit
                     await runtime.stabilize()
                 elif action_type == "PRESS":
@@ -3346,10 +3443,9 @@ Return JSON patch:
                 if self.config.verbose:
                     print(f"  [VERIFY] Predicate result: {'PASS' if verification_passed else 'FAIL'}", flush=True)
 
-                # For successful CLICK actions, check if a modal/drawer appeared and dismiss it
-                # This handles cases like Amazon's "Add Protection" drawer after Add to Cart
-                # where verification passes (e.g., "Proceed to checkout" button exists in drawer)
-                # but we need to dismiss the overlay before continuing
+                # For successful CLICK actions, check if a modal/drawer appeared
+                # IMPORTANT: For Add to Cart actions, look for checkout button FIRST
+                # before attempting modal dismissal (WebBench-style checkout continuation)
                 if verification_passed and original_action == "CLICK" and self.config.modal.enabled:
                     try:
                         post_snap = await runtime.snapshot(emit_trace=False)
@@ -3358,6 +3454,16 @@ Return JSON patch:
                         new_elements = post_elements - pre_elements
                         if len(new_elements) >= self.config.modal.min_new_elements:
                             # Significant DOM change after CLICK - might be a modal/drawer
+                            # Check if this was an Add to Cart action - if so, look for checkout button
+                            goal_lower = (step.goal or "").lower()
+                            intent_lower = (step.intent or "").lower()
+                            is_add_to_cart = any(
+                                p in goal_lower or p in intent_lower
+                                for p in ("add to cart", "add to bag", "add to basket")
+                            )
+
+                            # NOTE: Add to Cart checkout continuation is now handled after step completion
+                            # (see WebBench-style logic at step_index += 1), so just dismiss modals here
                             await self._attempt_modal_dismissal(runtime, post_snap)
                     except Exception:
                         pass  # Ignore snapshot errors
@@ -3426,6 +3532,26 @@ Return JSON patch:
                         print(f"  [VERIFY] No predicates defined, using error check: {'PASS' if verification_passed else 'FAIL'}", flush=True)
                     elif error:
                         print(f"  [VERIFY] Skipped due to error: {error}", flush=True)
+
+                # For overlay/modal dismissal steps without verify predicates,
+                # check if the modal is actually dismissed
+                if verification_passed and not step.verify and original_action == "CLICK":
+                    if self._looks_like_overlay_dismiss_intent(
+                        goal=str(step.goal or ""),
+                        intent=str(step.intent or ""),
+                    ):
+                        try:
+                            post_snap = await runtime.snapshot(emit_trace=False)
+                            modal_detected = getattr(post_snap, "modal_detected", None)
+                            # If modal is still detected, the dismissal didn't work
+                            if modal_detected is True:
+                                if self.config.verbose:
+                                    print(f"  [VERIFY] Overlay dismissal check: modal still detected", flush=True)
+                                verification_passed = False
+                            elif self.config.verbose:
+                                print(f"  [VERIFY] Overlay dismissal check: modal_detected={modal_detected}", flush=True)
+                        except Exception:
+                            pass  # Don't fail on snapshot errors
 
             # Track successful URL for recovery
             if verification_passed and self.config.recovery.track_successful_urls:
@@ -3720,6 +3846,61 @@ Return JSON patch:
                 # Check stop condition
                 if step.stop_if_true and outcome.verification_passed:
                     break
+
+                # Post-Add-to-Cart checkout continuation (WebBench-style):
+                # If this was an Add to Cart step and it's the last planned step,
+                # check if a cart drawer appeared with checkout buttons and add a step.
+                is_last_step = (step_index == len(plan.steps) - 1)
+                if (
+                    outcome.status in (StepStatus.SUCCESS, StepStatus.VISION_FALLBACK)
+                    and is_last_step
+                ):
+                    goal_lower = (step.goal or "").lower()
+                    is_add_to_cart = any(
+                        pattern in goal_lower
+                        for pattern in ("add to cart", "add to bag", "add to basket")
+                    )
+                    if is_add_to_cart:
+                        try:
+                            if self.config.verbose:
+                                print(f"  [CHECKOUT-CONTINUATION] Detected Add to Cart as last step, checking for checkout buttons", flush=True)
+                            checkout_snap = await runtime.snapshot(emit_trace=False)
+                            # Look for checkout buttons in the snapshot
+                            checkout_patterns = (
+                                "checkout", "check out", "proceed to checkout",
+                                "view cart", "go to cart", "view bag", "go to bag",
+                            )
+                            checkout_el = None
+                            for el in getattr(checkout_snap, "elements", []) or []:
+                                el_text = (getattr(el, "text", "") or "").lower()
+                                el_role = (getattr(el, "role", "") or "").lower()
+                                if el_role in ("button", "link") and any(p in el_text for p in checkout_patterns):
+                                    checkout_el = el
+                                    if self.config.verbose:
+                                        print(f"  [CHECKOUT-CONTINUATION] Found checkout button: id={el.id} text={el_text!r}", flush=True)
+                                    break
+                            if checkout_el is not None:
+                                # Dynamically add a checkout step to the plan
+                                from .models import PlanStep
+                                new_step = PlanStep(
+                                    id=step.id + 1,
+                                    goal="Click checkout button in cart drawer",
+                                    action="CLICK",
+                                    target=None,
+                                    intent="Checkout or View Cart button",
+                                    input=None,
+                                    verify=[],
+                                    required=True,
+                                    stop_if_true=False,
+                                    optional_substeps=[],
+                                    heuristic_hints=[],
+                                )
+                                plan.steps.append(new_step)
+                                if self.config.verbose:
+                                    print(f"  [CHECKOUT-CONTINUATION] Added checkout step id={new_step.id}", flush=True)
+                        except Exception as e:
+                            if self.config.verbose:
+                                print(f"  [CHECKOUT-CONTINUATION] Error: {e}", flush=True)
 
                 step_index += 1
 
@@ -4027,6 +4208,18 @@ Return JSON patch:
                     print(f"  [PLANNER] Action: {action_type}", flush=True)
                     print(f"  [PLANNER] Reasoning: {reasoning}", flush=True)
 
+                # 4.5 Loop detection: If the same action+target is repeated 2+ times, force DONE
+                current_target = next_action.get("intent") or next_action.get("input") or ""
+                if len(action_history) >= 2 and action_type == "CLICK":
+                    # Check if the last 2 actions were the same CLICK on the same target
+                    last_two = action_history[-2:]
+                    if all(r.action == "CLICK" and r.target and current_target.lower() in r.target.lower()
+                           for r in last_two):
+                        if self.config.verbose:
+                            print(f"  [LOOP DETECTED] Same CLICK action repeated 3+ times, forcing DONE", flush=True)
+                        action_type = "DONE"
+                        reasoning = "Loop detected - same CLICK action repeated, goal likely achieved"
+
                 # 5. Check for terminal states
                 if action_type == "DONE":
                     if self.config.verbose:
@@ -4087,8 +4280,9 @@ Return JSON patch:
                             predicates_passed=[],
                         )
 
-                    # 8.1 Modal dismissal after successful CLICK actions
-                    # Handles drawer/popup overlays (e.g., Amazon's "Add Protection" drawer after Add to Cart)
+                    # 8.1 Modal/drawer handling after successful CLICK actions
+                    # For Add to Cart actions, look for checkout button first (checkout continuation)
+                    # For other actions, use normal modal dismissal
                     if action_type == "CLICK" and self.config.modal.enabled:
                         try:
                             post_snap = await runtime.snapshot(emit_trace=False)
@@ -4099,9 +4293,44 @@ Return JSON patch:
                                 # Significant DOM change after CLICK - might be a modal/drawer
                                 if self.config.verbose:
                                     print(f"  [MODAL] Detected {len(new_elements)} new elements after CLICK, checking for dismissible overlay...", flush=True)
-                                dismissed = await self._attempt_modal_dismissal(runtime, post_snap)
-                                if dismissed and self.config.verbose:
-                                    print(f"  [MODAL] Dismissed overlay", flush=True)
+
+                                # Check if this was an Add to Cart action
+                                goal_lower = (plan_step.goal or "").lower()
+                                intent_lower = (plan_step.intent or "").lower()
+                                is_add_to_cart = any(
+                                    p in goal_lower or p in intent_lower
+                                    for p in ("add to cart", "add to bag", "add to basket")
+                                )
+
+                                if is_add_to_cart:
+                                    # Look for checkout button in the drawer
+                                    checkout_patterns = (
+                                        "checkout", "check out", "proceed to checkout",
+                                        "view cart", "go to cart", "view bag", "go to bag",
+                                    )
+                                    checkout_el = None
+                                    for el in getattr(post_snap, "elements", []) or []:
+                                        el_text = (getattr(el, "text", "") or "").lower()
+                                        el_role = (getattr(el, "role", "") or "").lower()
+                                        if el_role in ("button", "link") and any(p in el_text for p in checkout_patterns):
+                                            checkout_el = el
+                                            break
+
+                                    if checkout_el is not None:
+                                        if self.config.verbose:
+                                            print(f"  [CHECKOUT-CONTINUATION] Found checkout button: id={checkout_el.id} text={getattr(checkout_el, 'text', '')!r}", flush=True)
+                                        await runtime.click(checkout_el.id)
+                                        await runtime.stabilize()
+                                        if self.config.verbose:
+                                            print(f"  [CHECKOUT-CONTINUATION] Clicked checkout button", flush=True)
+                                    else:
+                                        dismissed = await self._attempt_modal_dismissal(runtime, post_snap)
+                                        if dismissed and self.config.verbose:
+                                            print(f"  [MODAL] Dismissed overlay", flush=True)
+                                else:
+                                    dismissed = await self._attempt_modal_dismissal(runtime, post_snap)
+                                    if dismissed and self.config.verbose:
+                                        print(f"  [MODAL] Dismissed overlay", flush=True)
                         except Exception:
                             pass  # Ignore snapshot errors
 
@@ -4219,7 +4448,13 @@ Return JSON patch:
             goal = f"Type '{input_text}' and submit"
         elif action_type == "CLICK":
             action = "CLICK"
-            goal = f"Click: {intent}" if intent else "Click element"
+            # Include input in goal if provided (e.g., "Click: button (Add Note)")
+            if intent and input_text:
+                goal = f"Click: {intent} ({input_text})"
+            elif intent:
+                goal = f"Click: {intent}"
+            else:
+                goal = "Click element"
         elif action_type == "SCROLL":
             action = "SCROLL"
             goal = f"Scroll {direction}"
