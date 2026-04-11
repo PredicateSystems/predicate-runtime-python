@@ -28,9 +28,63 @@ from predicate.agents.planner_executor_agent import (
     RecoveryNavigationConfig,
     SnapshotEscalationConfig,
     build_executor_prompt,
+    build_planner_prompt,
     normalize_plan,
     validate_plan_smoothness,
 )
+
+
+# ---------------------------------------------------------------------------
+# Test build_planner_prompt with page_context
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPlannerPromptPageContext:
+    """Tests for build_planner_prompt with page_context parameter."""
+
+    def test_page_context_not_included_when_none(self) -> None:
+        sys_prompt, user_prompt = build_planner_prompt(
+            task="Buy a laptop",
+            start_url="https://example.com",
+            page_context=None,
+        )
+        assert "Current Page Content" not in user_prompt
+        assert "markdown" not in user_prompt.lower()
+
+    def test_page_context_included_when_provided(self) -> None:
+        markdown_content = "# Welcome to Example Store\n\n- Laptops\n- Phones\n- Tablets"
+        sys_prompt, user_prompt = build_planner_prompt(
+            task="Buy a laptop",
+            start_url="https://example.com",
+            page_context=markdown_content,
+        )
+        assert "Current Page Content:" in user_prompt
+        assert "markdown representation" in user_prompt
+        assert "may be truncated" in user_prompt
+        assert "# Welcome to Example Store" in user_prompt
+        assert "Laptops" in user_prompt
+
+    def test_page_context_helps_with_task_understanding(self) -> None:
+        # Page context should help planner understand what's on the page
+        markdown_content = """
+# Search Results for "gaming laptop"
+
+## Products
+- ASUS ROG Gaming Laptop - $1299
+- MSI Raider - $1499
+- Alienware M15 - $1799
+
+## Filters
+- Price Range
+- Brand
+"""
+        sys_prompt, user_prompt = build_planner_prompt(
+            task="Add the ASUS gaming laptop to cart",
+            start_url="https://store.example.com/search?q=gaming+laptop",
+            page_context=markdown_content,
+        )
+        assert "ASUS ROG Gaming Laptop" in user_prompt
+        assert "Search Results" in user_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +721,19 @@ class TestPlannerExecutorConfigNewOptions:
             ),
         )
         assert config.recovery.max_recovery_attempts == 3
+
+    def test_use_page_context_default_disabled(self) -> None:
+        config = PlannerExecutorConfig()
+        assert config.use_page_context is False
+        assert config.page_context_max_chars == 8000
+
+    def test_use_page_context_can_be_enabled(self) -> None:
+        config = PlannerExecutorConfig(use_page_context=True)
+        assert config.use_page_context is True
+
+    def test_page_context_max_chars_customizable(self) -> None:
+        config = PlannerExecutorConfig(use_page_context=True, page_context_max_chars=4000)
+        assert config.page_context_max_chars == 4000
 
 
 # ---------------------------------------------------------------------------

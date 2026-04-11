@@ -677,6 +677,12 @@ class PlannerExecutorConfig:
     planner_max_tokens: int = 2048
     planner_temperature: float = 0.0
 
+    # Page context for planning: when enabled, extracts page content as markdown
+    # during initial planning to help the planner understand page type and structure.
+    # This adds token cost but improves plan quality for complex pages.
+    use_page_context: bool = False
+    page_context_max_chars: int = 8000  # Max chars of markdown to include
+
     # Executor LLM settings
     executor_max_tokens: int = 96
     executor_temperature: float = 0.0
@@ -1228,9 +1234,19 @@ def build_planner_prompt(
     auth_state: str = "unknown",
     strict: bool = False,
     schema_errors: str | None = None,
+    page_context: str | None = None,
 ) -> tuple[str, str]:
     """
     Build system and user prompts for the Planner LLM.
+
+    Args:
+        task: Task description
+        start_url: Starting URL
+        site_type: Type of site (general, e-commerce, etc.)
+        auth_state: Authentication state
+        strict: If True, emphasize JSON-only output
+        schema_errors: Errors from previous parsing attempt
+        page_context: Optional markdown content of the current page for context
 
     Returns:
         (system_prompt, user_prompt)
@@ -1330,12 +1346,27 @@ DO NOT use string format like "url_contains('text')" - use object format only.
 {domain_guidance}
 Return ONLY valid JSON. No prose, no code fences, no markdown."""
 
+    # Build page context section if provided
+    page_context_section = ""
+    if page_context:
+        page_context_section = f"""
+
+Current Page Content:
+The following is a markdown representation of the current page content. Use this to understand
+the page structure, available elements (buttons, links, forms), and content to inform your plan.
+Note: This may be truncated if the page is large.
+
+---
+{page_context}
+---
+"""
+
     user = f"""Task: {task}
 {schema_note}
 Starting URL: {start_url or "browser's current page"}
 Site type: {site_type}
 Auth state: {auth_state}
-
+{page_context_section}
 Output a JSON plan to accomplish this task. Each step should represent ONE distinct action."""
 
     return system, user
@@ -2506,6 +2537,7 @@ class PlannerExecutorAgent:
         *,
         start_url: str | None = None,
         max_attempts: int = 2,
+        page_context: str | None = None,
     ) -> Plan:
         """
         Generate execution plan for the given task.
@@ -2514,6 +2546,7 @@ class PlannerExecutorAgent:
             task: Task description
             start_url: Starting URL
             max_attempts: Maximum planning attempts
+            page_context: Optional markdown content of current page for better planning
 
         Returns:
             Plan object with steps
@@ -2529,6 +2562,7 @@ class PlannerExecutorAgent:
                 start_url=start_url,
                 strict=(attempt > 1),
                 schema_errors=last_errors or None,
+                page_context=page_context if attempt == 1 else None,  # Only include on first attempt
             )
 
             if self.config.verbose:
@@ -4557,9 +4591,21 @@ Return JSON patch:
         step_outcomes: list[StepOutcome] = []
         error: str | None = None
 
+        # Optionally fetch page context (markdown) for better planning
+        page_context: str | None = None
+        if self.config.use_page_context:
+            try:
+                page_context = await runtime.read_markdown(
+                    max_chars=self.config.page_context_max_chars
+                )
+                if self.config.verbose and page_context:
+                    print(f"  [PAGE-CONTEXT] Extracted {len(page_context)} chars of markdown for planning", flush=True)
+            except Exception:
+                pass  # Fail silently - page context is optional
+
         try:
             # Generate plan
-            plan = await self.plan(task_description, start_url=start_url)
+            plan = await self.plan(task_description, start_url=start_url, page_context=page_context)
 
             # Execute steps
             step_index = 0
@@ -4764,7 +4810,18 @@ Return JSON patch:
                             continuation_task = self._build_checkout_continuation_task(
                                 task_description, page_type
                             )
-                            plan = await self.plan(continuation_task, start_url=None)
+                            # Refresh page context for continuation planning if enabled
+                            continuation_context: str | None = None
+                            if self.config.use_page_context:
+                                try:
+                                    continuation_context = await runtime.read_markdown(
+                                        max_chars=self.config.page_context_max_chars
+                                    )
+                                except Exception:
+                                    pass
+                            plan = await self.plan(
+                                continuation_task, start_url=None, page_context=continuation_context
+                            )
                             step_index = 0  # Start from beginning of new plan
                             self._replans_used += 1
                             continue

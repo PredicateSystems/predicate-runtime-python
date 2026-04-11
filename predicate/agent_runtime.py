@@ -326,6 +326,40 @@ class AgentRuntime:
         self._cached_url = url
         return url
 
+    async def read_markdown(self, max_chars: int = 8000) -> str | None:
+        """
+        Read page content as markdown for semantic understanding.
+
+        This extracts the page HTML and converts it to markdown format,
+        which is useful for LLM planning to understand page context
+        (e.g., product listings, form fields, navigation structure).
+
+        Args:
+            max_chars: Maximum characters to return (default 8000).
+                       Truncates from the end if content exceeds this limit.
+
+        Returns:
+            Markdown string if successful, None if extraction fails.
+        """
+        try:
+            page = getattr(self.backend, "page", None)
+            if page is None:
+                return None
+
+            # Import here to avoid circular dependency
+            from .read import _fallback_read_from_page_async
+
+            result = await _fallback_read_from_page_async(page, output_format="markdown")
+            if result is None or result.status != "success":
+                return None
+
+            content = result.content
+            if len(content) > max_chars:
+                content = content[:max_chars]
+            return content
+        except Exception:
+            return None
+
     async def get_viewport_height(self) -> int:
         """
         Get current viewport height in pixels.
