@@ -1165,6 +1165,7 @@ class ExtractResult(BaseModel):
     data: Any | None = None
     raw: str | None = None
     error: str | None = None
+    llm_response: Any | None = None
 
 
 class TraceStats(BaseModel):

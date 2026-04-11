@@ -179,6 +179,32 @@ class AutomationTask:
     # Domain hints for heuristics (e.g., ["ecommerce", "amazon"])
     domain_hints: tuple[str, ...] = field(default_factory=tuple)
 
+    # Force a specific pruning category (overrides auto-detection)
+    force_pruning_category: str | None = None
+
+    def pruning_category_hint(self):
+        """
+        Return the pruning-oriented category for this task.
+
+        If force_pruning_category is set, returns that category directly.
+        Otherwise, uses rule-based normalization from task text and hints.
+        """
+        from ..pruning import PruningTaskCategory, classify_task_category
+
+        # If a category is forced, return it directly
+        if self.force_pruning_category:
+            try:
+                return PruningTaskCategory(self.force_pruning_category)
+            except ValueError:
+                pass  # Invalid category, fall through to auto-detection
+
+        return classify_task_category(
+            task_text=self.task,
+            current_url=self.starting_url,
+            domain_hints=self.domain_hints,
+            task_category=self.category,
+        ).category
+
     @classmethod
     def from_webbench_task(cls, task: Any) -> "AutomationTask":
         """

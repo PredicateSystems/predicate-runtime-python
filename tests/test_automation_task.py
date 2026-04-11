@@ -17,6 +17,7 @@ from predicate.agents import (
     COMMON_HINTS,
     get_common_hint,
 )
+from predicate.pruning import PruningTaskCategory
 
 
 class TestAutomationTask:
@@ -144,6 +145,30 @@ class TestAutomationTask:
         assert automation_task.task == "Read the page title"
         assert automation_task.category == TaskCategory.EXTRACTION
         assert automation_task.extraction_spec is not None
+
+    def test_pruning_category_hint_maps_transaction_task_to_shopping(self):
+        """Transaction tasks with shopping intent should map to shopping pruning."""
+        task = AutomationTask(
+            task_id="test-007",
+            starting_url="https://shop.com",
+            task="Find a jacket and add it to cart",
+            category=TaskCategory.TRANSACTION,
+            domain_hints=("ecommerce",),
+        )
+
+        assert task.pruning_category_hint() == PruningTaskCategory.SHOPPING
+
+    def test_pruning_category_hint_maps_form_fill_task(self):
+        """Form-fill tasks should map to form-filling pruning."""
+        task = AutomationTask(
+            task_id="test-008",
+            starting_url="https://example.com/contact",
+            task="Fill out the contact form",
+            category=TaskCategory.FORM_FILL,
+            domain_hints=("forms",),
+        )
+
+        assert task.pruning_category_hint() == PruningTaskCategory.FORM_FILLING
 
 
 class TestHeuristicHint:

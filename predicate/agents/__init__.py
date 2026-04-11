@@ -6,8 +6,9 @@ This package provides a "browser-use-like" agent surface built on top of:
 - RuntimeAgent (execution loop and bounded vision fallback)
 
 Agent types:
-- PredicateBrowserAgent: Single-executor agent with manual step definitions
+- PredicateAgent: Branded alias for PlannerExecutorAgent (recommended for external use)
 - PlannerExecutorAgent: Two-tier agent with LLM-generated plans
+- PredicateBrowserAgent: Single-executor agent with manual step definitions
 
 Task abstractions:
 - AutomationTask: Generic task model for browser automation
@@ -67,6 +68,9 @@ from .agent_factory import (
     get_config_preset,
 )
 
+# Branded alias for PlannerExecutorAgent
+PredicateAgent = PlannerExecutorAgent
+
 __all__ = [
     # Automation Task
     "AutomationTask",
@@ -95,6 +99,7 @@ __all__ = [
     "PlanStep",
     "PlannerExecutorAgent",
     "PlannerExecutorConfig",
+    "PredicateAgent",  # Branded alias for PlannerExecutorAgent
     "PredicateSpec",
     "RecoveryNavigationConfig",
     "RetryConfig",

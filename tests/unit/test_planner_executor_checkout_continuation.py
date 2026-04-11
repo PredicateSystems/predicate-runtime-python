@@ -261,6 +261,25 @@ class TestExtendedCheckoutDetection:
             should_skip = any(pattern in text.lower() for pattern in checkout_patterns)
             assert should_skip is False, f"Incorrectly matched: {text}"
 
+    def test_does_not_treat_global_nav_cart_link_as_drawer_checkout(self) -> None:
+        """Top-nav Amazon cart links should not suppress drawer dismissal."""
+        from types import SimpleNamespace
+
+        mock_planner = MagicMock()
+        mock_executor = MagicMock()
+        agent = PlannerExecutorAgent(planner=mock_planner, executor=mock_executor)
+
+        nav_cart = SimpleNamespace(
+            role="link",
+            text="Cart",
+            aria_label="0 items in cart",
+            href="https://www.amazon.com/gp/cart/view.html?ref_=nav_cart",
+            doc_y=24.0,
+            layout=SimpleNamespace(region="header"),
+        )
+
+        assert agent._is_global_nav_cart_link(nav_cart) is True
+
 
 # ---------------------------------------------------------------------------
 # Test Build Executor Prompt Improvements
@@ -279,6 +298,7 @@ class TestBuildExecutorPromptImprovements:
             intent=None,
             compact_context="100|textbox|Search|500|1|0|-|0|\n200|button|Submit|300|1|0|-|0|",
             input_text="laptop",
+            action_type="TYPE_AND_SUBMIT",  # Must specify action_type to get TYPE prompt
         )
 
         # System prompt should mention INPUT element explicitly
@@ -356,6 +376,36 @@ class TestThinkTagStripping:
         action_type, args = agent._parse_action(text)
         assert action_type == "CLICK"
         assert args == [100]
+
+    def test_parses_none_response(self) -> None:
+        """Should parse NONE response when executor can't find suitable element."""
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent
+        from predicate.llm_provider import LLMProvider
+
+        mock_planner = MagicMock(spec=LLMProvider)
+        mock_executor = MagicMock(spec=LLMProvider)
+        agent = PlannerExecutorAgent(planner=mock_planner, executor=mock_executor)
+
+        # Test NONE response
+        text = "NONE"
+        action_type, args = agent._parse_action(text)
+        assert action_type == "NONE"
+        assert args == []
+
+    def test_parses_none_with_explanation(self) -> None:
+        """Should parse NONE even with additional text."""
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent
+        from predicate.llm_provider import LLMProvider
+
+        mock_planner = MagicMock(spec=LLMProvider)
+        mock_executor = MagicMock(spec=LLMProvider)
+        agent = PlannerExecutorAgent(planner=mock_planner, executor=mock_executor)
+
+        # Test NONE with trailing text
+        text = "NONE - no search box found"
+        action_type, args = agent._parse_action(text)
+        assert action_type == "NONE"
+        assert args == []
 
 
 # ---------------------------------------------------------------------------

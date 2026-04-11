@@ -17,8 +17,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import re
+import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -26,13 +28,21 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
+from ..actions import clear_async, type_text_async
 from ..agent_runtime import AgentRuntime
 from ..llm_provider import LLMProvider, LLMResponse
 from ..models import Snapshot, SnapshotOptions, StepHookContext
+from ..pruning import (
+    PrunedSnapshotContext,
+    PruningTaskCategory,
+    classify_task_category,
+    prune_with_recovery,
+)
 from ..trace_event_builder import TraceEventBuilder
 from ..tracing import Tracer
 from ..verification import (
@@ -667,9 +677,16 @@ class PlannerExecutorConfig:
     planner_max_tokens: int = 2048
     planner_temperature: float = 0.0
 
+    # Page context for planning: when enabled, extracts page content as markdown
+    # during initial planning to help the planner understand page type and structure.
+    # This adds token cost but improves plan quality for complex pages.
+    use_page_context: bool = False
+    page_context_max_chars: int = 8000  # Max chars of markdown to include
+
     # Executor LLM settings
     executor_max_tokens: int = 96
     executor_temperature: float = 0.0
+    type_delay_ms: float | None = 17.0
 
     # Stabilization (wait for DOM to settle after actions)
     stabilize_enabled: bool = True
@@ -770,6 +787,8 @@ class SnapshotContext:
     snapshot_success: bool = True
     requires_vision: bool = False
     vision_reason: str | None = None
+    pruning_category: str | None = None
+    pruned_node_count: int = 0
 
     def is_stale(self, max_age_seconds: float = 5.0) -> bool:
         """Check if snapshot is too old to reuse."""
@@ -875,6 +894,16 @@ class StepOutcome:
     duration_ms: int = 0
     url_before: str | None = None
     url_after: str | None = None
+    extracted_data: Any | None = None
+
+
+@dataclass
+class SearchSubmitTelemetry:
+    """Tracks search-submit behavior for debugging and diagnostics."""
+
+    first_submit_method: Literal["click", "enter"] | None = None
+    retry_submit_method: Literal["click", "enter"] | None = None
+    observed_search_results_dom: bool = False
 
 
 @dataclass
@@ -934,6 +963,112 @@ def build_predicate(spec: PredicateSpec | dict[str, Any]) -> Predicate:
         return all_of(*(build_predicate(p) for p in args))
 
     raise ValueError(f"Unsupported predicate: {name}")
+
+
+# ---------------------------------------------------------------------------
+# Extraction Keywords for Markdown-based Text Extraction
+# ---------------------------------------------------------------------------
+
+# Keywords that indicate a simple text extraction task suitable for read_markdown()
+# These tasks don't need LLM-based extraction - just return the page content as markdown
+TEXT_EXTRACTION_KEYWORDS = frozenset([
+    # Direct extraction verbs
+    "extract",
+    "read",
+    "parse",
+    "scrape",
+    "get",
+    "fetch",
+    "retrieve",
+    "capture",
+    "grab",
+    "copy",
+    "pull",
+    # Question words that indicate reading content
+    "what is",
+    "what are",
+    "what's",
+    "show me",
+    "tell me",
+    "find",
+    "list",
+    "display",
+    # Content-specific patterns
+    "title",
+    "headline",
+    "heading",
+    "text",
+    "content",
+    "body",
+    "paragraph",
+    "article",
+    "post",
+    "message",
+    "description",
+    "summary",
+    "excerpt",
+    # Data extraction patterns
+    "price",
+    "cost",
+    "amount",
+    "name",
+    "label",
+    "value",
+    "number",
+    "date",
+    "time",
+    "address",
+    "email",
+    "phone",
+    "rating",
+    "review",
+    "comment",
+    "author",
+    "username",
+    # Table/list extraction
+    "table",
+    "row",
+    "column",
+    "item",
+    "entry",
+    "record",
+])
+
+
+def _is_text_extraction_task(task: str) -> bool:
+    """
+    Determine if a task is a simple text extraction that can use read_markdown().
+
+    Returns True if the task contains keywords indicating text extraction,
+    where returning the page markdown is sufficient without LLM-based extraction.
+
+    Args:
+        task: The task description to analyze
+
+    Returns:
+        True if this is a text extraction task suitable for read_markdown()
+    """
+    if not task:
+        return False
+
+    task_lower = task.lower()
+
+    # Check for extraction keyword patterns using word boundary matching
+    # to avoid false positives (e.g., "time" in "sentiment")
+    for keyword in TEXT_EXTRACTION_KEYWORDS:
+        # Multi-word keywords (like "what is") use substring matching
+        if " " in keyword:
+            if keyword in task_lower:
+                return True
+        else:
+            # Single-word keywords use word boundary matching via regex
+            # Match keyword at word boundaries, allowing for plurals (optional 's' or 'es')
+            # e.g., "title" matches "title", "titles", "title's"
+            pattern = rf"\b{re.escape(keyword)}(s|es)?\b"
+            if re.search(pattern, task_lower):
+                return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1073,6 +1208,7 @@ def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
                     "INPUT": "TYPE_AND_SUBMIT",
                     "TYPE_TEXT": "TYPE_AND_SUBMIT",
                     "ENTER_TEXT": "TYPE_AND_SUBMIT",
+                    "EXTRACT_TEXT": "EXTRACT",
                     "GOTO": "NAVIGATE",
                     "GO_TO": "NAVIGATE",
                     "OPEN": "NAVIGATE",
@@ -1204,9 +1340,19 @@ def build_planner_prompt(
     auth_state: str = "unknown",
     strict: bool = False,
     schema_errors: str | None = None,
+    page_context: str | None = None,
 ) -> tuple[str, str]:
     """
     Build system and user prompts for the Planner LLM.
+
+    Args:
+        task: Task description
+        start_url: Starting URL
+        site_type: Type of site (general, e-commerce, etc.)
+        auth_state: Authentication state
+        strict: If True, emphasize JSON-only output
+        schema_errors: Errors from previous parsing attempt
+        page_context: Optional markdown content of the current page for context
 
     Returns:
         (system_prompt, user_prompt)
@@ -1234,23 +1380,59 @@ IMPORTANT: E-Commerce Task Planning Rules
 =========================================
 For shopping/purchase tasks, include ALL necessary steps in order:
 1. NAVIGATE to the site (if not already there)
-2. TYPE_AND_SUBMIT search query in search box
+2. Find the product - choose ONE of these approaches IN PRIORITY ORDER:
+   a) DIRECT MATCH (BEST): Scan page for text closely matching the goal. CLICK any product/category with matching text.
+   b) CATEGORY BROWSE: If no exact match, click a category link that relates to the goal (e.g., "Tablecloths" for "vinyl tablecloth")
+   c) SEARCH: ONLY if you see an input EXPLICITLY labeled "Search" with placeholder="Search..." or aria-label="Search"
+   d) SEARCH ICON: Only if you see a magnifying glass icon linked to search
 3. CLICK on specific product from results (not filters or categories)
 4. CLICK "Add to Cart" button on product page
 5. CLICK "Proceed to Checkout" or cart icon
 6. Handle login/signup if required (may need CLICK + TYPE_AND_SUBMIT)
 7. CLICK through checkout process
 
+CRITICAL - CATEGORY NAVIGATION (MOST RELIABLE FOR HOMEPAGES):
+- On homepage/landing pages, browse via CATEGORY LINKS - this is the MOST RELIABLE method
+- Look for category links like "Rally Home Goods", "Tablecloths", "Kitchen", "Catalog", etc.
+- Category links are usually in the main navigation, sidebar, or footer and are always clickable
+- Example: Goal "vinyl tablecloth" → Click "Rally Home Goods" or "Catalog" category first
+- After clicking a category, THEN look for the specific product
+
+SECONDARY - Direct Product Click (ONLY on collection/category pages):
+- If a product appears on a CATEGORY/COLLECTION page (not homepage), click it directly
+- WARNING: Products in "Hot Products", carousels, or grid sections on HOME PAGES are often NOT clickable
+- The snapshot may not capture product titles in carousels - use category navigation instead
+
+AVOID - Searching on sites without visible search box:
+- Many e-commerce sites hide search or don't have search at all
+- If you don't see a clear "Search" textbox in the page markdown, DO NOT try to search
+- Prefer category navigation over searching - it's more reliable
+
+CRITICAL - Search Box Identification (ONLY WHEN NO MATCHING TEXT):
+- Only use TYPE_AND_SUBMIT if you see an input EXPLICITLY labeled for SEARCH
+- Valid search indicators: placeholder="Search...", aria-label="Search", text "Search products"
+- DO NOT type into fields with these labels (they are NOT search boxes):
+  * "Your email address", "Email", "Newsletter", "Subscribe"
+  * "Zip code", "Location", "Enter your email"
+  * Any field asking for personal information
+- If unsure whether a field is a search box, DO NOT use it - click products/categories instead
+
 Common mistakes to AVOID:
 - Do NOT skip "Add to Cart" step - clicking a product link is NOT adding to cart
 - Do NOT combine multiple distinct actions into one step
 - Do NOT confuse filter/category clicks with product selection
+- Do NOT assume a search box exists - if none is clearly visible, click products/categories directly
+- Do NOT hallucinate search boxes - if page content doesn't show an obvious search input, use direct navigation
+- Do NOT type into email/newsletter/subscription fields - they are NOT search boxes
+- Do NOT use search when matching text is visible - click directly instead
 - Each distinct user action should be its own step
 
-Intent hints are critical - use clear hints like:
+Intent hints are critical - ALWAYS include the specific product/element name:
+- intent: "Click product Vinyl Tablecloth" (GOOD - includes product name)
+- intent: "Click on product title or image" (BAD - too generic, will click wrong product)
+- intent: "Click category link Tablecloths" (GOOD - includes category name)
 - intent: "Click Add to Cart button"
 - intent: "Click Proceed to Checkout"
-- intent: "Click on product title or image"
 - intent: "Click sign in button"
 """
     elif is_search_task:
@@ -1263,6 +1445,46 @@ For search tasks, include steps to:
 2. TYPE_AND_SUBMIT the search query
 3. Wait for/verify search results
 4. If selecting a result: CLICK on specific result item
+"""
+
+    # Check for extraction tasks
+    is_extraction_task = any(keyword in task_lower for keyword in [
+        "extract", "get the", "what is", "read the", "find the text", "scrape",
+        "title of", "price of", "name of", "content of",
+    ])
+
+    if is_extraction_task:
+        domain_guidance = """
+
+IMPORTANT: Extraction Task Planning Rules
+=========================================
+For extraction tasks where data is already visible on the page:
+
+1. If the data you need is VISIBLE in the page context markdown above:
+   - Use EXTRACT directly as the ONLY step - no clicking needed
+   - The EXTRACT action will read the visible text from the page
+
+2. If you need to navigate to see the data:
+   - First CLICK or NAVIGATE to the right page
+   - Then use EXTRACT
+
+CRITICAL: Do NOT click on links to external sites when extracting.
+- Hacker News post titles link to EXTERNAL sites, not to HN pages
+- To extract a title that's visible, use EXTRACT directly on the current page
+- Only click if you need to navigate to an HN item page (e.g., for comments)
+
+Example for "Extract the title of the first post":
+{
+  "steps": [
+    {
+      "id": 1,
+      "goal": "Extract the first post title from the page",
+      "action": "EXTRACT",
+      "target": "first post title",
+      "verify": []
+    }
+  ]
+}
 """
 
     system = f"""You are the PLANNER. Output a JSON execution plan for the web automation task.
@@ -1289,10 +1511,10 @@ Your output must be a valid JSON object with this EXACT structure:
     }},
     {{
       "id": 3,
-      "goal": "Click on result",
+      "goal": "Click on product from results",
       "action": "CLICK",
       "intent": "Click on product title",
-      "verify": [{{"predicate": "url_contains", "args": ["/product/"]}}]
+      "verify": []
     }}
   ]
 }}
@@ -1303,15 +1525,44 @@ CRITICAL: Each verify predicate MUST be an object with "predicate" and "args" ke
 - {{"predicate": "not_exists", "args": ["text~'error'"]}}
 
 DO NOT use string format like "url_contains('text')" - use object format only.
+
+CRITICAL - url_contains RULES:
+1. Use ONLY generic keywords, NEVER site-specific paths like "/product/", "/products/", "/collections/"
+2. Different sites use different URL patterns - don't guess the path structure
+3. For product pages: use "verify": [] (empty) or use the product keyword like ["snow-blower"]
+4. For search: "search" or "query=" work across most sites
+5. For checkout: "checkout" or "cart" work across most sites
+6. NEVER use paths like "/product/", "/products/", "/p/", "/dp/" - these are site-specific
+
+Examples:
+- GOOD: {{"predicate": "url_contains", "args": ["snow-blower"]}} - uses product keyword
+- GOOD: {{"predicate": "url_contains", "args": ["search"]}} - generic search indicator
+- BAD: {{"predicate": "url_contains", "args": ["/product/"]}} - site-specific path
+- BAD: {{"predicate": "url_contains", "args": ["/products/vinyl-tablecloth"]}} - guessing path structure
 {domain_guidance}
 Return ONLY valid JSON. No prose, no code fences, no markdown."""
+
+    # Build page context section if provided
+    page_context_section = ""
+    if page_context:
+        page_context_section = f"""
+
+Current Page Content:
+The following is a markdown representation of the current page content. Use this to understand
+the page structure, available elements (buttons, links, forms), and content to inform your plan.
+Note: This may be truncated if the page is large.
+
+---
+{page_context}
+---
+"""
 
     user = f"""Task: {task}
 {schema_note}
 Starting URL: {start_url or "browser's current page"}
 Site type: {site_type}
 Auth state: {auth_state}
-
+{page_context_section}
 Output a JSON plan to accomplish this task. Each step should represent ONE distinct action."""
 
     return system, user
@@ -1354,23 +1605,28 @@ def build_stepwise_planner_prompt(
     system = """You are a browser automation planner. Decide the NEXT action.
 
 Actions:
-- CLICK: Click an element. Set "intent" to element type/role (e.g., "invoice link", "submit button"). Optionally set "input" to the specific text to match.
-- TYPE_AND_SUBMIT: Type and submit. Set "intent" to element type and "input" to text to type.
+- CLICK: Click an element. Set "intent" to element type/role. Set "input" to EXACT text from elements list.
+- TYPE_AND_SUBMIT: Type and submit. ONLY use if you see a "searchbox" or "textbox" with "search" in the text.
 - SCROLL: Scroll page. Set "direction" to "up" or "down".
 - DONE: Goal achieved. Return this when the goal is complete.
 
+CRITICAL RULE FOR CLICK:
+- The "input" field MUST contain text that ACTUALLY APPEARS in the elements list below
+- Do NOT guess or invent text - copy EXACT text from an element
+- If product title "vinyl tablecloth" is NOT in the elements list, click a category link instead (e.g., "Catalog", "Home Goods")
+- Only click a specific product if you see its EXACT name in the elements
+
 Output ONLY valid JSON (no markdown, no ```):
-{"action":"CLICK","intent":"invoice link","input":"INV-2024-001","reasoning":"click first invoice"}
-{"action":"CLICK","intent":"submit button","reasoning":"submit the form"}
-{"action":"TYPE_AND_SUBMIT","intent":"search box","input":"wireless keyboard","reasoning":"search for product"}
+{"action":"CLICK","intent":"category link","input":"Catalog","reasoning":"browse products via category"}
+{"action":"CLICK","intent":"product link","input":"Vinyl Round Tablecloth","reasoning":"found exact product name"}
 {"action":"DONE","intent":"completed","reasoning":"goal achieved"}
 
 RULES:
-1. Look at ACTUAL elements shown - pick one that matches your intent
-2. For CLICK: "intent" = element type (link, button, etc.), "input" = specific text (optional)
-3. CRITICAL: Do NOT repeat the same action twice. If history shows an action was already done (e.g., "CLICK Route To Review"), do NOT do it again.
-4. CRITICAL: If the goal is to click a button (e.g., "click Route to Review") and history shows you already clicked it, return DONE immediately.
-5. Return DONE when: (a) you clicked the target button, (b) you typed/submitted text, (c) page state shows goal is achieved
+1. ONLY use text that appears EXACTLY in the elements list - do NOT invent names
+2. For shopping: start with category links (Catalog, Shop Now, Home Goods) to find products
+3. ONLY use TYPE_AND_SUBMIT if you see a textbox labeled "search"
+4. Do NOT type into "email" or "newsletter" fields
+5. Do NOT repeat the same action twice
 6. Output ONLY JSON - no <think> tags, no markdown, no prose"""
 
     user = f"""Goal: {goal}
@@ -1385,11 +1641,53 @@ Based on the goal and current page state, what is the NEXT action to take?"""
     return system, user
 
 
+def _get_category_executor_hints(category: str | None) -> str:
+    """
+    Get category-specific hints for the executor.
+
+    These hints guide the executor to prioritize certain element types
+    based on the detected task category, improving accuracy without
+    adding tokens to the planner.
+    """
+    if not category:
+        return ""
+
+    category_lower = category.lower() if isinstance(category, str) else str(category).lower()
+
+    hints = {
+        "shopping": (
+            "Priority: 'Add to Cart', 'Buy Now', 'Add to Bag', product links, price elements."
+        ),
+        "checkout": (
+            "Priority: 'Checkout', 'Proceed to Checkout', 'Place Order', payment fields."
+        ),
+        "form_filling": (
+            "Priority: input fields, textboxes, submit/send buttons, form labels."
+        ),
+        "search": (
+            "Priority: search box, search button, result links, filter controls."
+        ),
+        "auth": (
+            "Priority: username/email field, password field, sign in/login button."
+        ),
+        "extraction": (
+            "Priority: data elements, table cells, list items, content containers."
+        ),
+        "navigation": (
+            "Priority: navigation links, menu items, breadcrumbs."
+        ),
+    }
+
+    return hints.get(category_lower, "")
+
+
 def build_executor_prompt(
     goal: str,
     intent: str | None,
     compact_context: str,
     input_text: str | None = None,
+    category: str | None = None,
+    action_type: str | None = None,
 ) -> tuple[str, str]:
     """
     Build system and user prompts for the Executor LLM.
@@ -1398,23 +1696,43 @@ def build_executor_prompt(
         goal: Human-readable goal for this step
         intent: Intent hint for element selection (optional)
         compact_context: Compact representation of page elements
-        input_text: Text to type for TYPE_AND_SUBMIT actions (optional)
+        input_text: For TYPE_AND_SUBMIT: text to type. For CLICK: target text to match (optional)
+        category: Task category for category-specific hints (optional)
+        action_type: Action type (CLICK, TYPE_AND_SUBMIT, etc.) to determine prompt variant
 
     Returns:
         (system_prompt, user_prompt)
     """
     intent_line = f"Intent: {intent}\n" if intent else ""
-    input_line = f"Text to type: \"{input_text}\"\n" if input_text else ""
+
+    # For CLICK actions, input_text is target to match (not text to type)
+    is_type_action = action_type in ("TYPE_AND_SUBMIT", "TYPE")
+    if is_type_action and input_text:
+        input_line = f"Text to type: \"{input_text}\"\n"
+    elif input_text:
+        input_line = f"Target to find: \"{input_text}\"\n"
+    else:
+        input_line = ""
+
+    # Get category-specific hints
+    category_hints = _get_category_executor_hints(category)
+    category_line = f"{category_hints}\n" if category_hints else ""
 
     # Tight prompt optimized for small local models (4B-7B)
     # Key: explicit format, no reasoning, clear failure consequence
-    if input_text:
+    if is_type_action and input_text:
         # TYPE action needed - find the INPUT element (textbox/combobox), not the submit button
         system = (
             "You are an executor for browser automation.\n"
             "Task: Find the INPUT element (textbox, combobox, searchbox) to type into.\n"
             "Return ONLY ONE line: TYPE(<id>, \"text\")\n"
             "IMPORTANT: Return the ID of the INPUT/TEXTBOX element, NOT the submit button.\n"
+            "CRITICAL - AVOID these fields (they are NOT search boxes):\n"
+            "- Fields with 'email', 'newsletter', 'subscribe', 'signup' in the text\n"
+            "- Fields labeled 'Your email address', 'Email', 'Enter your email'\n"
+            "- Fields in footer/newsletter sections\n"
+            "ONLY use fields explicitly labeled for SEARCH (placeholder='Search', aria='Search').\n"
+            "If NO search field exists, return NONE instead of guessing.\n"
             "If you output anything else, the action fails.\n"
             "Do NOT output <think> or any reasoning.\n"
             "No prose, no markdown, no extra whitespace.\n"
@@ -1422,25 +1740,112 @@ def build_executor_prompt(
         )
     else:
         # CLICK action (most common)
-        system = (
-            "You are an executor for browser automation.\n"
-            "Return ONLY a single-line CLICK(id) action.\n"
-            "If you output anything else, the action fails.\n"
-            "Do NOT output <think> or any reasoning.\n"
-            "No prose, no markdown, no extra whitespace.\n"
-            "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
-            "Example: CLICK(12)"
+        # Check if this is a search-related action (from intent or goal)
+        search_keywords = ["search", "magnify", "magnifier", "find"]
+        is_search_action = (
+            (intent and any(kw in intent.lower() for kw in search_keywords))
+            or any(kw in goal.lower() for kw in search_keywords)
         )
+        # Check if this is a product click action (from intent or goal)
+        product_keywords = ["product", "item", "result", "listing"]
+        is_product_action = (
+            (intent and any(kw in intent.lower() for kw in product_keywords))
+            or any(kw in goal.lower() for kw in product_keywords)
+        )
+        # Check if this is an Add to Cart action
+        add_to_cart_keywords = ["add to cart", "add to bag", "add to basket", "buy now"]
+        is_add_to_cart_action = (
+            (intent and any(kw in intent.lower() for kw in add_to_cart_keywords))
+            or any(kw in goal.lower() for kw in add_to_cart_keywords)
+        )
+        # Check if intent asks to match text (e.g., "Click element with text matching [keyword]")
+        is_text_matching_action = intent and "matching" in intent.lower()
+        # Check if input_text specifies a target to match (for CLICK actions, input_text is target text)
+        has_target_text = bool(input_text)
+
+        if is_search_action:
+            system = (
+                "You are an executor for browser automation.\n"
+                "Return ONLY a single-line CLICK(id) action.\n"
+                "If you output anything else, the action fails.\n"
+                "Do NOT output <think> or any reasoning.\n"
+                "SEARCH ICON HINTS: Look for links/buttons with 'search' in text/href, "
+                "or icon-only elements (text='0' or empty) with 'search' in href.\n"
+                "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
+                "Example: CLICK(12)"
+            )
+        elif is_text_matching_action or has_target_text:
+            # When planner specifies target text (input field), executor must match it
+            target_text = input_text or ""
+            system = (
+                "You are an executor for browser automation.\n"
+                "Return ONLY a single-line CLICK(id) action.\n"
+                "If you output anything else, the action fails.\n"
+                "Do NOT output <think> or any reasoning.\n"
+                f"CRITICAL: Find an element with text matching '{target_text}'.\n"
+                "- Look for: product titles, category names, link text, button labels\n"
+                "- Text must contain the target words (case-insensitive partial match is OK)\n"
+                "- If NO element contains the target text, return NONE instead of clicking something random\n"
+                "Output: CLICK(<digits>) or NONE\n"
+                "Example: CLICK(42) or NONE"
+            )
+        elif is_product_action:
+            # Product click action without specific target - guide executor to find product cards/links
+            system = (
+                "You are an executor for browser automation.\n"
+                "Return ONLY a single-line CLICK(id) action.\n"
+                "If you output anything else, the action fails.\n"
+                "Do NOT output <think> or any reasoning.\n"
+                "PRODUCT CLICK HINTS:\n"
+                "- Look for LINK elements (role=link) with product IDs in href (e.g., /7027762, /dp/B...)\n"
+                "- Prefer links with delivery info text like 'Delivery', 'Ships to Store', 'Get it...'\n"
+                "- These are inside product cards and will navigate to product detail pages\n"
+                "- AVOID buttons like 'Search', 'Shop', category buttons, or filter buttons\n"
+                "- AVOID image slider options (slider image 1, 2, etc.)\n"
+                "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
+                "Example: CLICK(1268)"
+            )
+        elif is_add_to_cart_action:
+            # Add to Cart action - may need to click product first if on search results page
+            system = (
+                "You are an executor for browser automation.\n"
+                "Return ONLY a single-line CLICK(id) action.\n"
+                "If you output anything else, the action fails.\n"
+                "Do NOT output <think> or any reasoning.\n"
+                "ADD TO CART HINTS:\n"
+                "- FIRST: Look for buttons with text: 'Add to Cart', 'Add to Bag', 'Add to Basket', 'Buy Now'\n"
+                "- If found, click that button directly\n"
+                "- FALLBACK: If NO 'Add to Cart' button is visible, you are likely on a SEARCH RESULTS page\n"
+                "  - In this case, click a PRODUCT LINK to go to the product details page first\n"
+                "  - Look for LINK elements with product IDs in href (e.g., /7027762, /dp/B...)\n"
+                "  - Prefer links with product names, prices, or delivery info\n"
+                "- AVOID: 'Search' buttons, category buttons, filter buttons, pagination\n"
+                "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
+                "Example: CLICK(42)"
+            )
+        else:
+            system = (
+                "You are an executor for browser automation.\n"
+                "Return ONLY a single-line CLICK(id) action.\n"
+                "If you output anything else, the action fails.\n"
+                "Do NOT output <think> or any reasoning.\n"
+                "No prose, no markdown, no extra whitespace.\n"
+                "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
+                "Example: CLICK(12)"
+            )
 
     # Choose the appropriate closing instruction based on action type
-    if input_text:
+    if is_type_action and input_text:
         # For TYPE actions, explicitly ask for TYPE with the text
         action_instruction = f'Return TYPE(id, "{input_text}"):'
+    elif input_text:
+        # For CLICK with target text, remind to match target or return NONE
+        action_instruction = f'Return CLICK(id) for element matching "{input_text}", or NONE if not found:'
     else:
         action_instruction = "Return CLICK(id):"
 
     user = f"""Goal: {goal}
-{intent_line}{input_line}
+{intent_line}{category_line}{input_line}
 Elements:
 {compact_context}
 
@@ -1575,6 +1980,9 @@ class PlannerExecutorAgent:
         # Current automation task (for run-level context)
         self._current_task: AutomationTask | None = None
 
+        # Cached pruning category (run-scoped, avoids re-classification per step)
+        self._cached_pruning_category: PruningTaskCategory | None = None
+
         # Token usage tracking
         self._token_collector = _TokenUsageCollector()
 
@@ -1606,6 +2014,93 @@ class PlannerExecutorAgent:
         except Exception:
             pass  # Don't fail on token tracking errors
 
+    def _detect_pruning_category(
+        self,
+        snap: Snapshot,
+        goal: str,
+    ) -> PruningTaskCategory | None:
+        """Resolve the pruning category from task context, then goal-based rules.
+
+        The category is cached for the duration of a run to ensure consistency
+        and avoid re-classification on every step.
+        """
+        # Return cached category if available
+        if self._cached_pruning_category is not None:
+            return self._cached_pruning_category
+
+        if self._current_task is not None:
+            try:
+                category = self._current_task.pruning_category_hint()
+                if category != PruningTaskCategory.GENERIC:
+                    self._cached_pruning_category = category
+                    if self.config.verbose:
+                        print(f"  [CATEGORY] Detected category from task hint: {category.value}", flush=True)
+                    return category
+            except Exception:
+                pass
+
+            result = classify_task_category(
+                task_text=self._current_task.task,
+                current_url=self._current_task.starting_url or getattr(snap, "url", "") or "",
+                domain_hints=self._current_task.domain_hints,
+                task_category=self._current_task.category,
+            )
+        else:
+            result = classify_task_category(
+                task_text=goal,
+                current_url=getattr(snap, "url", "") or "",
+            )
+
+        if result.category == PruningTaskCategory.GENERIC:
+            return None
+
+        # Cache the category for this run
+        self._cached_pruning_category = result.category
+        if self.config.verbose:
+            print(f"  [CATEGORY] Detected category: {result.category.value} (confidence={result.confidence:.2f})", flush=True)
+        return result.category
+
+    def _get_cached_category_str(self) -> str | None:
+        """Get the cached category as a string for executor hints."""
+        if self._cached_pruning_category is not None:
+            return self._cached_pruning_category.value
+        return None
+
+    def _build_pruned_context(
+        self,
+        snap: Snapshot,
+        goal: str,
+    ) -> PrunedSnapshotContext | None:
+        """Build a category-specific pruned context when task intent is known.
+
+        Uses automatic over-pruning recovery via relaxation levels if the
+        initial pruning leaves too few elements.
+        """
+        if self._context_formatter is not None:
+            return None
+
+        category = self._detect_pruning_category(snap, goal)
+        if category is None:
+            return None
+
+        try:
+            ctx = prune_with_recovery(
+                snap,
+                goal=goal,
+                category=category,
+                max_relaxation=3,
+                verbose=self.config.verbose,
+            )
+            if self.config.verbose and ctx.relaxation_level == 0:
+                print(
+                    f"  [PRUNING] {ctx.raw_element_count} -> {ctx.pruned_element_count} elements "
+                    f"(category={category.value})",
+                    flush=True,
+                )
+            return ctx
+        except Exception:
+            return None
+
     def _format_context(self, snap: Snapshot, goal: str) -> str:
         """
         Format snapshot for LLM context.
@@ -1615,6 +2110,10 @@ class PlannerExecutorAgent:
         """
         if self._context_formatter is not None:
             return self._context_formatter(snap, goal)
+
+        pruned_context = self._build_pruned_context(snap, goal)
+        if pruned_context is not None and pruned_context.nodes:
+            return pruned_context.prompt_block
 
         import re
 
@@ -1911,6 +2410,10 @@ class PlannerExecutorAgent:
         if "FINISH" in text:
             return "FINISH", []
 
+        # NONE - executor couldn't find a suitable element (e.g., no search box found)
+        if text.upper() == "NONE" or "NONE" in text.upper():
+            return "NONE", []
+
         return "UNKNOWN", [text]
 
     # -------------------------------------------------------------------------
@@ -2125,6 +2628,7 @@ class PlannerExecutorAgent:
         max_limit = cfg.limit_max if cfg.enabled else cfg.limit_base  # Disable escalation if not enabled
         last_snap: Snapshot | None = None
         last_compact: str = ""
+        last_pruned_context: PrunedSnapshotContext | None = None
         screenshot_b64: str | None = None
         requires_vision = False
         vision_reason: str | None = None
@@ -2153,8 +2657,14 @@ class PlannerExecutorAgent:
 
                 # Format context FIRST - we always want the compact representation
                 # even if vision fallback is required, so the planner can see available elements
-                compact = self._format_context(snap, goal)
+                pruned_context = self._build_pruned_context(snap, goal)
+                compact = (
+                    pruned_context.prompt_block
+                    if pruned_context is not None and pruned_context.nodes
+                    else self._format_context(snap, goal)
+                )
                 last_compact = compact
+                last_pruned_context = pruned_context
 
                 # Check for vision fallback
                 needs_vision, reason = detect_snapshot_failure(snap)
@@ -2172,7 +2682,8 @@ class PlannerExecutorAgent:
                 # a specific target element was found. Intent heuristics are only used
                 # for scroll-after-escalation AFTER limit escalation is exhausted.
                 elements = getattr(snap, "elements", []) or []
-                if len(elements) >= 10:
+                pruned_node_count = len(pruned_context.nodes) if pruned_context is not None else 0
+                if len(elements) >= 10 and (pruned_context is None or pruned_node_count > 0):
                     break
 
                 # Escalate limit
@@ -2258,7 +2769,12 @@ class PlannerExecutorAgent:
                                 continue
 
                             last_snap = snap
-                            last_compact = self._format_context(snap, goal)
+                            last_pruned_context = self._build_pruned_context(snap, goal)
+                            last_compact = (
+                                last_pruned_context.prompt_block
+                                if last_pruned_context is not None and last_pruned_context.nodes
+                                else self._format_context(snap, goal)
+                            )
 
                             # Extract screenshot
                             if capture_screenshot:
@@ -2307,6 +2823,16 @@ class PlannerExecutorAgent:
             snapshot_success=not requires_vision,
             requires_vision=requires_vision,
             vision_reason=vision_reason,
+            pruning_category=(
+                last_pruned_context.category.value
+                if last_pruned_context is not None
+                else None
+            ),
+            pruned_node_count=(
+                len(last_pruned_context.nodes)
+                if last_pruned_context is not None
+                else 0
+            ),
         )
 
     # -------------------------------------------------------------------------
@@ -2319,6 +2845,7 @@ class PlannerExecutorAgent:
         *,
         start_url: str | None = None,
         max_attempts: int = 2,
+        page_context: str | None = None,
     ) -> Plan:
         """
         Generate execution plan for the given task.
@@ -2327,6 +2854,7 @@ class PlannerExecutorAgent:
             task: Task description
             start_url: Starting URL
             max_attempts: Maximum planning attempts
+            page_context: Optional markdown content of current page for better planning
 
         Returns:
             Plan object with steps
@@ -2342,6 +2870,7 @@ class PlannerExecutorAgent:
                 start_url=start_url,
                 strict=(attempt > 1),
                 schema_errors=last_errors or None,
+                page_context=page_context if attempt == 1 else None,  # Only include on first attempt
             )
 
             if self.config.verbose:
@@ -2432,7 +2961,31 @@ class PlannerExecutorAgent:
 
         system = """You are the PLANNER. Output a JSON patch to edit an existing plan.
 Edit ONLY the failed step and optionally the next step.
-Return ONLY a JSON object with mode="patch" and replace_steps array."""
+Return ONLY a JSON object with mode="patch" and replace_steps array.
+
+IMPORTANT - Alternative approaches when CLICK fails:
+- If a product/category navigation failed, USE SITE SEARCH instead:
+  * Replace the failed CLICK with a TYPE_AND_SUBMIT to search for the product
+  * This is the MOST RELIABLE fallback - site search works on all websites
+- If clicking a specific element failed:
+  * Try a different selector or button (e.g., "Quick Shop", "View Details")
+- Don't just retry the same approach with minor changes"""
+
+        # Extract product/item name from step for search suggestion
+        product_hint = ""
+        step_labels = " ".join([
+            failed_step.goal or "",
+            failed_step.target or "",
+            failed_step.intent or "",
+        ]).lower()
+        # Common patterns to extract product name
+        for pattern in [r"snow\s*blower", r"product\s+(\w+)", r"click\s+(?:on\s+)?(.+?)(?:\s+product|\s+category)?$"]:
+            match = re.search(pattern, step_labels, re.IGNORECASE)
+            if match:
+                product_hint = match.group(0) if match.lastindex is None else match.group(1)
+                break
+        if not product_hint and failed_step.target:
+            product_hint = failed_step.target
 
         user = f"""Task: {task}
 
@@ -2441,16 +2994,25 @@ Failure:
 - Step goal: {failed_step.goal}
 - Reason: {failure_reason}
 
-Return JSON patch:
+IMPORTANT: The element could not be found or clicked. The current page likely doesn't have the target.
+The BEST approach is to USE SITE SEARCH to find the product directly.
+
+RECOMMENDED: Replace the failed step with a site search:
 {{
   "mode": "patch",
   "replace_steps": [
     {{
       "id": {failed_step.id},
-      "step": {{ "id": {failed_step.id}, "goal": "...", "action": "...", "verify": [...] }}
+      "step": {{ "id": {failed_step.id}, "goal": "Search for {product_hint or 'the product'}", "action": "TYPE_AND_SUBMIT", "input": "{product_hint or 'product name'}", "intent": "Type in search box and submit", "verify": [{{"predicate": "url_contains", "args": ["search"]}}] }}
     }}
   ]
-}}"""
+}}
+
+Alternative approaches (if search doesn't apply):
+1. Click "Catalog" or "Shop All" to browse products
+2. Click "Quick Shop" or "View Details" buttons
+
+Return JSON patch:"""
 
         for attempt in range(1, max_attempts + 1):
             resp = self.planner.generate(
@@ -2611,6 +3173,8 @@ Return JSON patch:
                     step.intent,
                     ctx.compact_representation,
                     input_text=step.input,
+                    category=self._get_cached_category_str(),
+                    action_type=step.action,
                 )
                 resp = self.executor.generate(
                     sys_prompt,
@@ -2683,6 +3247,8 @@ Return JSON patch:
                             substep.intent,
                             ctx.compact_representation,
                             input_text=substep.input,
+                            category=self._get_cached_category_str(),
+                            action_type=substep.action,
                         )
                         resp = self.executor.generate(
                             sys_prompt,
@@ -2800,6 +3366,9 @@ Return JSON patch:
             if role not in ("button", "link"):
                 continue
 
+            if self._is_global_nav_cart_link(el):
+                continue
+
             text = (getattr(el, "text", "") or "").lower()
             aria_label = (getattr(el, "aria_label", "") or getattr(el, "ariaLabel", "") or "").lower()
             href = (getattr(el, "href", "") or "").lower()
@@ -2907,6 +3476,599 @@ Return JSON patch:
         if self.config.verbose:
             print("  [MODAL] All dismissal attempts exhausted", flush=True)
         return False
+
+    def _is_global_nav_cart_link(self, el: Any) -> bool:
+        """
+        Detect persistent header/nav cart links that should not be treated as
+        drawer-local checkout controls.
+        """
+        href = (getattr(el, "href", "") or "").lower()
+        text = (getattr(el, "text", "") or "").lower().strip()
+        aria_label = (getattr(el, "aria_label", "") or getattr(el, "ariaLabel", "") or "").lower().strip()
+        label = text or aria_label
+
+        layout = getattr(el, "layout", None)
+        region = (getattr(layout, "region", "") or "").lower()
+        doc_y = getattr(el, "doc_y", None)
+
+        if "nav_cart" in href or "ref_=nav_cart" in href:
+            return True
+
+        if region in {"header", "nav"} and (
+            "cart" in href or label in {"cart", "0 items in cart"} or "items in cart" in label
+        ):
+            return True
+
+        try:
+            if doc_y is not None and float(doc_y) <= 120 and (
+                "cart" in href or label in {"cart", "0 items in cart"} or "items in cart" in label
+            ):
+                return True
+        except (TypeError, ValueError):
+            pass
+
+        return False
+
+    def _looks_like_search_submission(self, step: PlanStep, element: Any | None) -> bool:
+        """Detect TYPE_AND_SUBMIT actions that are likely site search submissions."""
+        role = (getattr(element, "role", "") or "").lower() if element is not None else ""
+        if role in {"searchbox", "combobox"}:
+            return True
+
+        labels = " ".join(
+            str(part or "")
+            for part in (
+                step.goal,
+                step.intent,
+                step.input,
+                getattr(element, "text", None),
+                getattr(element, "name", None),
+                getattr(element, "aria_label", None),
+                getattr(element, "ariaLabel", None),
+            )
+        ).lower()
+        return "search" in labels
+
+    def _is_add_to_cart_step(self, step: PlanStep) -> bool:
+        """Detect if a step is an Add to Cart action."""
+        add_to_cart_keywords = ["add to cart", "add to bag", "add to basket", "buy now"]
+        labels = " ".join(
+            str(part or "").lower()
+            for part in (step.goal, step.intent, step.input)
+        )
+        return any(kw in labels for kw in add_to_cart_keywords)
+
+    def _is_search_results_url(self, url: str) -> bool:
+        """Check if URL looks like a search results page."""
+        url_lower = url.lower()
+        # Common patterns for search results pages
+        search_patterns = [
+            "search",
+            "query=",
+            "q=",
+            "s=",
+            "/s?",
+            "keyword=",
+            "keywords=",
+            "results",
+        ]
+        return any(pattern in url_lower for pattern in search_patterns)
+
+    def _is_category_navigation_step(self, step: PlanStep) -> bool:
+        """Check if this step is navigating to a category/section."""
+        nav_keywords = [
+            "navigate to", "go to", "click category", "category link",
+            "click on", "browse", "section", "department"
+        ]
+        labels = " ".join(
+            str(part or "").lower()
+            for part in (step.goal, step.intent)
+        )
+        return any(kw in labels for kw in nav_keywords)
+
+    def _url_change_matches_intent(self, step: PlanStep, pre_url: str, post_url: str) -> bool:
+        """
+        Check if URL change actually matches the step's intent.
+
+        For category navigation, the new URL should contain keywords from the target.
+        This prevents accepting unrelated URL changes as successful navigation.
+        """
+        # Extract target keywords from step
+        target = step.target or ""
+        intent = step.intent or ""
+        goal = step.goal or ""
+
+        post_url_lower = post_url.lower()
+
+        # Special case: checkout/cart related steps
+        # These steps may go to /cart first before /checkout, which is valid
+        checkout_keywords = ["checkout", "proceed to checkout", "cart", "view cart"]
+        step_labels = f"{goal} {intent}".lower()
+        is_checkout_step = any(kw in step_labels for kw in checkout_keywords)
+        if is_checkout_step:
+            # Accept cart or checkout URLs as valid for checkout steps
+            checkout_url_patterns = ["cart", "checkout", "basket", "bag"]
+            if any(pattern in post_url_lower for pattern in checkout_url_patterns):
+                return True
+
+        # Get keywords from target (e.g., "Outdoor Power Equipment" -> ["outdoor", "power", "equipment"])
+        target_words = set(
+            word.lower() for word in re.split(r'[\s\-_]+', target)
+            if len(word) >= 3  # Skip short words like "to", "and"
+        )
+
+        # Also check predicates for expected URL patterns
+        expected_patterns = []
+        for pred in (step.verify or []):
+            if pred.predicate == "url_contains" and pred.args:
+                expected_patterns.append(pred.args[0].lower())
+
+        # If predicates specify URL patterns, check those
+        if expected_patterns:
+            if any(pattern in post_url_lower for pattern in expected_patterns):
+                return True
+            # For non-checkout steps, reject URL changes that don't match predicates
+            # But only if we have a target to validate against
+            if target_words:
+                return False
+            # No target and no predicate match - be permissive
+            return True
+
+        # Otherwise check if target keywords appear in URL
+        if target_words:
+            # At least one target word should appear in URL
+            if any(word in post_url_lower for word in target_words):
+                return True
+            # URL doesn't contain any target keywords - suspicious
+            return False
+
+        # No target specified - can't validate, allow fallback
+        return True
+
+    def _find_submit_button_for_type_and_submit(
+        self,
+        *,
+        elements: list[Any],
+        input_element_id: int | None,
+        step: PlanStep,
+    ) -> int | None:
+        """Find an explicit search/submit control for search-style TYPE_AND_SUBMIT steps."""
+        selected_element = None
+        for el in elements:
+            if getattr(el, "id", None) == input_element_id:
+                selected_element = el
+                break
+
+        if not self._looks_like_search_submission(step, selected_element):
+            return None
+
+        candidates: list[tuple[int, int]] = []
+        for el in elements:
+            el_id = getattr(el, "id", None)
+            if el_id is None or el_id == input_element_id:
+                continue
+
+            role = (getattr(el, "role", "") or "").lower()
+            if role not in {"button", "link"}:
+                continue
+
+            label = " ".join(
+                str(part or "")
+                for part in (
+                    getattr(el, "text", None),
+                    getattr(el, "name", None),
+                    getattr(el, "aria_label", None),
+                    getattr(el, "ariaLabel", None),
+                )
+            ).lower()
+            href = (getattr(el, "href", "") or "").lower()
+
+            score = 0
+            if "submit search" in label:
+                score += 120
+            if "search" in label:
+                score += 80
+            if "submit" in label:
+                score += 60
+            if label.strip() in {"go", "search"}:
+                score += 50
+            if "/search" in href or "search?" in href or "q=" in href:
+                score += 40
+
+            if score > 0:
+                score += int(getattr(el, "importance", 0) or 0) // 100
+                candidates.append((int(el_id), score))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        return candidates[0][0]
+
+    def _type_and_submit_url_change_looks_valid(
+        self,
+        *,
+        pre_url: str,
+        post_url: str,
+        step: PlanStep,
+        element: Any | None,
+        typed_text: str,
+    ) -> bool:
+        """
+        Allow URL-change fallback for TYPE_AND_SUBMIT only when the resulting URL
+        still matches the expected semantics of the typed action.
+        """
+        if not self._looks_like_search_submission(step, element):
+            return True
+
+        from urllib.parse import quote_plus, urlparse
+
+        post_lower = post_url.lower()
+        if any(marker in post_lower for marker in ("/search", "?q=", "&q=", "query=", "search=", "keyword=")):
+            return True
+
+        encoded_query = quote_plus((typed_text or "").strip().lower())
+        if encoded_query and encoded_query in post_lower:
+            return True
+
+        parsed = urlparse(post_url)
+        searchable = f"{parsed.path}?{parsed.query}".lower()
+        tokens = [tok for tok in re.split(r"[^a-z0-9]+", (typed_text or "").lower()) if len(tok) >= 3]
+        if tokens:
+            matched = sum(1 for tok in tokens[:4] if tok in searchable)
+            if matched >= min(2, len(tokens[:4])):
+                return True
+
+        return False
+
+    def _choose_type_and_submit_submit_method(
+        self,
+        *,
+        elements: list[Any],
+        input_element_id: int | None,
+        step: PlanStep,
+        prefer_alternate_of: Literal["click", "enter"] | None = None,
+    ) -> tuple[Literal["click", "enter"], int | None]:
+        """Choose the submit method for TYPE_AND_SUBMIT, optionally preferring the alternate path.
+
+        NOTE: For search-like submissions, we prefer Enter key by default (matching WebBench behavior).
+        Many search boxes (e.g., lifeisgood.com) don't have a proper submit button, or clicking the
+        "submit" button navigates to a category page instead of performing a search. Pressing Enter
+        is more reliable for search inputs.
+
+        When prefer_alternate_of is set, we try to return the opposite method for retry purposes:
+        - If prefer_alternate_of="enter", try to return "click" (if a submit button exists)
+        - If prefer_alternate_of="click", return "enter"
+        """
+        submit_button_id = self._find_submit_button_for_type_and_submit(
+            elements=elements,
+            input_element_id=input_element_id,
+            step=step,
+        )
+
+        # For search-like submissions, prefer Enter key by default (more reliable)
+        # Only fall back to button click if Enter doesn't work (via prefer_alternate_of)
+        default_method: Literal["click", "enter"] = "enter"
+
+        # Handle retry case: prefer the alternate method
+        if prefer_alternate_of == "enter" and submit_button_id is not None:
+            # First attempt used Enter, retry with click (if button available)
+            return "click", submit_button_id
+        if prefer_alternate_of == "click":
+            # First attempt used click, retry with Enter
+            return "enter", None
+
+        return default_method, submit_button_id
+
+    def _get_runtime_page(self, runtime: AgentRuntime) -> Any | None:
+        """Best-effort access to the live browser page for immediate URL observation."""
+        backend = getattr(runtime, "backend", None)
+        candidates = [
+            getattr(backend, "page", None),
+            getattr(backend, "_page", None),
+            getattr(runtime, "_legacy_page", None),
+        ]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if type(candidate).__module__.startswith("unittest.mock"):
+                continue
+            if inspect.getattr_static(candidate, "url", None) is not None:
+                return candidate
+        return None
+
+    async def _read_focused_input_value(self, runtime: AgentRuntime) -> str | None:
+        """Best-effort read of the currently focused input value."""
+        page = self._get_runtime_page(runtime)
+        if page is None:
+            return None
+        try:
+            value = await page.evaluate(
+                """
+                () => {
+                    const el = document.activeElement;
+                    if (!el) return null;
+                    if ("value" in el) return el.value ?? "";
+                    return null;
+                }
+                """
+            )
+        except Exception:
+            return None
+        return value if isinstance(value, str) else None
+
+    def _normalize_input_value(self, value: str | None) -> str:
+        """Normalize input text for equality checks across controlled inputs."""
+        return " ".join((value or "").strip().lower().split())
+
+    async def _clear_and_type_search_input(
+        self,
+        *,
+        runtime: AgentRuntime,
+        input_element_id: int,
+        text: str,
+    ) -> bool:
+        """Clear and type into a search input using the live page when available."""
+        page = self._get_runtime_page(runtime)
+        if page is None:
+            return False
+
+        browser_like = getattr(runtime, "_legacy_browser", None) or SimpleNamespace(page=page)
+
+        try:
+            await runtime.click(input_element_id)
+        except Exception:
+            return False
+
+        try:
+            clear_result = await clear_async(browser_like, int(input_element_id), take_snapshot=False)
+            if getattr(clear_result, "success", False):
+                await runtime.record_action(f"CLEAR({input_element_id})")
+        except Exception:
+            pass
+
+        try:
+            select_all_key = "Meta+A" if sys.platform == "darwin" else "Control+A"
+            await page.keyboard.press(select_all_key)
+            await page.keyboard.press("Backspace")
+            await runtime.record_action(f"PRESS({select_all_key})")
+            await runtime.record_action('PRESS("Backspace")')
+        except Exception:
+            pass
+
+        try:
+            delay_ms = float(self.config.type_delay_ms or 0)
+            type_result = await type_text_async(
+                browser_like,
+                int(input_element_id),
+                str(text),
+                take_snapshot=False,
+                delay_ms=delay_ms,
+            )
+            if not getattr(type_result, "success", False):
+                return False
+            await runtime.record_action(
+                f"TYPE({input_element_id}, '{text[:20]}...')" if len(text) > 20 else f"TYPE({input_element_id}, '{text}')"
+            )
+            return True
+        except Exception:
+            return False
+
+    async def _submit_if_already_typed(
+        self,
+        *,
+        runtime: AgentRuntime,
+        elements: list[Any],
+        input_element_id: int,
+        step: PlanStep,
+        text: str,
+        pre_url: str,
+        typed_element: Any | None,
+        telemetry: SearchSubmitTelemetry,
+    ) -> bool:
+        """Submit without retyping when the focused input already contains the desired text."""
+        page = self._get_runtime_page(runtime)
+        if page is None:
+            return False
+
+        try:
+            await runtime.click(input_element_id)
+        except Exception:
+            return False
+
+        try:
+            await page.wait_for_timeout(80)
+        except Exception:
+            pass
+
+        current_value = await self._read_focused_input_value(runtime)
+        if self._normalize_input_value(current_value) != self._normalize_input_value(text):
+            return False
+
+        await self._submit_type_and_submit(
+            runtime=runtime,
+            elements=elements,
+            input_element_id=input_element_id,
+            step=step,
+            text=text,
+            pre_url=pre_url,
+            typed_element=typed_element,
+            telemetry=telemetry,
+        )
+        await runtime.record_action(f"SUBMIT_ALREADY_TYPED({input_element_id})")
+        return True
+
+    def _snapshot_looks_like_search_results(self, snapshot: Any, typed_text: str) -> bool:
+        """Best-effort heuristic for product/search results-like pages."""
+        elements = getattr(snapshot, "elements", []) or []
+        if not elements:
+            return False
+
+        tokens = [tok for tok in re.split(r"[^a-z0-9]+", (typed_text or "").lower()) if len(tok) >= 3]
+        product_like_matches = 0
+        token_matches = 0
+
+        for el in elements:
+            role = (getattr(el, "role", "") or "").lower()
+            if role != "link":
+                continue
+            href = (getattr(el, "href", "") or "").lower()
+            label = " ".join(
+                str(part or "")
+                for part in (
+                    getattr(el, "text", None),
+                    getattr(el, "name", None),
+                    getattr(el, "aria_label", None),
+                    getattr(el, "ariaLabel", None),
+                )
+            ).lower()
+            blob = f"{href} {label}"
+
+            if any(p in href for p in ("/product/", "/products/", "/p/", "/dp/")):
+                product_like_matches += 1
+            if tokens:
+                token_matches += sum(1 for tok in tokens[:4] if tok in blob)
+
+        return product_like_matches > 0 or token_matches >= 2
+
+    async def _capture_search_results_snapshot_evidence(
+        self,
+        *,
+        runtime: AgentRuntime,
+        typed_text: str,
+        telemetry: SearchSubmitTelemetry,
+    ) -> None:
+        """Capture one post-submit snapshot to track results-like evidence."""
+        try:
+            snap = await runtime.snapshot(emit_trace=False)
+        except Exception:
+            return
+
+        telemetry.observed_search_results_dom = self._snapshot_looks_like_search_results(snap, typed_text)
+
+    async def _submit_type_and_submit(
+        self,
+        *,
+        runtime: AgentRuntime,
+        elements: list[Any],
+        input_element_id: int,
+        step: PlanStep,
+        text: str,
+        pre_url: str,
+        typed_element: Any | None,
+        telemetry: SearchSubmitTelemetry,
+        prefer_alternate_of: Literal["click", "enter"] | None = None,
+    ) -> None:
+        """Submit a search-like TYPE_AND_SUBMIT using the chosen method and record telemetry."""
+        submit_method, submit_target = self._choose_type_and_submit_submit_method(
+            elements=elements,
+            input_element_id=input_element_id,
+            step=step,
+            prefer_alternate_of=prefer_alternate_of,
+        )
+
+        if submit_method == "click" and submit_target is not None:
+            await runtime.click(submit_target)
+            if self.config.verbose:
+                print(f"  [ACTION] TYPE_AND_SUBMIT submit via CLICK({submit_target})", flush=True)
+            # Wait briefly for page load after clicking submit button
+            page = self._get_runtime_page(runtime)
+            if page is not None:
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=2000)
+                except Exception:
+                    pass
+        else:
+            await runtime.press("Enter")
+            if self.config.verbose:
+                print("  [ACTION] TYPE_AND_SUBMIT submit via PRESS(Enter)", flush=True)
+            submit_method = "enter"
+
+            # Wait briefly for URL change after Enter
+            page = self._get_runtime_page(runtime)
+            if page is not None:
+                try:
+                    await page.wait_for_url(lambda url: url != pre_url, timeout=3000)
+                    if self.config.verbose:
+                        print(f"  [SEARCH] URL changed to: {page.url}", flush=True)
+                except Exception:
+                    if self.config.verbose:
+                        print("  [SEARCH] URL unchanged after Enter", flush=True)
+
+        if prefer_alternate_of is None:
+            telemetry.first_submit_method = submit_method
+        else:
+            telemetry.retry_submit_method = submit_method
+
+        await runtime.stabilize()
+        await self._capture_search_results_snapshot_evidence(
+            runtime=runtime,
+            typed_text=text,
+            telemetry=telemetry,
+        )
+
+    async def _retry_search_widget_submission(
+        self,
+        *,
+        runtime: AgentRuntime,
+        elements: list[Any],
+        input_element_id: int,
+        step: PlanStep,
+        text: str,
+        pre_url: str,
+        typed_element: Any | None,
+        telemetry: SearchSubmitTelemetry,
+    ) -> bool:
+        """Retry a failed search submission once with a clean field and the alternate submit method."""
+        if telemetry.first_submit_method not in {"click", "enter"}:
+            return False
+
+        # Take a fresh snapshot in case DOM changed
+        fresh_elements = elements
+        try:
+            fresh_snap = await runtime.snapshot(emit_trace=False)
+            fresh_elements = getattr(fresh_snap, "elements", []) or elements
+            if self.config.verbose:
+                print(f"  [SEARCH-RETRY] Fresh snapshot: {len(fresh_elements)} elements", flush=True)
+        except Exception:
+            pass
+
+        retry_method, _ = self._choose_type_and_submit_submit_method(
+            elements=fresh_elements,
+            input_element_id=input_element_id,
+            step=step,
+            prefer_alternate_of=telemetry.first_submit_method,
+        )
+        if retry_method == telemetry.first_submit_method:
+            if self.config.verbose:
+                print("  [SEARCH-RETRY] No alternate submit method available", flush=True)
+            return False
+
+        select_all_key = "Meta+A" if sys.platform == "darwin" else "Control+A"
+        if self.config.verbose:
+            print(f"  [SEARCH-RETRY] Retrying search via alternate submit method ({retry_method})", flush=True)
+        typed_ok = await self._clear_and_type_search_input(
+            runtime=runtime,
+            input_element_id=input_element_id,
+            text=text,
+        )
+        if not typed_ok:
+            await runtime.click(input_element_id)
+            await runtime.press(select_all_key)
+            await runtime.press("Backspace")
+            await runtime.type(input_element_id, text, delay_ms=self.config.type_delay_ms)
+        await self._submit_type_and_submit(
+            runtime=runtime,
+            elements=fresh_elements,
+            input_element_id=input_element_id,
+            step=step,
+            text=text,
+            pre_url=pre_url,
+            typed_element=typed_element,
+            telemetry=telemetry,
+            prefer_alternate_of=telemetry.first_submit_method,
+        )
+        return await self._verify_step(runtime, step)
 
     def _looks_like_overlay_dismiss_intent(self, *, goal: str, intent: str) -> bool:
         """
@@ -3143,6 +4305,9 @@ Return JSON patch:
         used_heuristics = False
         error: str | None = None
         verification_passed = False
+        extraction_succeeded = False
+        extracted_data: Any | None = None
+        search_submit_telemetry = SearchSubmitTelemetry()
 
         try:
             # Pre-step verification check: skip if predicates already pass
@@ -3250,7 +4415,92 @@ Return JSON patch:
             element_id: int | None = None
             executor_text: str | None = None  # Text from executor response (for TYPE actions)
 
-            if action_type in ("CLICK", "TYPE_AND_SUBMIT"):
+            if action_type == "EXTRACT":
+                action_taken = "EXTRACT"
+                # Determine extraction query from step goal or task
+                extract_query = step.goal or (
+                    self._current_task.task if self._current_task is not None else "Extract relevant data from the current page"
+                )
+
+                # Check if this is a text extraction task that can use markdown-based extraction
+                use_markdown_extraction = _is_text_extraction_task(extract_query)
+
+                if use_markdown_extraction:
+                    # Step 1: Get page content as markdown (faster than snapshot-based extraction)
+                    markdown_content = await runtime.read_markdown(max_chars=8000)
+                    if markdown_content:
+                        if self.config.verbose:
+                            preview = markdown_content[:160].replace("\n", " ")
+                            print(f"  [ACTION] EXTRACT - got markdown: {preview}...", flush=True)
+
+                        # Step 2: Use LLM (executor) to extract specific data from markdown
+                        extraction_prompt = f"""You are a text extraction assistant. Given the page content in markdown format, extract the specific information requested.
+
+PAGE CONTENT (MARKDOWN):
+{markdown_content}
+
+EXTRACTION REQUEST:
+{extract_query}
+
+INSTRUCTIONS:
+1. Read the markdown content carefully
+2. Find and extract ONLY the specific information requested
+3. Return ONLY the extracted text, nothing else
+4. If the information is not found, return "NOT_FOUND"
+
+EXTRACTED TEXT:"""
+
+                        resp = self.executor.generate(
+                            "You extract specific text from markdown content. Return only the extracted text.",
+                            extraction_prompt,
+                            temperature=0.0,
+                            max_new_tokens=500,
+                        )
+                        self._record_token_usage("extract", resp)
+
+                        extracted_text = resp.content.strip()
+                        if extracted_text and extracted_text != "NOT_FOUND":
+                            extraction_succeeded = True
+                            extracted_data = {"text": extracted_text, "query": extract_query}
+                            if self.config.verbose:
+                                print(f"  [ACTION] EXTRACT ok: {extracted_text[:160]}", flush=True)
+                        else:
+                            error = f"Could not find requested data: {extract_query}"
+                    else:
+                        error = "Failed to extract markdown from page"
+                else:
+                    # Use LLM-based extraction for complex extraction tasks
+                    page = (
+                        getattr(getattr(runtime, "backend", None), "page", None)
+                        or getattr(getattr(runtime, "backend", None), "_page", None)
+                        or getattr(runtime, "_legacy_page", None)
+                    )
+                    if page is None:
+                        error = "No page available for EXTRACT"
+                    else:
+                        from types import SimpleNamespace
+
+                        from ..read import extract_async
+
+                        browser_like = SimpleNamespace(page=page)
+                        result = await extract_async(
+                            browser_like,
+                            self.planner,
+                            query=extract_query,
+                            schema=None,
+                        )
+                        llm_resp = getattr(result, "llm_response", None)
+                        if llm_resp is not None:
+                            self._record_token_usage("extract", llm_resp)
+                        if result.ok:
+                            extraction_succeeded = True
+                            extracted_data = result.data
+                            if self.config.verbose:
+                                preview = str(result.raw or "")[:160]
+                                print(f"  [ACTION] EXTRACT ok: {preview}", flush=True)
+                        else:
+                            error = result.error or "Extraction failed"
+            elif action_type in ("CLICK", "TYPE_AND_SUBMIT"):
                 # Try intent heuristics first (if available)
                 elements = getattr(ctx.snapshot, "elements", []) or []
                 url = getattr(ctx.snapshot, "url", "") or ""
@@ -3268,6 +4518,8 @@ Return JSON patch:
                         step.intent,
                         ctx.compact_representation,
                         input_text=step.input,
+                        category=self._get_cached_category_str(),
+                        action_type=step.action,
                     )
 
                     if self.config.verbose:
@@ -3372,14 +4624,47 @@ Return JSON patch:
                 elif action_type == "TYPE" and element_id is not None:
                     # Use text from executor response first, then fall back to step.input
                     text = executor_text or step.input or ""
-                    await runtime.type(element_id, text)
+                    typed_element = None
+                    for el in elements:
+                        if getattr(el, "id", None) == element_id:
+                            typed_element = el
+                            break
                     # If original plan action was TYPE_AND_SUBMIT, press Enter to submit
                     if original_action == "TYPE_AND_SUBMIT":
-                        # Press Enter to submit (WebBench approach - simpler and more reliable)
-                        await runtime.press("Enter")
+                        submitted_without_retyping = False
+                        if self._looks_like_search_submission(step, typed_element):
+                            submitted_without_retyping = await self._submit_if_already_typed(
+                                runtime=runtime,
+                                elements=elements,
+                                input_element_id=element_id,
+                                step=step,
+                                text=text,
+                                pre_url=pre_url or (ctx.snapshot.url or ""),
+                                typed_element=typed_element,
+                                telemetry=search_submit_telemetry,
+                            )
+                        if not submitted_without_retyping:
+                            typed_ok = False
+                            if self._looks_like_search_submission(step, typed_element):
+                                typed_ok = await self._clear_and_type_search_input(
+                                    runtime=runtime,
+                                    input_element_id=element_id,
+                                    text=text,
+                                )
+                            if not typed_ok:
+                                await runtime.type(element_id, text, delay_ms=self.config.type_delay_ms)
+                            await self._submit_type_and_submit(
+                                runtime=runtime,
+                                elements=elements,
+                                input_element_id=element_id,
+                                step=step,
+                                text=text,
+                                pre_url=pre_url or (ctx.snapshot.url or ""),
+                                typed_element=typed_element,
+                                telemetry=search_submit_telemetry,
+                            )
                         if self.config.verbose:
                             print(f"  [ACTION] TYPE_AND_SUBMIT({element_id}, '{text}')", flush=True)
-                        await runtime.stabilize()
                     elif self.config.verbose:
                         print(f"  [ACTION] TYPE({element_id}, '{text[:30]}...')" if len(text) > 30 else f"  [ACTION] TYPE({element_id}, '{text}')", flush=True)
                 elif action_type == "TYPE_AND_SUBMIT" and element_id is not None:
@@ -3393,16 +4678,46 @@ Return JSON patch:
                             text = match.group(1).strip()
 
                     # Type the text
-                    await runtime.type(element_id, text)
-
-                    # Press Enter to submit (WebBench approach)
-                    await runtime.press("Enter")
+                    typed_element = None
+                    for el in elements:
+                        if getattr(el, "id", None) == element_id:
+                            typed_element = el
+                            break
+                    submitted_without_retyping = False
+                    if self._looks_like_search_submission(step, typed_element):
+                        submitted_without_retyping = await self._submit_if_already_typed(
+                            runtime=runtime,
+                            elements=elements,
+                            input_element_id=element_id,
+                            step=step,
+                            text=text,
+                            pre_url=pre_url or (ctx.snapshot.url or ""),
+                            typed_element=typed_element,
+                            telemetry=search_submit_telemetry,
+                        )
+                    if not submitted_without_retyping:
+                        typed_ok = False
+                        if self._looks_like_search_submission(step, typed_element):
+                            typed_ok = await self._clear_and_type_search_input(
+                                runtime=runtime,
+                                input_element_id=element_id,
+                                text=text,
+                            )
+                        if not typed_ok:
+                            await runtime.type(element_id, text, delay_ms=self.config.type_delay_ms)
+                        await self._submit_type_and_submit(
+                            runtime=runtime,
+                            elements=elements,
+                            input_element_id=element_id,
+                            step=step,
+                            text=text,
+                            pre_url=pre_url or (ctx.snapshot.url or ""),
+                            typed_element=typed_element,
+                            telemetry=search_submit_telemetry,
+                        )
 
                     if self.config.verbose:
                         print(f"  [ACTION] TYPE_AND_SUBMIT({element_id}, '{text}')", flush=True)
-
-                    # Wait for page to load after submit
-                    await runtime.stabilize()
                 elif action_type == "PRESS":
                     key = "Enter"  # Default
                     await runtime.press(key)
@@ -3423,8 +4738,16 @@ Return JSON patch:
                         # No target URL - we're already at the page, just verify
                         if self.config.verbose:
                             print(f"  [ACTION] NAVIGATE(skip - already at page)", flush=True)
+                elif action_type == "EXTRACT":
+                    pass  # Extraction already executed above
                 elif action_type == "FINISH":
                     pass  # No action needed
+                elif action_type == "NONE":
+                    # Executor couldn't find a suitable element (e.g., no search box)
+                    # This triggers replanning to try an alternative approach
+                    error = f"No suitable element found for step: {step.goal}"
+                    if self.config.verbose:
+                        print(f"  [EXECUTOR] NONE - no suitable element found, will trigger replan", flush=True)
                 elif action_type not in ("CLICK", "TYPE", "TYPE_AND_SUBMIT") or element_id is None:
                     if action_type in ("CLICK", "TYPE", "TYPE_AND_SUBMIT"):
                         error = f"No element ID for {action_type}"
@@ -3436,7 +4759,14 @@ Return JSON patch:
                 await runtime.record_action(action_taken)
 
             # Run verifications
-            if step.verify and error is None:
+            if action_type == "EXTRACT" and error is None:
+                verification_passed = extraction_succeeded
+                if self.config.verbose:
+                    print(
+                        f"  [VERIFY] Using extraction result: {'PASS' if verification_passed else 'FAIL'}",
+                        flush=True,
+                    )
+            elif step.verify and error is None:
                 if self.config.verbose:
                     print(f"  [VERIFY] Running {len(step.verify)} verification predicates...", flush=True)
                 verification_passed = await self._verify_step(runtime, step)
@@ -3485,11 +4815,142 @@ Return JSON patch:
                 if not verification_passed and original_action in ("TYPE_AND_SUBMIT", "CLICK"):
                     current_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
                     if current_url and pre_url and current_url != pre_url:
-                        # URL changed - the action likely achieved navigation
-                        if self.config.verbose:
-                            print(f"  [VERIFY] Predicate failed but URL changed: {pre_url} -> {current_url}", flush=True)
-                            print(f"  [VERIFY] Accepting {original_action} as successful (URL change fallback)", flush=True)
-                        verification_passed = True
+                        # Check if this is a meaningful URL change (not just anchor change)
+                        # Strip anchors (#...) before comparing
+                        pre_url_base = pre_url.split("#")[0]
+                        current_url_base = current_url.split("#")[0]
+                        is_meaningful_change = pre_url_base != current_url_base
+
+                        fallback_ok = is_meaningful_change
+                        if original_action == "TYPE_AND_SUBMIT":
+                            typed_element = None
+                            for el in (ctx.snapshot.elements or []):
+                                if getattr(el, "id", None) == element_id:
+                                    typed_element = el
+                                    break
+                            fallback_ok = self._type_and_submit_url_change_looks_valid(
+                                pre_url=pre_url,
+                                post_url=current_url,
+                                step=step,
+                                element=typed_element,
+                                typed_text=executor_text or step.input or "",
+                            )
+                        elif original_action == "CLICK" and is_meaningful_change:
+                            # For CLICK actions, validate URL change matches step intent
+                            # This prevents accepting wrong category navigations
+                            url_matches_intent = self._url_change_matches_intent(
+                                step=step,
+                                pre_url=pre_url,
+                                post_url=current_url,
+                            )
+                            if not url_matches_intent:
+                                fallback_ok = False
+                                if self.config.verbose:
+                                    print(f"  [VERIFY] URL changed but doesn't match step intent", flush=True)
+                                    print(f"  [VERIFY] Step target: {step.target}, URL: {current_url}", flush=True)
+
+                        # Special handling for Add to Cart steps: if we were on search results
+                        # and navigated to a product page, retry the step on the new page
+                        # instead of accepting URL change as success
+                        is_add_to_cart = self._is_add_to_cart_step(step)
+                        was_on_search_results = self._is_search_results_url(pre_url)
+                        now_on_product_page = not self._is_search_results_url(current_url)
+
+                        if is_add_to_cart and was_on_search_results and now_on_product_page and is_meaningful_change:
+                            # We clicked a product link instead of Add to Cart
+                            # Retry the step on the product page
+                            if self.config.verbose:
+                                print(f"  [ADD-TO-CART] Navigated from search results to product page: {pre_url} -> {current_url}", flush=True)
+                                print(f"  [ADD-TO-CART] Retrying Add to Cart action on product page...", flush=True)
+
+                            # Get fresh snapshot on the product page
+                            await asyncio.sleep(0.5)  # Brief wait for page to load
+                            try:
+                                retry_ctx = await self._get_execution_context(
+                                    runtime, step, step_index
+                                )
+                                # Build prompt for retry - looking for Add to Cart on product page
+                                retry_prompt = self.build_executor_prompt(
+                                    goal=step.goal,
+                                    elements=retry_ctx.snapshot.elements or [],
+                                    intent=step.intent,
+                                    task_category=retry_ctx.task_category,
+                                    input_text=step.input,
+                                )
+                                if self.config.verbose:
+                                    print(f"  [ADD-TO-CART] Asking executor to find Add to Cart button...", flush=True)
+
+                                retry_resp = self.executor.generate(
+                                    retry_prompt["system"],
+                                    retry_prompt["user"],
+                                    max_tokens=self.config.executor_max_tokens,
+                                )
+                                self._usage.record(role="executor", resp=retry_resp)
+                                retry_action = retry_resp.content.strip()
+                                if self.config.verbose:
+                                    print(f"  [ADD-TO-CART] Retry executor output: {retry_action}", flush=True)
+
+                                # Parse and execute retry action
+                                retry_match = re.match(r"CLICK\((\d+)\)", retry_action)
+                                if retry_match:
+                                    retry_element_id = int(retry_match.group(1))
+                                    await runtime.click(retry_element_id)
+                                    if self.config.verbose:
+                                        print(f"  [ADD-TO-CART] Clicked element {retry_element_id}", flush=True)
+
+                                    # Wait and verify
+                                    await asyncio.sleep(0.5)
+                                    verification_passed = await self._verify_step(runtime, step)
+                                    if verification_passed:
+                                        if self.config.verbose:
+                                            print(f"  [ADD-TO-CART] Add to Cart successful after retry!", flush=True)
+                                    else:
+                                        # Check for DOM change (cart drawer/modal)
+                                        post_retry_snap = await runtime.snapshot(SnapshotOptions(limit=50))
+                                        if post_retry_snap and hasattr(post_retry_snap, "elements"):
+                                            post_els = post_retry_snap.elements or []
+                                            cart_indicators = ["cart", "bag", "basket", "checkout", "added", "item"]
+                                            has_cart_indicator = any(
+                                                any(ind in (getattr(el, "text", "") or "").lower() for ind in cart_indicators)
+                                                for el in post_els[:30]
+                                            )
+                                            if has_cart_indicator:
+                                                if self.config.verbose:
+                                                    print(f"  [ADD-TO-CART] Cart indicator detected, accepting as success", flush=True)
+                                                verification_passed = True
+                            except Exception as retry_err:
+                                if self.config.verbose:
+                                    print(f"  [ADD-TO-CART] Retry failed: {retry_err}", flush=True)
+
+                            # Skip the normal URL fallback since we handled Add to Cart specially
+                            fallback_ok = False
+
+                        if fallback_ok:
+                            if self.config.verbose:
+                                print(f"  [VERIFY] Predicate failed but URL changed: {pre_url} -> {current_url}", flush=True)
+                                print(f"  [VERIFY] Accepting {original_action} as successful (URL change fallback)", flush=True)
+                            verification_passed = True
+                        else:
+                            if self.config.verbose:
+                                print(f"  [VERIFY] URL changed but does not match {original_action} intent: {pre_url} -> {current_url}", flush=True)
+                            if original_action == "TYPE_AND_SUBMIT":
+                                typed_element = None
+                                for el in (ctx.snapshot.elements or []):
+                                    if getattr(el, "id", None) == element_id:
+                                        typed_element = el
+                                        break
+                                if self._looks_like_search_submission(step, typed_element):
+                                    # Try retry submission with alternate method
+                                    verification_passed = await self._retry_search_widget_submission(
+                                        runtime=runtime,
+                                        elements=elements,
+                                        input_element_id=element_id,
+                                        step=step,
+                                        pre_url=pre_url,
+                                        text=executor_text or step.input or "",
+                                        typed_element=typed_element,
+                                        telemetry=search_submit_telemetry,
+                                    )
                     elif original_action == "CLICK" and error is None and element_id is not None:
                         # For CLICK actions that don't change URL, check if DOM changed
                         # (e.g., modal appeared, cart drawer opened)
@@ -3582,6 +5043,7 @@ Return JSON patch:
             duration_ms=duration_ms,
             url_before=pre_url,
             url_after=post_url,
+            extracted_data=extracted_data,
         )
 
         # Emit step_end trace
@@ -3691,6 +5153,7 @@ Return JSON patch:
                 start_url = automation_task.starting_url
 
         self._current_task = automation_task
+        self._cached_pruning_category = None  # Reset category cache for new run
         self._run_id = run_id or automation_task.task_id
         self._replans_used = 0
         self._vision_calls = 0
@@ -3719,9 +5182,24 @@ Return JSON patch:
         step_outcomes: list[StepOutcome] = []
         error: str | None = None
 
+        # Optionally fetch page context (markdown) for better planning
+        page_context: str | None = None
+        if self.config.use_page_context:
+            try:
+                page_context = await runtime.read_markdown(
+                    max_chars=self.config.page_context_max_chars
+                )
+                if self.config.verbose and page_context:
+                    print(f"  [PAGE-CONTEXT] Extracted {len(page_context)} chars of markdown for planning", flush=True)
+                    print("\n--- Page Context (Markdown) ---", flush=True)
+                    print(page_context, flush=True)
+                    print("--- End Page Context ---\n", flush=True)
+            except Exception:
+                pass  # Fail silently - page context is optional
+
         try:
             # Generate plan
-            plan = await self.plan(task_description, start_url=start_url)
+            plan = await self.plan(task_description, start_url=start_url, page_context=page_context)
 
             # Execute steps
             step_index = 0
@@ -3926,6 +5404,7 @@ Return JSON patch:
                             continuation_task = self._build_checkout_continuation_task(
                                 task_description, page_type
                             )
+                            # Note: page_context (markdown) is only extracted once during initial planning
                             plan = await self.plan(continuation_task, start_url=None)
                             step_index = 0  # Start from beginning of new plan
                             self._replans_used += 1
@@ -4106,6 +5585,7 @@ Return JSON patch:
                 start_url = automation_task.starting_url
 
         self._current_task = automation_task
+        self._cached_pruning_category = None  # Reset category cache for new run
         self._run_id = run_id or automation_task.task_id
         self._replans_used = 0
         self._vision_calls = 0

@@ -28,9 +28,63 @@ from predicate.agents.planner_executor_agent import (
     RecoveryNavigationConfig,
     SnapshotEscalationConfig,
     build_executor_prompt,
+    build_planner_prompt,
     normalize_plan,
     validate_plan_smoothness,
 )
+
+
+# ---------------------------------------------------------------------------
+# Test build_planner_prompt with page_context
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPlannerPromptPageContext:
+    """Tests for build_planner_prompt with page_context parameter."""
+
+    def test_page_context_not_included_when_none(self) -> None:
+        sys_prompt, user_prompt = build_planner_prompt(
+            task="Buy a laptop",
+            start_url="https://example.com",
+            page_context=None,
+        )
+        assert "Current Page Content" not in user_prompt
+        assert "markdown" not in user_prompt.lower()
+
+    def test_page_context_included_when_provided(self) -> None:
+        markdown_content = "# Welcome to Example Store\n\n- Laptops\n- Phones\n- Tablets"
+        sys_prompt, user_prompt = build_planner_prompt(
+            task="Buy a laptop",
+            start_url="https://example.com",
+            page_context=markdown_content,
+        )
+        assert "Current Page Content:" in user_prompt
+        assert "markdown representation" in user_prompt
+        assert "may be truncated" in user_prompt
+        assert "# Welcome to Example Store" in user_prompt
+        assert "Laptops" in user_prompt
+
+    def test_page_context_helps_with_task_understanding(self) -> None:
+        # Page context should help planner understand what's on the page
+        markdown_content = """
+# Search Results for "gaming laptop"
+
+## Products
+- ASUS ROG Gaming Laptop - $1299
+- MSI Raider - $1499
+- Alienware M15 - $1799
+
+## Filters
+- Price Range
+- Brand
+"""
+        sys_prompt, user_prompt = build_planner_prompt(
+            task="Add the ASUS gaming laptop to cart",
+            start_url="https://store.example.com/search?q=gaming+laptop",
+            page_context=markdown_content,
+        )
+        assert "ASUS ROG Gaming Laptop" in user_prompt
+        assert "Search Results" in user_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +129,7 @@ class TestBuildExecutorPrompt:
             intent=None,
             compact_context="167|searchbox|Search|100|1|0|-|0|",
             input_text="Logitech mouse",
+            action_type="TYPE_AND_SUBMIT",
         )
         assert 'Text to type: "Logitech mouse"' in user_prompt
 
@@ -95,9 +150,62 @@ class TestBuildExecutorPrompt:
             intent="search_box",
             compact_context="100|searchbox|Search|100|1|0|-|0|",
             input_text="laptop",
+            action_type="TYPE_AND_SUBMIT",
         )
         assert "Intent: search_box" in user_prompt
         assert 'Text to type: "laptop"' in user_prompt
+
+    def test_text_matching_prompt_for_matching_intent(self) -> None:
+        """Should include text matching hints when intent mentions matching."""
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Click category for tablecloth",
+            intent="Click element with text matching tablecloth",
+            compact_context="100|link|Tablecloths|100|1|0|-|0|\n101|link|Kitchen|100|1|0|-|0|",
+            action_type="CLICK",
+        )
+        # Should have matching instructions and allow NONE response
+        assert "matching" in sys_prompt.lower()
+        assert "NONE" in sys_prompt
+        assert "Intent: Click element with text matching tablecloth" in user_prompt
+
+    def test_search_icon_prompt_for_search_intent(self) -> None:
+        """Should include search icon hints for search-related intents."""
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Open search",
+            intent="Click search icon",
+            compact_context="100|link|Search|100|1|0|-|0|\n101|button||100|1|0|-|0|",
+        )
+        assert "SEARCH ICON HINTS" in sys_prompt
+
+    def test_type_prompt_warns_about_email_fields(self) -> None:
+        """Should warn about email/newsletter fields when typing."""
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Search for vinyl tablecloth",
+            intent="Type in search box",
+            compact_context="100|textbox|Search|100|1|0|-|0|\n101|textbox|Your email address|100|1|0|-|0|",
+            input_text="vinyl tablecloth",
+            action_type="TYPE_AND_SUBMIT",
+        )
+        assert "email" in sys_prompt.lower()
+        assert "newsletter" in sys_prompt.lower()
+        assert "NONE" in sys_prompt  # Should mention NONE as fallback
+
+    def test_click_with_target_text(self) -> None:
+        """CLICK action with target text should use text matching prompt."""
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Click vinyl tablecloth product",
+            intent="product link",
+            compact_context="100|link|Kitchen Goods|100|1|0|-|0|\n101|link|Vinyl Tablecloth|100|1|0|-|0|",
+            input_text="Vinyl Tablecloth",
+            action_type="CLICK",
+        )
+        # Should have target matching instructions, not "text to type"
+        assert "Target to find:" in user_prompt
+        assert 'Vinyl Tablecloth' in user_prompt
+        assert "Text to type:" not in user_prompt
+        # Should allow NONE response
+        assert "NONE" in sys_prompt
+        assert "matching" in sys_prompt.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +234,7 @@ class TestNormalizePlan:
             ("INPUT", "TYPE_AND_SUBMIT"),
             ("TYPE_TEXT", "TYPE_AND_SUBMIT"),
             ("ENTER_TEXT", "TYPE_AND_SUBMIT"),
+            ("EXTRACT_TEXT", "EXTRACT"),
             ("GOTO", "NAVIGATE"),
             ("GO_TO", "NAVIGATE"),
             ("OPEN", "NAVIGATE"),
@@ -666,6 +775,19 @@ class TestPlannerExecutorConfigNewOptions:
             ),
         )
         assert config.recovery.max_recovery_attempts == 3
+
+    def test_use_page_context_default_disabled(self) -> None:
+        config = PlannerExecutorConfig()
+        assert config.use_page_context is False
+        assert config.page_context_max_chars == 8000
+
+    def test_use_page_context_can_be_enabled(self) -> None:
+        config = PlannerExecutorConfig(use_page_context=True)
+        assert config.use_page_context is True
+
+    def test_page_context_max_chars_customizable(self) -> None:
+        config = PlannerExecutorConfig(use_page_context=True, page_context_max_chars=4000)
+        assert config.page_context_max_chars == 4000
 
 
 # ---------------------------------------------------------------------------
@@ -1244,6 +1366,754 @@ class TestSnapshotWithEscalationScrollBehavior:
         # No scrolling should occur without intent_heuristics
         assert runtime.scroll_count == 0
 
+
+class TestExtractActionSupport:
+    """Tests for EXTRACT step execution in PlannerExecutorAgent."""
+
+    @pytest.mark.asyncio
+    async def test_execute_step_supports_extract_action(self) -> None:
+        """EXTRACT steps should use the SDK extraction path instead of failing."""
+        from datetime import datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext, StepStatus
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.backend = SimpleNamespace(page=object())
+        runtime.get_url = AsyncMock(return_value="https://news.ycombinator.com/")
+        runtime.record_action = AsyncMock()
+        runtime.goto = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        # Mock read_markdown for text extraction tasks (used when keywords like "title" are detected)
+        runtime.read_markdown = AsyncMock(return_value="# Story 1\n## Story 2\n## Story 3")
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot([MockElement(1, "link", "Story 1")], url="https://news.ycombinator.com/"),
+            compact_representation="Category: extraction\nURL: https://news.ycombinator.com/\nNodes:",
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        # Use a goal with "title" keyword to trigger markdown extraction path
+        step = PlanStep(id=1, goal="Identify the top 5 story titles", action="EXTRACT", verify=[])
+
+        with patch.object(agent, "_snapshot_with_escalation", AsyncMock(return_value=ctx)):
+            outcome = await agent._execute_step(step, runtime, step_index=0)
+
+        assert outcome.status == StepStatus.SUCCESS
+        assert outcome.verification_passed is True
+        assert outcome.action_taken == "EXTRACT"
+        # Verify read_markdown was called for text extraction task
+        runtime.read_markdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_extract_step_succeeds_even_if_planner_verify_is_brittle(self) -> None:
+        """EXTRACT success should be the primary success signal for extraction steps."""
+        from datetime import datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext, StepStatus
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.backend = SimpleNamespace(page=object())
+        runtime.get_url = AsyncMock(return_value="https://news.ycombinator.com/")
+        runtime.record_action = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        # Mock read_markdown for text extraction tasks
+        runtime.read_markdown = AsyncMock(return_value="# Story 1\n## Story 2\n## Story 3")
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot([MockElement(1, "link", "Story 1")], url="https://news.ycombinator.com/"),
+            compact_representation="Category: extraction\nURL: https://news.ycombinator.com/\nNodes:",
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        # Goal contains "title" keyword, which triggers markdown extraction
+        step = PlanStep(
+            id=1,
+            goal="Identify the top 5 story titles",
+            action="EXTRACT",
+            verify=[PredicateSpec(predicate="exists", args=[".storylink"])],
+        )
+
+        with patch.object(agent, "_snapshot_with_escalation", AsyncMock(return_value=ctx)):
+            with patch.object(agent, "_verify_step", AsyncMock(return_value=False)):
+                outcome = await agent._execute_step(step, runtime, step_index=0)
+
+        assert outcome.status == StepStatus.SUCCESS
+        assert outcome.verification_passed is True
+
+
+class TestMarkdownExtraction:
+    """Tests for markdown-based text extraction optimization."""
+
+    @pytest.mark.asyncio
+    async def test_text_extraction_uses_read_markdown_then_llm(self) -> None:
+        """EXTRACT with text extraction keywords should use read_markdown() + executor LLM."""
+        from datetime import datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext, StepStatus
+        from predicate.llm_provider import LLMResponse
+
+        # Create executor that returns extracted text
+        executor = MagicMock()
+        executor.generate = MagicMock(
+            return_value=LLMResponse(
+                content="Story Title Two",
+                prompt_tokens=100,
+                completion_tokens=10,
+                total_tokens=110,
+                model_name="test-model",
+            )
+        )
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=executor,
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.backend = SimpleNamespace(page=object())
+        runtime.get_url = AsyncMock(return_value="https://news.ycombinator.com/")
+        runtime.record_action = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        # Mock read_markdown to return page content
+        markdown_content = "# Hacker News\n\n1. Story Title One\n2. Story Title Two\n3. Story Title Three"
+        runtime.read_markdown = AsyncMock(return_value=markdown_content)
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot([MockElement(1, "link", "Story 1")], url="https://news.ycombinator.com/"),
+            compact_representation="Category: extraction\nURL: https://news.ycombinator.com/\nNodes:",
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        # Goal contains "extract" and "title" keywords - should trigger markdown extraction
+        step = PlanStep(id=1, goal="Extract the title of the second post", action="EXTRACT", verify=[])
+
+        with patch.object(agent, "_snapshot_with_escalation", AsyncMock(return_value=ctx)):
+            outcome = await agent._execute_step(step, runtime, step_index=0)
+
+        assert outcome.status == StepStatus.SUCCESS
+        assert outcome.verification_passed is True
+        assert outcome.action_taken == "EXTRACT"
+        # Verify read_markdown was called first
+        runtime.read_markdown.assert_awaited_once_with(max_chars=8000)
+        # Verify executor LLM was called to extract specific text from markdown
+        executor.generate.assert_called_once()
+        # Check that the markdown content was passed to the executor
+        call_args = executor.generate.call_args
+        assert markdown_content in call_args[0][1]  # markdown in user prompt
+        assert "Extract the title of the second post" in call_args[0][1]  # query in prompt
+
+    @pytest.mark.asyncio
+    async def test_complex_extraction_uses_llm(self) -> None:
+        """EXTRACT without text extraction keywords should use LLM-based extraction."""
+        from datetime import datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext, StepStatus
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.backend = SimpleNamespace(page=object())
+        runtime.get_url = AsyncMock(return_value="https://news.ycombinator.com/")
+        runtime.record_action = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        runtime.read_markdown = AsyncMock(return_value="# Page Content")
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot([MockElement(1, "link", "Story 1")], url="https://news.ycombinator.com/"),
+            compact_representation="Category: extraction\nURL: https://news.ycombinator.com/\nNodes:",
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        # Goal without extraction keywords - should use LLM extraction
+        step = PlanStep(id=1, goal="Analyze sentiment patterns from visible HTML", action="EXTRACT", verify=[])
+
+        extract_result = SimpleNamespace(ok=True, data={"sentiment": "positive"}, raw='{"sentiment": "positive"}')
+
+        with patch.object(agent, "_snapshot_with_escalation", AsyncMock(return_value=ctx)):
+            with patch("predicate.read.extract_async", new=AsyncMock(return_value=extract_result)) as mock_extract:
+                outcome = await agent._execute_step(step, runtime, step_index=0)
+
+        assert outcome.status == StepStatus.SUCCESS
+        # Verify LLM-based extraction was used, not read_markdown
+        mock_extract.assert_awaited_once()
+        runtime.read_markdown.assert_not_awaited()
+
+
+class TestTextExtractionKeywords:
+    """Tests for the _is_text_extraction_task helper function."""
+
+    def test_extraction_keywords_match(self) -> None:
+        """Keywords like extract, read, parse should trigger markdown extraction."""
+        from predicate.agents.planner_executor_agent import _is_text_extraction_task
+
+        assert _is_text_extraction_task("Extract the title from the page") is True
+        assert _is_text_extraction_task("Read the article content") is True
+        assert _is_text_extraction_task("Parse the product names") is True
+        assert _is_text_extraction_task("Get the price of this item") is True
+        assert _is_text_extraction_task("What is the headline?") is True
+
+    def test_question_keywords_match(self) -> None:
+        """Question words like 'what is' should trigger markdown extraction."""
+        from predicate.agents.planner_executor_agent import _is_text_extraction_task
+
+        assert _is_text_extraction_task("What is the title of the page?") is True
+        assert _is_text_extraction_task("What are the prices listed?") is True
+        assert _is_text_extraction_task("Show me the description") is True
+        assert _is_text_extraction_task("Tell me the author name") is True
+
+    def test_plural_keywords_match(self) -> None:
+        """Plural forms of keywords should also match."""
+        from predicate.agents.planner_executor_agent import _is_text_extraction_task
+
+        assert _is_text_extraction_task("Get all the titles") is True
+        assert _is_text_extraction_task("List the prices") is True
+        assert _is_text_extraction_task("Find the headlines") is True
+        assert _is_text_extraction_task("Extract the items") is True
+
+    def test_non_extraction_tasks_dont_match(self) -> None:
+        """Tasks without extraction keywords should not match."""
+        from predicate.agents.planner_executor_agent import _is_text_extraction_task
+
+        assert _is_text_extraction_task("Analyze sentiment patterns") is False
+        assert _is_text_extraction_task("Identify HTML structure") is False
+        assert _is_text_extraction_task("Determine page complexity") is False
+
+    def test_word_boundary_prevents_false_positives(self) -> None:
+        """Keywords embedded in other words should not match."""
+        from predicate.agents.planner_executor_agent import _is_text_extraction_task
+
+        # "time" is a keyword but should not match inside "sentiment"
+        assert _is_text_extraction_task("Analyze sentiment") is False
+        # "get" is a keyword but should not match inside "together"
+        assert _is_text_extraction_task("Put together a report") is False
+
+
+class TestExtractTokenAccounting:
+    """Tests for token accounting on EXTRACT steps."""
+
+    @pytest.mark.asyncio
+    async def test_extract_step_records_token_usage(self) -> None:
+        """EXTRACT steps should contribute to agent token stats (for LLM-based extraction)."""
+        from datetime import datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext
+        from predicate.llm_provider import LLMResponse
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.backend = SimpleNamespace(page=object())
+        runtime.get_url = AsyncMock(return_value="https://news.ycombinator.com/")
+        runtime.record_action = AsyncMock()
+        runtime.stabilize = AsyncMock()
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot([MockElement(1, "link", "Story 1")], url="https://news.ycombinator.com/"),
+            compact_representation="Category: extraction\nURL: https://news.ycombinator.com/\nNodes:",
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        # Use a goal without common extraction keywords to trigger LLM-based extraction
+        # (Avoids keywords like extract, read, parse, title, content, text, etc.)
+        step = PlanStep(id=1, goal="Identify sentiment patterns from visible HTML", action="EXTRACT", verify=[])
+
+        extract_result = SimpleNamespace(
+            ok=True,
+            data={"text": '["Story 1"]'},
+            raw='["Story 1"]',
+            llm_response=LLMResponse(
+                content='["Story 1"]',
+                prompt_tokens=111,
+                completion_tokens=22,
+                total_tokens=133,
+                model_name="gpt-4o-mini",
+            ),
+        )
+
+        with patch.object(agent, "_snapshot_with_escalation", AsyncMock(return_value=ctx)):
+            with patch("predicate.read.extract_async", new=AsyncMock(return_value=extract_result)):
+                await agent._execute_step(step, runtime, step_index=0)
+
+        stats = agent.get_token_stats()
+        assert stats["total"]["calls"] == 1
+        assert stats["total"]["total_tokens"] == 133
+        assert stats["by_role"]["extract"]["calls"] == 1
+        assert stats["by_role"]["extract"]["prompt_tokens"] == 111
+        assert stats["by_role"]["extract"]["completion_tokens"] == 22
+        assert stats["by_model"]["gpt-4o-mini"]["total_tokens"] == 133
+
+
+# ---------------------------------------------------------------------------
+# Test TYPE_AND_SUBMIT typing delay
+# ---------------------------------------------------------------------------
+
+
+class TestTypeAndSubmitTypingDelay:
+    """Tests for humanized typing in TYPE_AND_SUBMIT execution."""
+
+    @pytest.mark.asyncio
+    async def test_execute_step_passes_typing_delay_to_runtime(self) -> None:
+        """TYPE_AND_SUBMIT should forward configured keystroke delay to runtime.type."""
+        from datetime import datetime
+        from unittest.mock import AsyncMock, MagicMock
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext
+        from predicate.llm_provider import LLMResponse
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MagicMock(
+                generate=MagicMock(
+                    return_value=LLMResponse(content='TYPE(1, "Thinkpad laptop")', model_name="stub")
+                )
+            ),
+            config=PlannerExecutorConfig(type_delay_ms=17.0),
+        )
+
+        runtime = MagicMock()
+        runtime.type = AsyncMock()
+        runtime.press = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        runtime.get_url = AsyncMock(return_value="https://www.amazon.com/")
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot([MockElement(1, "searchbox", "Search Amazon")], url="https://www.amazon.com/"),
+            compact_representation="1|searchbox|Search Amazon|100|1|0|-|0|",
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        step = PlanStep(id=1, goal="Search for Thinkpad laptop", action="TYPE_AND_SUBMIT", input="Thinkpad laptop", verify=[])
+
+        agent._snapshot_with_escalation = AsyncMock(return_value=ctx)  # type: ignore[method-assign]
+
+        await agent._execute_step(step, runtime, step_index=0)
+
+        runtime.type.assert_awaited_once_with(1, "Thinkpad laptop", delay_ms=17.0)
+        runtime.press.assert_awaited_once_with("Enter")
+
+    @pytest.mark.asyncio
+    async def test_execute_search_type_and_submit_uses_enter_by_default(self) -> None:
+        """Search submissions should prefer Enter key over clicking submit button (more reliable).
+
+        Many search boxes (e.g., lifeisgood.com) don't work correctly when clicking
+        the submit button - they may navigate to a category page instead of searching.
+        Pressing Enter is more reliable for search inputs, matching WebBench behavior.
+        """
+        from datetime import datetime
+        from unittest.mock import AsyncMock, MagicMock
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext
+        from predicate.llm_provider import LLMResponse
+
+        submit_button = MockElement(110, "button", "Submit Search")
+        submit_button.aria_label = "Submit Search"
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MagicMock(
+                generate=MagicMock(
+                    return_value=LLMResponse(content='TYPE(105, "Rainbow trout trucker hat")', model_name="stub")
+                )
+            ),
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.type = AsyncMock()
+        runtime.click = AsyncMock()
+        runtime.press = AsyncMock()
+        runtime.goto = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        runtime.record_action = AsyncMock()
+        runtime.get_url = AsyncMock(return_value="https://lifeisgood.com/search?q=Rainbow+trout+trucker+hat")
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot(
+                [
+                    MockElement(105, "searchbox", "Search for cat tees"),
+                    submit_button,
+                ],
+                url="https://lifeisgood.com/",
+            ),
+            compact_representation="\n".join(
+                [
+                    "105|searchbox|Search for cat tees|1177|0||0|||0|",
+                    "110|button|Submit Search|308|0||0|||0|",
+                ]
+            ),
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        step = PlanStep(id=1, goal="Search for the product", action="TYPE_AND_SUBMIT", input="Rainbow trout trucker hat", verify=[])
+
+        agent._snapshot_with_escalation = AsyncMock(return_value=ctx)  # type: ignore[method-assign]
+
+        await agent._execute_step(step, runtime, step_index=0)
+
+        runtime.type.assert_awaited_once()
+        # Now we expect Enter to be pressed (not click), matching WebBench behavior
+        runtime.press.assert_awaited_once_with("Enter")
+        runtime.click.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_search_type_and_submit_does_not_accept_unrelated_url_change(self) -> None:
+        """Searchbox submissions should not treat arbitrary collection redirects as success."""
+        from datetime import datetime
+        from unittest.mock import AsyncMock, MagicMock
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext, StepStatus
+        from predicate.llm_provider import LLMResponse
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MagicMock(
+                generate=MagicMock(
+                    return_value=LLMResponse(content='TYPE(105, "Rainbow trout trucker hat")', model_name="stub")
+                )
+            ),
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.type = AsyncMock()
+        runtime.click = AsyncMock()
+        runtime.press = AsyncMock()
+        runtime.goto = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        runtime.record_action = AsyncMock()
+        url_reads = [
+            "https://lifeisgood.com/",
+            "https://lifeisgood.com/collections/hats",
+            "https://lifeisgood.com/collections/hats",
+        ]
+
+        async def _next_url() -> str:
+            if url_reads:
+                return url_reads.pop(0)
+            return "https://lifeisgood.com/collections/hats"
+
+        runtime.get_url = AsyncMock(side_effect=_next_url)
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot([MockElement(105, "searchbox", "Search for cat tees")], url="https://lifeisgood.com/"),
+            compact_representation="105|searchbox|Search for cat tees|1177|0||0|||0|",
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        step = PlanStep(
+            id=1,
+            goal="Search for the product",
+            action="TYPE_AND_SUBMIT",
+            input="Rainbow trout trucker hat",
+            verify=[PredicateSpec(predicate="url_contains", args=["search"])],
+        )
+
+        agent._snapshot_with_escalation = AsyncMock(return_value=ctx)  # type: ignore[method-assign]
+        agent._verify_step = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        outcome = await agent._execute_step(step, runtime, step_index=0)
+
+        assert outcome.status == StepStatus.FAILED
+        assert outcome.verification_passed is False
+        assert runtime.goto.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_search_type_and_submit_retries_with_alternate_submit_method(self) -> None:
+        """Searchbox submissions should retry once with the alternate submit method before failing.
+
+        Since Enter is now the default, when Enter fails, retry should try clicking the submit button.
+        """
+        from datetime import datetime
+        from unittest.mock import AsyncMock, MagicMock
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext, StepStatus
+        from predicate.llm_provider import LLMResponse
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MagicMock(
+                generate=MagicMock(
+                    return_value=LLMResponse(content='TYPE(105, "Rainbow trout trucker hat")', model_name="stub")
+                )
+            ),
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.type = AsyncMock()
+        runtime.click = AsyncMock()
+        runtime.press = AsyncMock()
+        runtime.goto = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        runtime.record_action = AsyncMock()
+        submit_button = MockElement(110, "button", "Submit Search")
+        submit_button.aria_label = "Submit Search"
+        url_reads = ["https://lifeisgood.com/"]
+
+        async def _next_url() -> str:
+            if url_reads:
+                return url_reads.pop(0)
+            if runtime.press.await_count > 0 or runtime.click.await_count > 0:
+                return "https://lifeisgood.com/collections/hats"
+            return "https://lifeisgood.com/collections/hats"
+
+        runtime.get_url = AsyncMock(side_effect=_next_url)
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot(
+                [MockElement(105, "searchbox", "Search for cat tees"), submit_button],
+                url="https://lifeisgood.com/",
+            ),
+            compact_representation="\n".join(
+                [
+                    "105|searchbox|Search for cat tees|1177|0||0|||0|",
+                    "110|button|Submit Search|308|0||0|||0|",
+                ]
+            ),
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        step = PlanStep(
+            id=1,
+            goal="Search for the product",
+            action="TYPE_AND_SUBMIT",
+            input="Rainbow trout trucker hat",
+            verify=[PredicateSpec(predicate="url_contains", args=["search"])],
+        )
+
+        agent._snapshot_with_escalation = AsyncMock(return_value=ctx)  # type: ignore[method-assign]
+        agent._verify_step = AsyncMock(side_effect=[False, False])  # type: ignore[method-assign]
+
+        outcome = await agent._execute_step(step, runtime, step_index=0)
+
+        # Now: first attempt uses Enter, retry uses click
+        runtime.press.assert_any_await("Enter")
+        assert runtime.click.await_count >= 1  # Retry should try click
+        runtime.goto.assert_not_awaited()
+        assert outcome.status == StepStatus.FAILED
+        assert outcome.verification_passed is False
+
+    @pytest.mark.asyncio
+    async def test_search_type_and_submit_retry_can_switch_from_enter_to_click(self) -> None:
+        """If Enter fails and a submit button becomes available, retry should switch to click.
+
+        With the new behavior (Enter first), this test validates that when Enter fails,
+        the retry logic can find and use a submit button as a fallback.
+        """
+        from datetime import datetime
+        from unittest.mock import AsyncMock, MagicMock
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext, StepStatus
+        from predicate.llm_provider import LLMResponse
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MagicMock(
+                generate=MagicMock(
+                    return_value=LLMResponse(content='TYPE(105, "Rainbow trout trucker hat")', model_name="stub")
+                )
+            ),
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.type = AsyncMock()
+        runtime.click = AsyncMock()
+        runtime.press = AsyncMock()
+        runtime.goto = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        runtime.record_action = AsyncMock()
+        url_reads = [
+            "https://lifeisgood.com/",
+            "https://lifeisgood.com/collections/hats",
+            "https://lifeisgood.com/collections/hats",
+        ]
+
+        async def _next_url() -> str:
+            if url_reads:
+                return url_reads.pop(0)
+            return "https://lifeisgood.com/collections/hats"
+
+        runtime.get_url = AsyncMock(side_effect=_next_url)
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot([MockElement(105, "searchbox", "Search for cat tees")], url="https://lifeisgood.com/"),
+            compact_representation="105|searchbox|Search for cat tees|1177|0||0|||0|",
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        step = PlanStep(
+            id=1,
+            goal="Search for the product",
+            action="TYPE_AND_SUBMIT",
+            input="Rainbow trout trucker hat",
+            verify=[PredicateSpec(predicate="url_contains", args=["search"])],
+        )
+
+        agent._snapshot_with_escalation = AsyncMock(return_value=ctx)  # type: ignore[method-assign]
+        agent._verify_step = AsyncMock(side_effect=[False, False])  # type: ignore[method-assign]
+        # Submit button not found initially, then found on retry
+        agent._find_submit_button_for_type_and_submit = MagicMock(side_effect=[None, 110, 110])  # type: ignore[method-assign]
+
+        outcome = await agent._execute_step(step, runtime, step_index=0)
+
+        # First attempt: Enter (default)
+        runtime.press.assert_any_await("Enter")
+        # Retry: click the submit button that became available
+        runtime.click.assert_any_await(110)
+        runtime.goto.assert_not_awaited()
+        assert outcome.status == StepStatus.FAILED
+        assert outcome.verification_passed is False
+
+    @pytest.mark.asyncio
+    async def test_search_type_and_submit_submits_without_retyping_if_value_already_matches(self) -> None:
+        """Search submissions should skip retyping when the focused input already contains the desired query."""
+        from datetime import datetime
+        from unittest.mock import AsyncMock, MagicMock
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext, StepStatus
+        from predicate.llm_provider import LLMResponse
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MagicMock(
+                generate=MagicMock(
+                    return_value=LLMResponse(content='TYPE(105, "Rainbow trout trucker hat")', model_name="stub")
+                )
+            ),
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.type = AsyncMock()
+        runtime.click = AsyncMock()
+        runtime.press = AsyncMock()
+        runtime.goto = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        runtime.record_action = AsyncMock()
+        runtime.get_url = AsyncMock(return_value="https://lifeisgood.com/search?q=Rainbow+trout+trucker+hat")
+        runtime.backend = MagicMock(page=MagicMock())
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot([MockElement(105, "searchbox", "Search for cat tees")], url="https://lifeisgood.com/"),
+            compact_representation="105|searchbox|Search for cat tees|1177|0||0|||0|",
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        step = PlanStep(
+            id=1,
+            goal="Search for the product",
+            action="TYPE_AND_SUBMIT",
+            input="Rainbow trout trucker hat",
+            verify=[PredicateSpec(predicate="url_contains", args=["search"])],
+        )
+
+        agent._snapshot_with_escalation = AsyncMock(return_value=ctx)  # type: ignore[method-assign]
+        agent._verify_step = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        agent._submit_if_already_typed = AsyncMock(return_value=True)  # type: ignore[attr-defined,method-assign]
+
+        outcome = await agent._execute_step(step, runtime, step_index=0)
+
+        agent._submit_if_already_typed.assert_awaited_once()  # type: ignore[attr-defined]
+        runtime.type.assert_not_awaited()
+        assert outcome.status == StepStatus.SUCCESS
+        assert outcome.verification_passed is True
+
+    @pytest.mark.asyncio
+    async def test_search_retry_uses_browser_clear_and_type_helper_when_available(self) -> None:
+        """Search retry should prefer the browser-backed clear/type helper over generic select-all fallback.
+
+        With the new behavior where Enter is the default, first_submit_method="enter" reflects
+        that the initial submission used Enter key.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SearchSubmitTelemetry
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MagicMock(),
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.type = AsyncMock()
+        runtime.click = AsyncMock()
+        runtime.press = AsyncMock()
+        runtime.backend = MagicMock(page=MagicMock())
+
+        # Now Enter is the default first method
+        telemetry = SearchSubmitTelemetry(first_submit_method="enter")
+        step = PlanStep(
+            id=1,
+            goal="Search for the product",
+            action="TYPE_AND_SUBMIT",
+            input="Rainbow trout trucker hat",
+            verify=[PredicateSpec(predicate="url_contains", args=["search"])],
+        )
+        typed_element = MockElement(105, "searchbox", "Search for cat tees")
+
+        agent._clear_and_type_search_input = AsyncMock(return_value=True)  # type: ignore[attr-defined,method-assign]
+        agent._submit_type_and_submit = AsyncMock()  # type: ignore[method-assign]
+        agent._verify_step = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        await agent._retry_search_widget_submission(
+            runtime=runtime,
+            elements=[typed_element, MockElement(110, "button", "Submit Search")],
+            input_element_id=105,
+            step=step,
+            text="Rainbow trout trucker hat",
+            pre_url="https://lifeisgood.com/",
+            typed_element=typed_element,
+            telemetry=telemetry,
+        )
+
+        agent._clear_and_type_search_input.assert_awaited_once()  # type: ignore[attr-defined]
+        runtime.type.assert_not_awaited()
+        # Submit is handled by _submit_type_and_submit, which is mocked
+        # No direct press calls in this test path
 
 # ---------------------------------------------------------------------------
 # Test AuthBoundaryConfig

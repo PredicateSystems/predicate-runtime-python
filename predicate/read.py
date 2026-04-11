@@ -493,14 +493,14 @@ def extract(
     raw = response.content.strip()
 
     if schema is None:
-        return ExtractResult(ok=True, data={"text": raw}, raw=raw)
+        return ExtractResult(ok=True, data={"text": raw}, raw=raw, llm_response=response)
 
     try:
         payload = _extract_json_payload(raw)
         validated = schema.model_validate(payload)
-        return ExtractResult(ok=True, data=validated, raw=raw)
+        return ExtractResult(ok=True, data=validated, raw=raw, llm_response=response)
     except (json.JSONDecodeError, ValidationError) as exc:
-        return ExtractResult(ok=False, error=str(exc), raw=raw)
+        return ExtractResult(ok=False, error=str(exc), raw=raw, llm_response=response)
 
 
 async def extract_async(
@@ -527,11 +527,11 @@ async def extract_async(
     raw = response.content.strip()
 
     if schema is None:
-        return ExtractResult(ok=True, data={"text": raw}, raw=raw)
+        return ExtractResult(ok=True, data={"text": raw}, raw=raw, llm_response=response)
 
     try:
         payload = _extract_json_payload(raw)
         validated = schema.model_validate(payload)
-        return ExtractResult(ok=True, data=validated, raw=raw)
+        return ExtractResult(ok=True, data=validated, raw=raw, llm_response=response)
     except (json.JSONDecodeError, ValidationError) as exc:
-        return ExtractResult(ok=False, error=str(exc), raw=raw)
+        return ExtractResult(ok=False, error=str(exc), raw=raw, llm_response=response)
