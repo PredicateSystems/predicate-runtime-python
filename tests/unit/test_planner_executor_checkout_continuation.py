@@ -298,6 +298,7 @@ class TestBuildExecutorPromptImprovements:
             intent=None,
             compact_context="100|textbox|Search|500|1|0|-|0|\n200|button|Submit|300|1|0|-|0|",
             input_text="laptop",
+            action_type="TYPE_AND_SUBMIT",  # Must specify action_type to get TYPE prompt
         )
 
         # System prompt should mention INPUT element explicitly
