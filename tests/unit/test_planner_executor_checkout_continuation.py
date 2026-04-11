@@ -261,6 +261,25 @@ class TestExtendedCheckoutDetection:
             should_skip = any(pattern in text.lower() for pattern in checkout_patterns)
             assert should_skip is False, f"Incorrectly matched: {text}"
 
+    def test_does_not_treat_global_nav_cart_link_as_drawer_checkout(self) -> None:
+        """Top-nav Amazon cart links should not suppress drawer dismissal."""
+        from types import SimpleNamespace
+
+        mock_planner = MagicMock()
+        mock_executor = MagicMock()
+        agent = PlannerExecutorAgent(planner=mock_planner, executor=mock_executor)
+
+        nav_cart = SimpleNamespace(
+            role="link",
+            text="Cart",
+            aria_label="0 items in cart",
+            href="https://www.amazon.com/gp/cart/view.html?ref_=nav_cart",
+            doc_y=24.0,
+            layout=SimpleNamespace(region="header"),
+        )
+
+        assert agent._is_global_nav_cart_link(nav_cart) is True
+
 
 # ---------------------------------------------------------------------------
 # Test Build Executor Prompt Improvements

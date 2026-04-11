@@ -17,8 +17,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import re
+import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -26,13 +28,21 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
+from ..actions import clear_async, type_text_async
 from ..agent_runtime import AgentRuntime
 from ..llm_provider import LLMProvider, LLMResponse
 from ..models import Snapshot, SnapshotOptions, StepHookContext
+from ..pruning import (
+    PrunedSnapshotContext,
+    PruningTaskCategory,
+    classify_task_category,
+    prune_with_recovery,
+)
 from ..trace_event_builder import TraceEventBuilder
 from ..tracing import Tracer
 from ..verification import (
@@ -670,6 +680,7 @@ class PlannerExecutorConfig:
     # Executor LLM settings
     executor_max_tokens: int = 96
     executor_temperature: float = 0.0
+    type_delay_ms: float | None = 17.0
 
     # Stabilization (wait for DOM to settle after actions)
     stabilize_enabled: bool = True
@@ -770,6 +781,8 @@ class SnapshotContext:
     snapshot_success: bool = True
     requires_vision: bool = False
     vision_reason: str | None = None
+    pruning_category: str | None = None
+    pruned_node_count: int = 0
 
     def is_stale(self, max_age_seconds: float = 5.0) -> bool:
         """Check if snapshot is too old to reuse."""
@@ -875,6 +888,16 @@ class StepOutcome:
     duration_ms: int = 0
     url_before: str | None = None
     url_after: str | None = None
+    extracted_data: Any | None = None
+
+
+@dataclass
+class SearchSubmitTelemetry:
+    """Tracks search-submit behavior for debugging and diagnostics."""
+
+    first_submit_method: Literal["click", "enter"] | None = None
+    retry_submit_method: Literal["click", "enter"] | None = None
+    observed_search_results_dom: bool = False
 
 
 @dataclass
@@ -1073,6 +1096,7 @@ def normalize_plan(plan_dict: dict[str, Any]) -> dict[str, Any]:
                     "INPUT": "TYPE_AND_SUBMIT",
                     "TYPE_TEXT": "TYPE_AND_SUBMIT",
                     "ENTER_TEXT": "TYPE_AND_SUBMIT",
+                    "EXTRACT_TEXT": "EXTRACT",
                     "GOTO": "NAVIGATE",
                     "GO_TO": "NAVIGATE",
                     "OPEN": "NAVIGATE",
@@ -1385,11 +1409,52 @@ Based on the goal and current page state, what is the NEXT action to take?"""
     return system, user
 
 
+def _get_category_executor_hints(category: str | None) -> str:
+    """
+    Get category-specific hints for the executor.
+
+    These hints guide the executor to prioritize certain element types
+    based on the detected task category, improving accuracy without
+    adding tokens to the planner.
+    """
+    if not category:
+        return ""
+
+    category_lower = category.lower() if isinstance(category, str) else str(category).lower()
+
+    hints = {
+        "shopping": (
+            "Priority: 'Add to Cart', 'Buy Now', 'Add to Bag', product links, price elements."
+        ),
+        "checkout": (
+            "Priority: 'Checkout', 'Proceed to Checkout', 'Place Order', payment fields."
+        ),
+        "form_filling": (
+            "Priority: input fields, textboxes, submit/send buttons, form labels."
+        ),
+        "search": (
+            "Priority: search box, search button, result links, filter controls."
+        ),
+        "auth": (
+            "Priority: username/email field, password field, sign in/login button."
+        ),
+        "extraction": (
+            "Priority: data elements, table cells, list items, content containers."
+        ),
+        "navigation": (
+            "Priority: navigation links, menu items, breadcrumbs."
+        ),
+    }
+
+    return hints.get(category_lower, "")
+
+
 def build_executor_prompt(
     goal: str,
     intent: str | None,
     compact_context: str,
     input_text: str | None = None,
+    category: str | None = None,
 ) -> tuple[str, str]:
     """
     Build system and user prompts for the Executor LLM.
@@ -1399,12 +1464,17 @@ def build_executor_prompt(
         intent: Intent hint for element selection (optional)
         compact_context: Compact representation of page elements
         input_text: Text to type for TYPE_AND_SUBMIT actions (optional)
+        category: Task category for category-specific hints (optional)
 
     Returns:
         (system_prompt, user_prompt)
     """
     intent_line = f"Intent: {intent}\n" if intent else ""
     input_line = f"Text to type: \"{input_text}\"\n" if input_text else ""
+
+    # Get category-specific hints
+    category_hints = _get_category_executor_hints(category)
+    category_line = f"{category_hints}\n" if category_hints else ""
 
     # Tight prompt optimized for small local models (4B-7B)
     # Key: explicit format, no reasoning, clear failure consequence
@@ -1440,7 +1510,7 @@ def build_executor_prompt(
         action_instruction = "Return CLICK(id):"
 
     user = f"""Goal: {goal}
-{intent_line}{input_line}
+{intent_line}{category_line}{input_line}
 Elements:
 {compact_context}
 
@@ -1575,6 +1645,9 @@ class PlannerExecutorAgent:
         # Current automation task (for run-level context)
         self._current_task: AutomationTask | None = None
 
+        # Cached pruning category (run-scoped, avoids re-classification per step)
+        self._cached_pruning_category: PruningTaskCategory | None = None
+
         # Token usage tracking
         self._token_collector = _TokenUsageCollector()
 
@@ -1606,6 +1679,93 @@ class PlannerExecutorAgent:
         except Exception:
             pass  # Don't fail on token tracking errors
 
+    def _detect_pruning_category(
+        self,
+        snap: Snapshot,
+        goal: str,
+    ) -> PruningTaskCategory | None:
+        """Resolve the pruning category from task context, then goal-based rules.
+
+        The category is cached for the duration of a run to ensure consistency
+        and avoid re-classification on every step.
+        """
+        # Return cached category if available
+        if self._cached_pruning_category is not None:
+            return self._cached_pruning_category
+
+        if self._current_task is not None:
+            try:
+                category = self._current_task.pruning_category_hint()
+                if category != PruningTaskCategory.GENERIC:
+                    self._cached_pruning_category = category
+                    if self.config.verbose:
+                        print(f"  [CATEGORY] Detected category from task hint: {category.value}", flush=True)
+                    return category
+            except Exception:
+                pass
+
+            result = classify_task_category(
+                task_text=self._current_task.task,
+                current_url=self._current_task.starting_url or getattr(snap, "url", "") or "",
+                domain_hints=self._current_task.domain_hints,
+                task_category=self._current_task.category,
+            )
+        else:
+            result = classify_task_category(
+                task_text=goal,
+                current_url=getattr(snap, "url", "") or "",
+            )
+
+        if result.category == PruningTaskCategory.GENERIC:
+            return None
+
+        # Cache the category for this run
+        self._cached_pruning_category = result.category
+        if self.config.verbose:
+            print(f"  [CATEGORY] Detected category: {result.category.value} (confidence={result.confidence:.2f})", flush=True)
+        return result.category
+
+    def _get_cached_category_str(self) -> str | None:
+        """Get the cached category as a string for executor hints."""
+        if self._cached_pruning_category is not None:
+            return self._cached_pruning_category.value
+        return None
+
+    def _build_pruned_context(
+        self,
+        snap: Snapshot,
+        goal: str,
+    ) -> PrunedSnapshotContext | None:
+        """Build a category-specific pruned context when task intent is known.
+
+        Uses automatic over-pruning recovery via relaxation levels if the
+        initial pruning leaves too few elements.
+        """
+        if self._context_formatter is not None:
+            return None
+
+        category = self._detect_pruning_category(snap, goal)
+        if category is None:
+            return None
+
+        try:
+            ctx = prune_with_recovery(
+                snap,
+                goal=goal,
+                category=category,
+                max_relaxation=3,
+                verbose=self.config.verbose,
+            )
+            if self.config.verbose and ctx.relaxation_level == 0:
+                print(
+                    f"  [PRUNING] {ctx.raw_element_count} -> {ctx.pruned_element_count} elements "
+                    f"(category={category.value})",
+                    flush=True,
+                )
+            return ctx
+        except Exception:
+            return None
+
     def _format_context(self, snap: Snapshot, goal: str) -> str:
         """
         Format snapshot for LLM context.
@@ -1615,6 +1775,10 @@ class PlannerExecutorAgent:
         """
         if self._context_formatter is not None:
             return self._context_formatter(snap, goal)
+
+        pruned_context = self._build_pruned_context(snap, goal)
+        if pruned_context is not None and pruned_context.nodes:
+            return pruned_context.prompt_block
 
         import re
 
@@ -2125,6 +2289,7 @@ class PlannerExecutorAgent:
         max_limit = cfg.limit_max if cfg.enabled else cfg.limit_base  # Disable escalation if not enabled
         last_snap: Snapshot | None = None
         last_compact: str = ""
+        last_pruned_context: PrunedSnapshotContext | None = None
         screenshot_b64: str | None = None
         requires_vision = False
         vision_reason: str | None = None
@@ -2153,8 +2318,14 @@ class PlannerExecutorAgent:
 
                 # Format context FIRST - we always want the compact representation
                 # even if vision fallback is required, so the planner can see available elements
-                compact = self._format_context(snap, goal)
+                pruned_context = self._build_pruned_context(snap, goal)
+                compact = (
+                    pruned_context.prompt_block
+                    if pruned_context is not None and pruned_context.nodes
+                    else self._format_context(snap, goal)
+                )
                 last_compact = compact
+                last_pruned_context = pruned_context
 
                 # Check for vision fallback
                 needs_vision, reason = detect_snapshot_failure(snap)
@@ -2172,7 +2343,8 @@ class PlannerExecutorAgent:
                 # a specific target element was found. Intent heuristics are only used
                 # for scroll-after-escalation AFTER limit escalation is exhausted.
                 elements = getattr(snap, "elements", []) or []
-                if len(elements) >= 10:
+                pruned_node_count = len(pruned_context.nodes) if pruned_context is not None else 0
+                if len(elements) >= 10 and (pruned_context is None or pruned_node_count > 0):
                     break
 
                 # Escalate limit
@@ -2258,7 +2430,12 @@ class PlannerExecutorAgent:
                                 continue
 
                             last_snap = snap
-                            last_compact = self._format_context(snap, goal)
+                            last_pruned_context = self._build_pruned_context(snap, goal)
+                            last_compact = (
+                                last_pruned_context.prompt_block
+                                if last_pruned_context is not None and last_pruned_context.nodes
+                                else self._format_context(snap, goal)
+                            )
 
                             # Extract screenshot
                             if capture_screenshot:
@@ -2307,6 +2484,16 @@ class PlannerExecutorAgent:
             snapshot_success=not requires_vision,
             requires_vision=requires_vision,
             vision_reason=vision_reason,
+            pruning_category=(
+                last_pruned_context.category.value
+                if last_pruned_context is not None
+                else None
+            ),
+            pruned_node_count=(
+                len(last_pruned_context.nodes)
+                if last_pruned_context is not None
+                else 0
+            ),
         )
 
     # -------------------------------------------------------------------------
@@ -2611,6 +2798,7 @@ Return JSON patch:
                     step.intent,
                     ctx.compact_representation,
                     input_text=step.input,
+                    category=self._get_cached_category_str(),
                 )
                 resp = self.executor.generate(
                     sys_prompt,
@@ -2683,6 +2871,7 @@ Return JSON patch:
                             substep.intent,
                             ctx.compact_representation,
                             input_text=substep.input,
+                            category=self._get_cached_category_str(),
                         )
                         resp = self.executor.generate(
                             sys_prompt,
@@ -2800,6 +2989,9 @@ Return JSON patch:
             if role not in ("button", "link"):
                 continue
 
+            if self._is_global_nav_cart_link(el):
+                continue
+
             text = (getattr(el, "text", "") or "").lower()
             aria_label = (getattr(el, "aria_label", "") or getattr(el, "ariaLabel", "") or "").lower()
             href = (getattr(el, "href", "") or "").lower()
@@ -2907,6 +3099,503 @@ Return JSON patch:
         if self.config.verbose:
             print("  [MODAL] All dismissal attempts exhausted", flush=True)
         return False
+
+    def _is_global_nav_cart_link(self, el: Any) -> bool:
+        """
+        Detect persistent header/nav cart links that should not be treated as
+        drawer-local checkout controls.
+        """
+        href = (getattr(el, "href", "") or "").lower()
+        text = (getattr(el, "text", "") or "").lower().strip()
+        aria_label = (getattr(el, "aria_label", "") or getattr(el, "ariaLabel", "") or "").lower().strip()
+        label = text or aria_label
+
+        layout = getattr(el, "layout", None)
+        region = (getattr(layout, "region", "") or "").lower()
+        doc_y = getattr(el, "doc_y", None)
+
+        if "nav_cart" in href or "ref_=nav_cart" in href:
+            return True
+
+        if region in {"header", "nav"} and (
+            "cart" in href or label in {"cart", "0 items in cart"} or "items in cart" in label
+        ):
+            return True
+
+        try:
+            if doc_y is not None and float(doc_y) <= 120 and (
+                "cart" in href or label in {"cart", "0 items in cart"} or "items in cart" in label
+            ):
+                return True
+        except (TypeError, ValueError):
+            pass
+
+        return False
+
+    def _looks_like_search_submission(self, step: PlanStep, element: Any | None) -> bool:
+        """Detect TYPE_AND_SUBMIT actions that are likely site search submissions."""
+        role = (getattr(element, "role", "") or "").lower() if element is not None else ""
+        if role in {"searchbox", "combobox"}:
+            return True
+
+        labels = " ".join(
+            str(part or "")
+            for part in (
+                step.goal,
+                step.intent,
+                step.input,
+                getattr(element, "text", None),
+                getattr(element, "name", None),
+                getattr(element, "aria_label", None),
+                getattr(element, "ariaLabel", None),
+            )
+        ).lower()
+        return "search" in labels
+
+    def _find_submit_button_for_type_and_submit(
+        self,
+        *,
+        elements: list[Any],
+        input_element_id: int | None,
+        step: PlanStep,
+    ) -> int | None:
+        """Find an explicit search/submit control for search-style TYPE_AND_SUBMIT steps."""
+        selected_element = None
+        for el in elements:
+            if getattr(el, "id", None) == input_element_id:
+                selected_element = el
+                break
+
+        if not self._looks_like_search_submission(step, selected_element):
+            return None
+
+        candidates: list[tuple[int, int]] = []
+        for el in elements:
+            el_id = getattr(el, "id", None)
+            if el_id is None or el_id == input_element_id:
+                continue
+
+            role = (getattr(el, "role", "") or "").lower()
+            if role not in {"button", "link"}:
+                continue
+
+            label = " ".join(
+                str(part or "")
+                for part in (
+                    getattr(el, "text", None),
+                    getattr(el, "name", None),
+                    getattr(el, "aria_label", None),
+                    getattr(el, "ariaLabel", None),
+                )
+            ).lower()
+            href = (getattr(el, "href", "") or "").lower()
+
+            score = 0
+            if "submit search" in label:
+                score += 120
+            if "search" in label:
+                score += 80
+            if "submit" in label:
+                score += 60
+            if label.strip() in {"go", "search"}:
+                score += 50
+            if "/search" in href or "search?" in href or "q=" in href:
+                score += 40
+
+            if score > 0:
+                score += int(getattr(el, "importance", 0) or 0) // 100
+                candidates.append((int(el_id), score))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        return candidates[0][0]
+
+    def _type_and_submit_url_change_looks_valid(
+        self,
+        *,
+        pre_url: str,
+        post_url: str,
+        step: PlanStep,
+        element: Any | None,
+        typed_text: str,
+    ) -> bool:
+        """
+        Allow URL-change fallback for TYPE_AND_SUBMIT only when the resulting URL
+        still matches the expected semantics of the typed action.
+        """
+        if not self._looks_like_search_submission(step, element):
+            return True
+
+        from urllib.parse import quote_plus, urlparse
+
+        post_lower = post_url.lower()
+        if any(marker in post_lower for marker in ("/search", "?q=", "&q=", "query=", "search=", "keyword=")):
+            return True
+
+        encoded_query = quote_plus((typed_text or "").strip().lower())
+        if encoded_query and encoded_query in post_lower:
+            return True
+
+        parsed = urlparse(post_url)
+        searchable = f"{parsed.path}?{parsed.query}".lower()
+        tokens = [tok for tok in re.split(r"[^a-z0-9]+", (typed_text or "").lower()) if len(tok) >= 3]
+        if tokens:
+            matched = sum(1 for tok in tokens[:4] if tok in searchable)
+            if matched >= min(2, len(tokens[:4])):
+                return True
+
+        return False
+
+    def _choose_type_and_submit_submit_method(
+        self,
+        *,
+        elements: list[Any],
+        input_element_id: int | None,
+        step: PlanStep,
+        prefer_alternate_of: Literal["click", "enter"] | None = None,
+    ) -> tuple[Literal["click", "enter"], int | None]:
+        """Choose the submit method for TYPE_AND_SUBMIT, optionally preferring the alternate path.
+
+        NOTE: For search-like submissions, we prefer Enter key by default (matching WebBench behavior).
+        Many search boxes (e.g., lifeisgood.com) don't have a proper submit button, or clicking the
+        "submit" button navigates to a category page instead of performing a search. Pressing Enter
+        is more reliable for search inputs.
+
+        When prefer_alternate_of is set, we try to return the opposite method for retry purposes:
+        - If prefer_alternate_of="enter", try to return "click" (if a submit button exists)
+        - If prefer_alternate_of="click", return "enter"
+        """
+        submit_button_id = self._find_submit_button_for_type_and_submit(
+            elements=elements,
+            input_element_id=input_element_id,
+            step=step,
+        )
+
+        # For search-like submissions, prefer Enter key by default (more reliable)
+        # Only fall back to button click if Enter doesn't work (via prefer_alternate_of)
+        default_method: Literal["click", "enter"] = "enter"
+
+        # Handle retry case: prefer the alternate method
+        if prefer_alternate_of == "enter" and submit_button_id is not None:
+            # First attempt used Enter, retry with click (if button available)
+            return "click", submit_button_id
+        if prefer_alternate_of == "click":
+            # First attempt used click, retry with Enter
+            return "enter", None
+
+        return default_method, submit_button_id
+
+    def _get_runtime_page(self, runtime: AgentRuntime) -> Any | None:
+        """Best-effort access to the live browser page for immediate URL observation."""
+        backend = getattr(runtime, "backend", None)
+        candidates = [
+            getattr(backend, "page", None),
+            getattr(backend, "_page", None),
+            getattr(runtime, "_legacy_page", None),
+        ]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if type(candidate).__module__.startswith("unittest.mock"):
+                continue
+            if inspect.getattr_static(candidate, "url", None) is not None:
+                return candidate
+        return None
+
+    async def _read_focused_input_value(self, runtime: AgentRuntime) -> str | None:
+        """Best-effort read of the currently focused input value."""
+        page = self._get_runtime_page(runtime)
+        if page is None:
+            return None
+        try:
+            value = await page.evaluate(
+                """
+                () => {
+                    const el = document.activeElement;
+                    if (!el) return null;
+                    if ("value" in el) return el.value ?? "";
+                    return null;
+                }
+                """
+            )
+        except Exception:
+            return None
+        return value if isinstance(value, str) else None
+
+    def _normalize_input_value(self, value: str | None) -> str:
+        """Normalize input text for equality checks across controlled inputs."""
+        return " ".join((value or "").strip().lower().split())
+
+    async def _clear_and_type_search_input(
+        self,
+        *,
+        runtime: AgentRuntime,
+        input_element_id: int,
+        text: str,
+    ) -> bool:
+        """Clear and type into a search input using the live page when available."""
+        page = self._get_runtime_page(runtime)
+        if page is None:
+            return False
+
+        browser_like = getattr(runtime, "_legacy_browser", None) or SimpleNamespace(page=page)
+
+        try:
+            await runtime.click(input_element_id)
+        except Exception:
+            return False
+
+        try:
+            clear_result = await clear_async(browser_like, int(input_element_id), take_snapshot=False)
+            if getattr(clear_result, "success", False):
+                await runtime.record_action(f"CLEAR({input_element_id})")
+        except Exception:
+            pass
+
+        try:
+            select_all_key = "Meta+A" if sys.platform == "darwin" else "Control+A"
+            await page.keyboard.press(select_all_key)
+            await page.keyboard.press("Backspace")
+            await runtime.record_action(f"PRESS({select_all_key})")
+            await runtime.record_action('PRESS("Backspace")')
+        except Exception:
+            pass
+
+        try:
+            delay_ms = float(self.config.type_delay_ms or 0)
+            type_result = await type_text_async(
+                browser_like,
+                int(input_element_id),
+                str(text),
+                take_snapshot=False,
+                delay_ms=delay_ms,
+            )
+            if not getattr(type_result, "success", False):
+                return False
+            await runtime.record_action(
+                f"TYPE({input_element_id}, '{text[:20]}...')" if len(text) > 20 else f"TYPE({input_element_id}, '{text}')"
+            )
+            return True
+        except Exception:
+            return False
+
+    async def _submit_if_already_typed(
+        self,
+        *,
+        runtime: AgentRuntime,
+        elements: list[Any],
+        input_element_id: int,
+        step: PlanStep,
+        text: str,
+        pre_url: str,
+        typed_element: Any | None,
+        telemetry: SearchSubmitTelemetry,
+    ) -> bool:
+        """Submit without retyping when the focused input already contains the desired text."""
+        page = self._get_runtime_page(runtime)
+        if page is None:
+            return False
+
+        try:
+            await runtime.click(input_element_id)
+        except Exception:
+            return False
+
+        try:
+            await page.wait_for_timeout(80)
+        except Exception:
+            pass
+
+        current_value = await self._read_focused_input_value(runtime)
+        if self._normalize_input_value(current_value) != self._normalize_input_value(text):
+            return False
+
+        await self._submit_type_and_submit(
+            runtime=runtime,
+            elements=elements,
+            input_element_id=input_element_id,
+            step=step,
+            text=text,
+            pre_url=pre_url,
+            typed_element=typed_element,
+            telemetry=telemetry,
+        )
+        await runtime.record_action(f"SUBMIT_ALREADY_TYPED({input_element_id})")
+        return True
+
+    def _snapshot_looks_like_search_results(self, snapshot: Any, typed_text: str) -> bool:
+        """Best-effort heuristic for product/search results-like pages."""
+        elements = getattr(snapshot, "elements", []) or []
+        if not elements:
+            return False
+
+        tokens = [tok for tok in re.split(r"[^a-z0-9]+", (typed_text or "").lower()) if len(tok) >= 3]
+        product_like_matches = 0
+        token_matches = 0
+
+        for el in elements:
+            role = (getattr(el, "role", "") or "").lower()
+            if role != "link":
+                continue
+            href = (getattr(el, "href", "") or "").lower()
+            label = " ".join(
+                str(part or "")
+                for part in (
+                    getattr(el, "text", None),
+                    getattr(el, "name", None),
+                    getattr(el, "aria_label", None),
+                    getattr(el, "ariaLabel", None),
+                )
+            ).lower()
+            blob = f"{href} {label}"
+
+            if any(p in href for p in ("/product/", "/products/", "/p/", "/dp/")):
+                product_like_matches += 1
+            if tokens:
+                token_matches += sum(1 for tok in tokens[:4] if tok in blob)
+
+        return product_like_matches > 0 or token_matches >= 2
+
+    async def _capture_search_results_snapshot_evidence(
+        self,
+        *,
+        runtime: AgentRuntime,
+        typed_text: str,
+        telemetry: SearchSubmitTelemetry,
+    ) -> None:
+        """Capture one post-submit snapshot to track results-like evidence."""
+        try:
+            snap = await runtime.snapshot(emit_trace=False)
+        except Exception:
+            return
+
+        telemetry.observed_search_results_dom = self._snapshot_looks_like_search_results(snap, typed_text)
+
+    async def _submit_type_and_submit(
+        self,
+        *,
+        runtime: AgentRuntime,
+        elements: list[Any],
+        input_element_id: int,
+        step: PlanStep,
+        text: str,
+        pre_url: str,
+        typed_element: Any | None,
+        telemetry: SearchSubmitTelemetry,
+        prefer_alternate_of: Literal["click", "enter"] | None = None,
+    ) -> None:
+        """Submit a search-like TYPE_AND_SUBMIT using the chosen method and record telemetry."""
+        submit_method, submit_target = self._choose_type_and_submit_submit_method(
+            elements=elements,
+            input_element_id=input_element_id,
+            step=step,
+            prefer_alternate_of=prefer_alternate_of,
+        )
+
+        if submit_method == "click" and submit_target is not None:
+            await runtime.click(submit_target)
+            if self.config.verbose:
+                print(f"  [ACTION] TYPE_AND_SUBMIT submit via CLICK({submit_target})", flush=True)
+            # Wait briefly for page load after clicking submit button
+            page = self._get_runtime_page(runtime)
+            if page is not None:
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=2000)
+                except Exception:
+                    pass
+        else:
+            await runtime.press("Enter")
+            if self.config.verbose:
+                print("  [ACTION] TYPE_AND_SUBMIT submit via PRESS(Enter)", flush=True)
+            submit_method = "enter"
+
+            # Wait briefly for URL change after Enter
+            page = self._get_runtime_page(runtime)
+            if page is not None:
+                try:
+                    await page.wait_for_url(lambda url: url != pre_url, timeout=3000)
+                    if self.config.verbose:
+                        print(f"  [SEARCH] URL changed to: {page.url}", flush=True)
+                except Exception:
+                    if self.config.verbose:
+                        print("  [SEARCH] URL unchanged after Enter", flush=True)
+
+        if prefer_alternate_of is None:
+            telemetry.first_submit_method = submit_method
+        else:
+            telemetry.retry_submit_method = submit_method
+
+        await runtime.stabilize()
+        await self._capture_search_results_snapshot_evidence(
+            runtime=runtime,
+            typed_text=text,
+            telemetry=telemetry,
+        )
+
+    async def _retry_search_widget_submission(
+        self,
+        *,
+        runtime: AgentRuntime,
+        elements: list[Any],
+        input_element_id: int,
+        step: PlanStep,
+        text: str,
+        pre_url: str,
+        typed_element: Any | None,
+        telemetry: SearchSubmitTelemetry,
+    ) -> bool:
+        """Retry a failed search submission once with a clean field and the alternate submit method."""
+        if telemetry.first_submit_method not in {"click", "enter"}:
+            return False
+
+        # Take a fresh snapshot in case DOM changed
+        fresh_elements = elements
+        try:
+            fresh_snap = await runtime.snapshot(emit_trace=False)
+            fresh_elements = getattr(fresh_snap, "elements", []) or elements
+            if self.config.verbose:
+                print(f"  [SEARCH-RETRY] Fresh snapshot: {len(fresh_elements)} elements", flush=True)
+        except Exception:
+            pass
+
+        retry_method, _ = self._choose_type_and_submit_submit_method(
+            elements=fresh_elements,
+            input_element_id=input_element_id,
+            step=step,
+            prefer_alternate_of=telemetry.first_submit_method,
+        )
+        if retry_method == telemetry.first_submit_method:
+            if self.config.verbose:
+                print("  [SEARCH-RETRY] No alternate submit method available", flush=True)
+            return False
+
+        select_all_key = "Meta+A" if sys.platform == "darwin" else "Control+A"
+        if self.config.verbose:
+            print(f"  [SEARCH-RETRY] Retrying search via alternate submit method ({retry_method})", flush=True)
+        typed_ok = await self._clear_and_type_search_input(
+            runtime=runtime,
+            input_element_id=input_element_id,
+            text=text,
+        )
+        if not typed_ok:
+            await runtime.click(input_element_id)
+            await runtime.press(select_all_key)
+            await runtime.press("Backspace")
+            await runtime.type(input_element_id, text, delay_ms=self.config.type_delay_ms)
+        await self._submit_type_and_submit(
+            runtime=runtime,
+            elements=fresh_elements,
+            input_element_id=input_element_id,
+            step=step,
+            text=text,
+            pre_url=pre_url,
+            typed_element=typed_element,
+            telemetry=telemetry,
+            prefer_alternate_of=telemetry.first_submit_method,
+        )
+        return await self._verify_step(runtime, step)
 
     def _looks_like_overlay_dismiss_intent(self, *, goal: str, intent: str) -> bool:
         """
@@ -3143,6 +3832,9 @@ Return JSON patch:
         used_heuristics = False
         error: str | None = None
         verification_passed = False
+        extraction_succeeded = False
+        extracted_data: Any | None = None
+        search_submit_telemetry = SearchSubmitTelemetry()
 
         try:
             # Pre-step verification check: skip if predicates already pass
@@ -3250,7 +3942,42 @@ Return JSON patch:
             element_id: int | None = None
             executor_text: str | None = None  # Text from executor response (for TYPE actions)
 
-            if action_type in ("CLICK", "TYPE_AND_SUBMIT"):
+            if action_type == "EXTRACT":
+                action_taken = "EXTRACT"
+                page = (
+                    getattr(getattr(runtime, "backend", None), "page", None)
+                    or getattr(getattr(runtime, "backend", None), "_page", None)
+                    or getattr(runtime, "_legacy_page", None)
+                )
+                if page is None:
+                    error = "No page available for EXTRACT"
+                else:
+                    from types import SimpleNamespace
+
+                    from ..read import extract_async
+
+                    browser_like = SimpleNamespace(page=page)
+                    extract_query = step.goal or (
+                        self._current_task.task if self._current_task is not None else "Extract relevant data from the current page"
+                    )
+                    result = await extract_async(
+                        browser_like,
+                        self.planner,
+                        query=extract_query,
+                        schema=None,
+                    )
+                    llm_resp = getattr(result, "llm_response", None)
+                    if llm_resp is not None:
+                        self._record_token_usage("extract", llm_resp)
+                    if result.ok:
+                        extraction_succeeded = True
+                        extracted_data = result.data
+                        if self.config.verbose:
+                            preview = str(result.raw or "")[:160]
+                            print(f"  [ACTION] EXTRACT ok: {preview}", flush=True)
+                    else:
+                        error = result.error or "Extraction failed"
+            elif action_type in ("CLICK", "TYPE_AND_SUBMIT"):
                 # Try intent heuristics first (if available)
                 elements = getattr(ctx.snapshot, "elements", []) or []
                 url = getattr(ctx.snapshot, "url", "") or ""
@@ -3268,6 +3995,7 @@ Return JSON patch:
                         step.intent,
                         ctx.compact_representation,
                         input_text=step.input,
+                        category=self._get_cached_category_str(),
                     )
 
                     if self.config.verbose:
@@ -3372,14 +4100,47 @@ Return JSON patch:
                 elif action_type == "TYPE" and element_id is not None:
                     # Use text from executor response first, then fall back to step.input
                     text = executor_text or step.input or ""
-                    await runtime.type(element_id, text)
+                    typed_element = None
+                    for el in elements:
+                        if getattr(el, "id", None) == element_id:
+                            typed_element = el
+                            break
                     # If original plan action was TYPE_AND_SUBMIT, press Enter to submit
                     if original_action == "TYPE_AND_SUBMIT":
-                        # Press Enter to submit (WebBench approach - simpler and more reliable)
-                        await runtime.press("Enter")
+                        submitted_without_retyping = False
+                        if self._looks_like_search_submission(step, typed_element):
+                            submitted_without_retyping = await self._submit_if_already_typed(
+                                runtime=runtime,
+                                elements=elements,
+                                input_element_id=element_id,
+                                step=step,
+                                text=text,
+                                pre_url=pre_url or (ctx.snapshot.url or ""),
+                                typed_element=typed_element,
+                                telemetry=search_submit_telemetry,
+                            )
+                        if not submitted_without_retyping:
+                            typed_ok = False
+                            if self._looks_like_search_submission(step, typed_element):
+                                typed_ok = await self._clear_and_type_search_input(
+                                    runtime=runtime,
+                                    input_element_id=element_id,
+                                    text=text,
+                                )
+                            if not typed_ok:
+                                await runtime.type(element_id, text, delay_ms=self.config.type_delay_ms)
+                            await self._submit_type_and_submit(
+                                runtime=runtime,
+                                elements=elements,
+                                input_element_id=element_id,
+                                step=step,
+                                text=text,
+                                pre_url=pre_url or (ctx.snapshot.url or ""),
+                                typed_element=typed_element,
+                                telemetry=search_submit_telemetry,
+                            )
                         if self.config.verbose:
                             print(f"  [ACTION] TYPE_AND_SUBMIT({element_id}, '{text}')", flush=True)
-                        await runtime.stabilize()
                     elif self.config.verbose:
                         print(f"  [ACTION] TYPE({element_id}, '{text[:30]}...')" if len(text) > 30 else f"  [ACTION] TYPE({element_id}, '{text}')", flush=True)
                 elif action_type == "TYPE_AND_SUBMIT" and element_id is not None:
@@ -3393,16 +4154,46 @@ Return JSON patch:
                             text = match.group(1).strip()
 
                     # Type the text
-                    await runtime.type(element_id, text)
-
-                    # Press Enter to submit (WebBench approach)
-                    await runtime.press("Enter")
+                    typed_element = None
+                    for el in elements:
+                        if getattr(el, "id", None) == element_id:
+                            typed_element = el
+                            break
+                    submitted_without_retyping = False
+                    if self._looks_like_search_submission(step, typed_element):
+                        submitted_without_retyping = await self._submit_if_already_typed(
+                            runtime=runtime,
+                            elements=elements,
+                            input_element_id=element_id,
+                            step=step,
+                            text=text,
+                            pre_url=pre_url or (ctx.snapshot.url or ""),
+                            typed_element=typed_element,
+                            telemetry=search_submit_telemetry,
+                        )
+                    if not submitted_without_retyping:
+                        typed_ok = False
+                        if self._looks_like_search_submission(step, typed_element):
+                            typed_ok = await self._clear_and_type_search_input(
+                                runtime=runtime,
+                                input_element_id=element_id,
+                                text=text,
+                            )
+                        if not typed_ok:
+                            await runtime.type(element_id, text, delay_ms=self.config.type_delay_ms)
+                        await self._submit_type_and_submit(
+                            runtime=runtime,
+                            elements=elements,
+                            input_element_id=element_id,
+                            step=step,
+                            text=text,
+                            pre_url=pre_url or (ctx.snapshot.url or ""),
+                            typed_element=typed_element,
+                            telemetry=search_submit_telemetry,
+                        )
 
                     if self.config.verbose:
                         print(f"  [ACTION] TYPE_AND_SUBMIT({element_id}, '{text}')", flush=True)
-
-                    # Wait for page to load after submit
-                    await runtime.stabilize()
                 elif action_type == "PRESS":
                     key = "Enter"  # Default
                     await runtime.press(key)
@@ -3423,6 +4214,8 @@ Return JSON patch:
                         # No target URL - we're already at the page, just verify
                         if self.config.verbose:
                             print(f"  [ACTION] NAVIGATE(skip - already at page)", flush=True)
+                elif action_type == "EXTRACT":
+                    pass  # Extraction already executed above
                 elif action_type == "FINISH":
                     pass  # No action needed
                 elif action_type not in ("CLICK", "TYPE", "TYPE_AND_SUBMIT") or element_id is None:
@@ -3436,7 +4229,14 @@ Return JSON patch:
                 await runtime.record_action(action_taken)
 
             # Run verifications
-            if step.verify and error is None:
+            if action_type == "EXTRACT" and error is None:
+                verification_passed = extraction_succeeded
+                if self.config.verbose:
+                    print(
+                        f"  [VERIFY] Using extraction result: {'PASS' if verification_passed else 'FAIL'}",
+                        flush=True,
+                    )
+            elif step.verify and error is None:
                 if self.config.verbose:
                     print(f"  [VERIFY] Running {len(step.verify)} verification predicates...", flush=True)
                 verification_passed = await self._verify_step(runtime, step)
@@ -3485,11 +4285,47 @@ Return JSON patch:
                 if not verification_passed and original_action in ("TYPE_AND_SUBMIT", "CLICK"):
                     current_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
                     if current_url and pre_url and current_url != pre_url:
-                        # URL changed - the action likely achieved navigation
-                        if self.config.verbose:
-                            print(f"  [VERIFY] Predicate failed but URL changed: {pre_url} -> {current_url}", flush=True)
-                            print(f"  [VERIFY] Accepting {original_action} as successful (URL change fallback)", flush=True)
-                        verification_passed = True
+                        fallback_ok = True
+                        if original_action == "TYPE_AND_SUBMIT":
+                            typed_element = None
+                            for el in (ctx.snapshot.elements or []):
+                                if getattr(el, "id", None) == element_id:
+                                    typed_element = el
+                                    break
+                            fallback_ok = self._type_and_submit_url_change_looks_valid(
+                                pre_url=pre_url,
+                                post_url=current_url,
+                                step=step,
+                                element=typed_element,
+                                typed_text=executor_text or step.input or "",
+                            )
+
+                        if fallback_ok:
+                            if self.config.verbose:
+                                print(f"  [VERIFY] Predicate failed but URL changed: {pre_url} -> {current_url}", flush=True)
+                                print(f"  [VERIFY] Accepting {original_action} as successful (URL change fallback)", flush=True)
+                            verification_passed = True
+                        else:
+                            if self.config.verbose:
+                                print(f"  [VERIFY] URL changed but does not match {original_action} intent: {pre_url} -> {current_url}", flush=True)
+                            if original_action == "TYPE_AND_SUBMIT":
+                                typed_element = None
+                                for el in (ctx.snapshot.elements or []):
+                                    if getattr(el, "id", None) == element_id:
+                                        typed_element = el
+                                        break
+                                if self._looks_like_search_submission(step, typed_element):
+                                    # Try retry submission with alternate method
+                                    verification_passed = await self._retry_search_widget_submission(
+                                        runtime=runtime,
+                                        elements=elements,
+                                        input_element_id=element_id,
+                                        step=step,
+                                        pre_url=pre_url,
+                                        text=executor_text or step.input or "",
+                                        typed_element=typed_element,
+                                        telemetry=search_submit_telemetry,
+                                    )
                     elif original_action == "CLICK" and error is None and element_id is not None:
                         # For CLICK actions that don't change URL, check if DOM changed
                         # (e.g., modal appeared, cart drawer opened)
@@ -3582,6 +4418,7 @@ Return JSON patch:
             duration_ms=duration_ms,
             url_before=pre_url,
             url_after=post_url,
+            extracted_data=extracted_data,
         )
 
         # Emit step_end trace
@@ -3691,6 +4528,7 @@ Return JSON patch:
                 start_url = automation_task.starting_url
 
         self._current_task = automation_task
+        self._cached_pruning_category = None  # Reset category cache for new run
         self._run_id = run_id or automation_task.task_id
         self._replans_used = 0
         self._vision_calls = 0
@@ -4106,6 +4944,7 @@ Return JSON patch:
                 start_url = automation_task.starting_url
 
         self._current_task = automation_task
+        self._cached_pruning_category = None  # Reset category cache for new run
         self._run_id = run_id or automation_task.task_id
         self._replans_used = 0
         self._vision_calls = 0

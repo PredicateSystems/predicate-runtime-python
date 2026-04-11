@@ -398,19 +398,23 @@ class AgentRuntime:
 
         await self.record_action(f"CLICK({element_id})")
 
-    async def type(self, element_id: int, text: str) -> None:
+    async def type(self, element_id: int, text: str, *, delay_ms: float | None = None) -> None:
         """
         Type text into an element.
 
         Args:
             element_id: Element ID from snapshot
             text: Text to type
+            delay_ms: Optional delay between keystrokes in milliseconds
         """
         # First click to focus
         await self.click(element_id)
 
         # Then type
-        await self.backend.type_text(text)
+        if delay_ms is None:
+            await self.backend.type_text(text)
+        else:
+            await self.backend.type_text(text, delay_ms=delay_ms)
         await self.record_action(f"TYPE({element_id}, '{text[:20]}...')" if len(text) > 20 else f"TYPE({element_id}, '{text}')")
 
     async def press(self, key: str) -> None:

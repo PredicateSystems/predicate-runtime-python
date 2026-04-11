@@ -119,6 +119,15 @@ from .models import (  # Agent Layer Models
 from .ordinal import OrdinalIntent, boost_ordinal_elements, detect_ordinal_intent, select_by_ordinal
 from .overlay import clear_overlay, show_overlay
 from .permissions import PermissionPolicy
+from .pruning import (
+    CategoryDetectionResult,
+    PrunedSnapshotContext,
+    PruningTaskCategory,
+    SkeletonDomNode,
+    classify_task_category,
+    prune_snapshot_for_task,
+    serialize_pruned_snapshot,
+)
 from .query import find, query
 from .read import extract, extract_async, read, read_best_effort
 from .recorder import Recorder, Trace, TraceStep, record
@@ -313,6 +322,13 @@ __all__ = [
     "save_storage_state",
     # Formatting (v0.12.0+)
     "format_snapshot_for_llm",
+    "CategoryDetectionResult",
+    "PrunedSnapshotContext",
+    "PruningTaskCategory",
+    "SkeletonDomNode",
+    "classify_task_category",
+    "prune_snapshot_for_task",
+    "serialize_pruned_snapshot",
     # Agent Config (v0.12.0+)
     "AgentConfig",
     # Enums
