@@ -1391,6 +1391,8 @@ class TestExtractActionSupport:
         runtime.record_action = AsyncMock()
         runtime.goto = AsyncMock()
         runtime.stabilize = AsyncMock()
+        # Mock read_markdown for text extraction tasks (used when keywords like "title" are detected)
+        runtime.read_markdown = AsyncMock(return_value="# Story 1\n## Story 2\n## Story 3")
 
         ctx = SnapshotContext(
             snapshot=MockSnapshot([MockElement(1, "link", "Story 1")], url="https://news.ycombinator.com/"),
@@ -1399,19 +1401,17 @@ class TestExtractActionSupport:
             captured_at=datetime.now(),
             limit_used=60,
         )
+        # Use a goal with "title" keyword to trigger markdown extraction path
         step = PlanStep(id=1, goal="Identify the top 5 story titles", action="EXTRACT", verify=[])
 
         with patch.object(agent, "_snapshot_with_escalation", AsyncMock(return_value=ctx)):
-            with patch(
-                "predicate.read.extract_async",
-                new=AsyncMock(return_value=SimpleNamespace(ok=True, data={"text": '["Story 1"]'}, raw='["Story 1"]')),
-            ) as mock_extract:
-                outcome = await agent._execute_step(step, runtime, step_index=0)
+            outcome = await agent._execute_step(step, runtime, step_index=0)
 
         assert outcome.status == StepStatus.SUCCESS
         assert outcome.verification_passed is True
         assert outcome.action_taken == "EXTRACT"
-        mock_extract.assert_awaited_once()
+        # Verify read_markdown was called for text extraction task
+        runtime.read_markdown.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_extract_step_succeeds_even_if_planner_verify_is_brittle(self) -> None:
@@ -1433,6 +1433,8 @@ class TestExtractActionSupport:
         runtime.get_url = AsyncMock(return_value="https://news.ycombinator.com/")
         runtime.record_action = AsyncMock()
         runtime.stabilize = AsyncMock()
+        # Mock read_markdown for text extraction tasks
+        runtime.read_markdown = AsyncMock(return_value="# Story 1\n## Story 2\n## Story 3")
 
         ctx = SnapshotContext(
             snapshot=MockSnapshot([MockElement(1, "link", "Story 1")], url="https://news.ycombinator.com/"),
@@ -1441,6 +1443,7 @@ class TestExtractActionSupport:
             captured_at=datetime.now(),
             limit_used=60,
         )
+        # Goal contains "title" keyword, which triggers markdown extraction
         step = PlanStep(
             id=1,
             goal="Identify the top 5 story titles",
@@ -1449,15 +1452,169 @@ class TestExtractActionSupport:
         )
 
         with patch.object(agent, "_snapshot_with_escalation", AsyncMock(return_value=ctx)):
-            with patch(
-                "predicate.read.extract_async",
-                new=AsyncMock(return_value=SimpleNamespace(ok=True, data={"text": '["Story 1"]'}, raw='["Story 1"]')),
-            ):
-                with patch.object(agent, "_verify_step", AsyncMock(return_value=False)):
-                    outcome = await agent._execute_step(step, runtime, step_index=0)
+            with patch.object(agent, "_verify_step", AsyncMock(return_value=False)):
+                outcome = await agent._execute_step(step, runtime, step_index=0)
 
         assert outcome.status == StepStatus.SUCCESS
         assert outcome.verification_passed is True
+
+
+class TestMarkdownExtraction:
+    """Tests for markdown-based text extraction optimization."""
+
+    @pytest.mark.asyncio
+    async def test_text_extraction_uses_read_markdown_then_llm(self) -> None:
+        """EXTRACT with text extraction keywords should use read_markdown() + executor LLM."""
+        from datetime import datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext, StepStatus
+        from predicate.llm_provider import LLMResponse
+
+        # Create executor that returns extracted text
+        executor = MagicMock()
+        executor.generate = MagicMock(
+            return_value=LLMResponse(
+                content="Story Title Two",
+                prompt_tokens=100,
+                completion_tokens=10,
+                total_tokens=110,
+                model_name="test-model",
+            )
+        )
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=executor,
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.backend = SimpleNamespace(page=object())
+        runtime.get_url = AsyncMock(return_value="https://news.ycombinator.com/")
+        runtime.record_action = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        # Mock read_markdown to return page content
+        markdown_content = "# Hacker News\n\n1. Story Title One\n2. Story Title Two\n3. Story Title Three"
+        runtime.read_markdown = AsyncMock(return_value=markdown_content)
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot([MockElement(1, "link", "Story 1")], url="https://news.ycombinator.com/"),
+            compact_representation="Category: extraction\nURL: https://news.ycombinator.com/\nNodes:",
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        # Goal contains "extract" and "title" keywords - should trigger markdown extraction
+        step = PlanStep(id=1, goal="Extract the title of the second post", action="EXTRACT", verify=[])
+
+        with patch.object(agent, "_snapshot_with_escalation", AsyncMock(return_value=ctx)):
+            outcome = await agent._execute_step(step, runtime, step_index=0)
+
+        assert outcome.status == StepStatus.SUCCESS
+        assert outcome.verification_passed is True
+        assert outcome.action_taken == "EXTRACT"
+        # Verify read_markdown was called first
+        runtime.read_markdown.assert_awaited_once_with(max_chars=8000)
+        # Verify executor LLM was called to extract specific text from markdown
+        executor.generate.assert_called_once()
+        # Check that the markdown content was passed to the executor
+        call_args = executor.generate.call_args
+        assert markdown_content in call_args[0][1]  # markdown in user prompt
+        assert "Extract the title of the second post" in call_args[0][1]  # query in prompt
+
+    @pytest.mark.asyncio
+    async def test_complex_extraction_uses_llm(self) -> None:
+        """EXTRACT without text extraction keywords should use LLM-based extraction."""
+        from datetime import datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent, SnapshotContext, StepStatus
+
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=PlannerExecutorConfig(),
+        )
+
+        runtime = MagicMock()
+        runtime.backend = SimpleNamespace(page=object())
+        runtime.get_url = AsyncMock(return_value="https://news.ycombinator.com/")
+        runtime.record_action = AsyncMock()
+        runtime.stabilize = AsyncMock()
+        runtime.read_markdown = AsyncMock(return_value="# Page Content")
+
+        ctx = SnapshotContext(
+            snapshot=MockSnapshot([MockElement(1, "link", "Story 1")], url="https://news.ycombinator.com/"),
+            compact_representation="Category: extraction\nURL: https://news.ycombinator.com/\nNodes:",
+            screenshot_base64=None,
+            captured_at=datetime.now(),
+            limit_used=60,
+        )
+        # Goal without extraction keywords - should use LLM extraction
+        step = PlanStep(id=1, goal="Analyze sentiment patterns from visible HTML", action="EXTRACT", verify=[])
+
+        extract_result = SimpleNamespace(ok=True, data={"sentiment": "positive"}, raw='{"sentiment": "positive"}')
+
+        with patch.object(agent, "_snapshot_with_escalation", AsyncMock(return_value=ctx)):
+            with patch("predicate.read.extract_async", new=AsyncMock(return_value=extract_result)) as mock_extract:
+                outcome = await agent._execute_step(step, runtime, step_index=0)
+
+        assert outcome.status == StepStatus.SUCCESS
+        # Verify LLM-based extraction was used, not read_markdown
+        mock_extract.assert_awaited_once()
+        runtime.read_markdown.assert_not_awaited()
+
+
+class TestTextExtractionKeywords:
+    """Tests for the _is_text_extraction_task helper function."""
+
+    def test_extraction_keywords_match(self) -> None:
+        """Keywords like extract, read, parse should trigger markdown extraction."""
+        from predicate.agents.planner_executor_agent import _is_text_extraction_task
+
+        assert _is_text_extraction_task("Extract the title from the page") is True
+        assert _is_text_extraction_task("Read the article content") is True
+        assert _is_text_extraction_task("Parse the product names") is True
+        assert _is_text_extraction_task("Get the price of this item") is True
+        assert _is_text_extraction_task("What is the headline?") is True
+
+    def test_question_keywords_match(self) -> None:
+        """Question words like 'what is' should trigger markdown extraction."""
+        from predicate.agents.planner_executor_agent import _is_text_extraction_task
+
+        assert _is_text_extraction_task("What is the title of the page?") is True
+        assert _is_text_extraction_task("What are the prices listed?") is True
+        assert _is_text_extraction_task("Show me the description") is True
+        assert _is_text_extraction_task("Tell me the author name") is True
+
+    def test_plural_keywords_match(self) -> None:
+        """Plural forms of keywords should also match."""
+        from predicate.agents.planner_executor_agent import _is_text_extraction_task
+
+        assert _is_text_extraction_task("Get all the titles") is True
+        assert _is_text_extraction_task("List the prices") is True
+        assert _is_text_extraction_task("Find the headlines") is True
+        assert _is_text_extraction_task("Extract the items") is True
+
+    def test_non_extraction_tasks_dont_match(self) -> None:
+        """Tasks without extraction keywords should not match."""
+        from predicate.agents.planner_executor_agent import _is_text_extraction_task
+
+        assert _is_text_extraction_task("Analyze sentiment patterns") is False
+        assert _is_text_extraction_task("Identify HTML structure") is False
+        assert _is_text_extraction_task("Determine page complexity") is False
+
+    def test_word_boundary_prevents_false_positives(self) -> None:
+        """Keywords embedded in other words should not match."""
+        from predicate.agents.planner_executor_agent import _is_text_extraction_task
+
+        # "time" is a keyword but should not match inside "sentiment"
+        assert _is_text_extraction_task("Analyze sentiment") is False
+        # "get" is a keyword but should not match inside "together"
+        assert _is_text_extraction_task("Put together a report") is False
 
 
 class TestExtractTokenAccounting:
@@ -1465,7 +1622,7 @@ class TestExtractTokenAccounting:
 
     @pytest.mark.asyncio
     async def test_extract_step_records_token_usage(self) -> None:
-        """EXTRACT steps should contribute to agent token stats."""
+        """EXTRACT steps should contribute to agent token stats (for LLM-based extraction)."""
         from datetime import datetime
         from types import SimpleNamespace
         from unittest.mock import AsyncMock, MagicMock, patch
@@ -1492,7 +1649,9 @@ class TestExtractTokenAccounting:
             captured_at=datetime.now(),
             limit_used=60,
         )
-        step = PlanStep(id=1, goal="Identify the top 5 story titles", action="EXTRACT", verify=[])
+        # Use a goal without common extraction keywords to trigger LLM-based extraction
+        # (Avoids keywords like extract, read, parse, title, content, text, etc.)
+        step = PlanStep(id=1, goal="Identify sentiment patterns from visible HTML", action="EXTRACT", verify=[])
 
         extract_result = SimpleNamespace(
             ok=True,

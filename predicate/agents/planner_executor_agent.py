@@ -966,6 +966,112 @@ def build_predicate(spec: PredicateSpec | dict[str, Any]) -> Predicate:
 
 
 # ---------------------------------------------------------------------------
+# Extraction Keywords for Markdown-based Text Extraction
+# ---------------------------------------------------------------------------
+
+# Keywords that indicate a simple text extraction task suitable for read_markdown()
+# These tasks don't need LLM-based extraction - just return the page content as markdown
+TEXT_EXTRACTION_KEYWORDS = frozenset([
+    # Direct extraction verbs
+    "extract",
+    "read",
+    "parse",
+    "scrape",
+    "get",
+    "fetch",
+    "retrieve",
+    "capture",
+    "grab",
+    "copy",
+    "pull",
+    # Question words that indicate reading content
+    "what is",
+    "what are",
+    "what's",
+    "show me",
+    "tell me",
+    "find",
+    "list",
+    "display",
+    # Content-specific patterns
+    "title",
+    "headline",
+    "heading",
+    "text",
+    "content",
+    "body",
+    "paragraph",
+    "article",
+    "post",
+    "message",
+    "description",
+    "summary",
+    "excerpt",
+    # Data extraction patterns
+    "price",
+    "cost",
+    "amount",
+    "name",
+    "label",
+    "value",
+    "number",
+    "date",
+    "time",
+    "address",
+    "email",
+    "phone",
+    "rating",
+    "review",
+    "comment",
+    "author",
+    "username",
+    # Table/list extraction
+    "table",
+    "row",
+    "column",
+    "item",
+    "entry",
+    "record",
+])
+
+
+def _is_text_extraction_task(task: str) -> bool:
+    """
+    Determine if a task is a simple text extraction that can use read_markdown().
+
+    Returns True if the task contains keywords indicating text extraction,
+    where returning the page markdown is sufficient without LLM-based extraction.
+
+    Args:
+        task: The task description to analyze
+
+    Returns:
+        True if this is a text extraction task suitable for read_markdown()
+    """
+    if not task:
+        return False
+
+    task_lower = task.lower()
+
+    # Check for extraction keyword patterns using word boundary matching
+    # to avoid false positives (e.g., "time" in "sentiment")
+    for keyword in TEXT_EXTRACTION_KEYWORDS:
+        # Multi-word keywords (like "what is") use substring matching
+        if " " in keyword:
+            if keyword in task_lower:
+                return True
+        else:
+            # Single-word keywords use word boundary matching via regex
+            # Match keyword at word boundaries, allowing for plurals (optional 's' or 'es')
+            # e.g., "title" matches "title", "titles", "title's"
+            pattern = rf"\b{re.escape(keyword)}(s|es)?\b"
+            if re.search(pattern, task_lower):
+                return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Plan Normalization and Validation
 # ---------------------------------------------------------------------------
 
@@ -4178,39 +4284,89 @@ Return JSON patch:"""
 
             if action_type == "EXTRACT":
                 action_taken = "EXTRACT"
-                page = (
-                    getattr(getattr(runtime, "backend", None), "page", None)
-                    or getattr(getattr(runtime, "backend", None), "_page", None)
-                    or getattr(runtime, "_legacy_page", None)
+                # Determine extraction query from step goal or task
+                extract_query = step.goal or (
+                    self._current_task.task if self._current_task is not None else "Extract relevant data from the current page"
                 )
-                if page is None:
-                    error = "No page available for EXTRACT"
-                else:
-                    from types import SimpleNamespace
 
-                    from ..read import extract_async
+                # Check if this is a text extraction task that can use markdown-based extraction
+                use_markdown_extraction = _is_text_extraction_task(extract_query)
 
-                    browser_like = SimpleNamespace(page=page)
-                    extract_query = step.goal or (
-                        self._current_task.task if self._current_task is not None else "Extract relevant data from the current page"
-                    )
-                    result = await extract_async(
-                        browser_like,
-                        self.planner,
-                        query=extract_query,
-                        schema=None,
-                    )
-                    llm_resp = getattr(result, "llm_response", None)
-                    if llm_resp is not None:
-                        self._record_token_usage("extract", llm_resp)
-                    if result.ok:
-                        extraction_succeeded = True
-                        extracted_data = result.data
+                if use_markdown_extraction:
+                    # Step 1: Get page content as markdown (faster than snapshot-based extraction)
+                    markdown_content = await runtime.read_markdown(max_chars=8000)
+                    if markdown_content:
                         if self.config.verbose:
-                            preview = str(result.raw or "")[:160]
-                            print(f"  [ACTION] EXTRACT ok: {preview}", flush=True)
+                            preview = markdown_content[:160].replace("\n", " ")
+                            print(f"  [ACTION] EXTRACT - got markdown: {preview}...", flush=True)
+
+                        # Step 2: Use LLM (executor) to extract specific data from markdown
+                        extraction_prompt = f"""You are a text extraction assistant. Given the page content in markdown format, extract the specific information requested.
+
+PAGE CONTENT (MARKDOWN):
+{markdown_content}
+
+EXTRACTION REQUEST:
+{extract_query}
+
+INSTRUCTIONS:
+1. Read the markdown content carefully
+2. Find and extract ONLY the specific information requested
+3. Return ONLY the extracted text, nothing else
+4. If the information is not found, return "NOT_FOUND"
+
+EXTRACTED TEXT:"""
+
+                        resp = self.executor.generate(
+                            "You extract specific text from markdown content. Return only the extracted text.",
+                            extraction_prompt,
+                            temperature=0.0,
+                            max_new_tokens=500,
+                        )
+                        self._record_token_usage("extract", resp)
+
+                        extracted_text = resp.content.strip()
+                        if extracted_text and extracted_text != "NOT_FOUND":
+                            extraction_succeeded = True
+                            extracted_data = {"text": extracted_text, "query": extract_query}
+                            if self.config.verbose:
+                                print(f"  [ACTION] EXTRACT ok: {extracted_text[:160]}", flush=True)
+                        else:
+                            error = f"Could not find requested data: {extract_query}"
                     else:
-                        error = result.error or "Extraction failed"
+                        error = "Failed to extract markdown from page"
+                else:
+                    # Use LLM-based extraction for complex extraction tasks
+                    page = (
+                        getattr(getattr(runtime, "backend", None), "page", None)
+                        or getattr(getattr(runtime, "backend", None), "_page", None)
+                        or getattr(runtime, "_legacy_page", None)
+                    )
+                    if page is None:
+                        error = "No page available for EXTRACT"
+                    else:
+                        from types import SimpleNamespace
+
+                        from ..read import extract_async
+
+                        browser_like = SimpleNamespace(page=page)
+                        result = await extract_async(
+                            browser_like,
+                            self.planner,
+                            query=extract_query,
+                            schema=None,
+                        )
+                        llm_resp = getattr(result, "llm_response", None)
+                        if llm_resp is not None:
+                            self._record_token_usage("extract", llm_resp)
+                        if result.ok:
+                            extraction_succeeded = True
+                            extracted_data = result.data
+                            if self.config.verbose:
+                                preview = str(result.raw or "")[:160]
+                                print(f"  [ACTION] EXTRACT ok: {preview}", flush=True)
+                        else:
+                            error = result.error or "Extraction failed"
             elif action_type in ("CLICK", "TYPE_AND_SUBMIT"):
                 # Try intent heuristics first (if available)
                 elements = getattr(ctx.snapshot, "elements", []) or []
