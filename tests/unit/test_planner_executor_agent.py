@@ -129,6 +129,7 @@ class TestBuildExecutorPrompt:
             intent=None,
             compact_context="167|searchbox|Search|100|1|0|-|0|",
             input_text="Logitech mouse",
+            action_type="TYPE_AND_SUBMIT",
         )
         assert 'Text to type: "Logitech mouse"' in user_prompt
 
@@ -149,9 +150,62 @@ class TestBuildExecutorPrompt:
             intent="search_box",
             compact_context="100|searchbox|Search|100|1|0|-|0|",
             input_text="laptop",
+            action_type="TYPE_AND_SUBMIT",
         )
         assert "Intent: search_box" in user_prompt
         assert 'Text to type: "laptop"' in user_prompt
+
+    def test_text_matching_prompt_for_matching_intent(self) -> None:
+        """Should include text matching hints when intent mentions matching."""
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Click category for tablecloth",
+            intent="Click element with text matching tablecloth",
+            compact_context="100|link|Tablecloths|100|1|0|-|0|\n101|link|Kitchen|100|1|0|-|0|",
+            action_type="CLICK",
+        )
+        # Should have matching instructions and allow NONE response
+        assert "matching" in sys_prompt.lower()
+        assert "NONE" in sys_prompt
+        assert "Intent: Click element with text matching tablecloth" in user_prompt
+
+    def test_search_icon_prompt_for_search_intent(self) -> None:
+        """Should include search icon hints for search-related intents."""
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Open search",
+            intent="Click search icon",
+            compact_context="100|link|Search|100|1|0|-|0|\n101|button||100|1|0|-|0|",
+        )
+        assert "SEARCH ICON HINTS" in sys_prompt
+
+    def test_type_prompt_warns_about_email_fields(self) -> None:
+        """Should warn about email/newsletter fields when typing."""
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Search for vinyl tablecloth",
+            intent="Type in search box",
+            compact_context="100|textbox|Search|100|1|0|-|0|\n101|textbox|Your email address|100|1|0|-|0|",
+            input_text="vinyl tablecloth",
+            action_type="TYPE_AND_SUBMIT",
+        )
+        assert "email" in sys_prompt.lower()
+        assert "newsletter" in sys_prompt.lower()
+        assert "NONE" in sys_prompt  # Should mention NONE as fallback
+
+    def test_click_with_target_text(self) -> None:
+        """CLICK action with target text should use text matching prompt."""
+        sys_prompt, user_prompt = build_executor_prompt(
+            goal="Click vinyl tablecloth product",
+            intent="product link",
+            compact_context="100|link|Kitchen Goods|100|1|0|-|0|\n101|link|Vinyl Tablecloth|100|1|0|-|0|",
+            input_text="Vinyl Tablecloth",
+            action_type="CLICK",
+        )
+        # Should have target matching instructions, not "text to type"
+        assert "Target to find:" in user_prompt
+        assert 'Vinyl Tablecloth' in user_prompt
+        assert "Text to type:" not in user_prompt
+        # Should allow NONE response
+        assert "NONE" in sys_prompt
+        assert "matching" in sys_prompt.lower()
 
 
 # ---------------------------------------------------------------------------

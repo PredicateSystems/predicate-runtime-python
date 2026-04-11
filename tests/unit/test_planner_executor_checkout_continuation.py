@@ -376,6 +376,36 @@ class TestThinkTagStripping:
         assert action_type == "CLICK"
         assert args == [100]
 
+    def test_parses_none_response(self) -> None:
+        """Should parse NONE response when executor can't find suitable element."""
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent
+        from predicate.llm_provider import LLMProvider
+
+        mock_planner = MagicMock(spec=LLMProvider)
+        mock_executor = MagicMock(spec=LLMProvider)
+        agent = PlannerExecutorAgent(planner=mock_planner, executor=mock_executor)
+
+        # Test NONE response
+        text = "NONE"
+        action_type, args = agent._parse_action(text)
+        assert action_type == "NONE"
+        assert args == []
+
+    def test_parses_none_with_explanation(self) -> None:
+        """Should parse NONE even with additional text."""
+        from predicate.agents.planner_executor_agent import PlannerExecutorAgent
+        from predicate.llm_provider import LLMProvider
+
+        mock_planner = MagicMock(spec=LLMProvider)
+        mock_executor = MagicMock(spec=LLMProvider)
+        agent = PlannerExecutorAgent(planner=mock_planner, executor=mock_executor)
+
+        # Test NONE with trailing text
+        text = "NONE - no search box found"
+        action_type, args = agent._parse_action(text)
+        assert action_type == "NONE"
+        assert args == []
+
 
 # ---------------------------------------------------------------------------
 # Test Overlay Dismiss Intent Detection

@@ -1274,23 +1274,59 @@ IMPORTANT: E-Commerce Task Planning Rules
 =========================================
 For shopping/purchase tasks, include ALL necessary steps in order:
 1. NAVIGATE to the site (if not already there)
-2. TYPE_AND_SUBMIT search query in search box
+2. Find the product - choose ONE of these approaches IN PRIORITY ORDER:
+   a) DIRECT MATCH (BEST): Scan page for text closely matching the goal. CLICK any product/category with matching text.
+   b) CATEGORY BROWSE: If no exact match, click a category link that relates to the goal (e.g., "Tablecloths" for "vinyl tablecloth")
+   c) SEARCH: ONLY if you see an input EXPLICITLY labeled "Search" with placeholder="Search..." or aria-label="Search"
+   d) SEARCH ICON: Only if you see a magnifying glass icon linked to search
 3. CLICK on specific product from results (not filters or categories)
 4. CLICK "Add to Cart" button on product page
 5. CLICK "Proceed to Checkout" or cart icon
 6. Handle login/signup if required (may need CLICK + TYPE_AND_SUBMIT)
 7. CLICK through checkout process
 
+CRITICAL - CATEGORY NAVIGATION (MOST RELIABLE FOR HOMEPAGES):
+- On homepage/landing pages, browse via CATEGORY LINKS - this is the MOST RELIABLE method
+- Look for category links like "Rally Home Goods", "Tablecloths", "Kitchen", "Catalog", etc.
+- Category links are usually in the main navigation, sidebar, or footer and are always clickable
+- Example: Goal "vinyl tablecloth" → Click "Rally Home Goods" or "Catalog" category first
+- After clicking a category, THEN look for the specific product
+
+SECONDARY - Direct Product Click (ONLY on collection/category pages):
+- If a product appears on a CATEGORY/COLLECTION page (not homepage), click it directly
+- WARNING: Products in "Hot Products", carousels, or grid sections on HOME PAGES are often NOT clickable
+- The snapshot may not capture product titles in carousels - use category navigation instead
+
+AVOID - Searching on sites without visible search box:
+- Many e-commerce sites hide search or don't have search at all
+- If you don't see a clear "Search" textbox in the page markdown, DO NOT try to search
+- Prefer category navigation over searching - it's more reliable
+
+CRITICAL - Search Box Identification (ONLY WHEN NO MATCHING TEXT):
+- Only use TYPE_AND_SUBMIT if you see an input EXPLICITLY labeled for SEARCH
+- Valid search indicators: placeholder="Search...", aria-label="Search", text "Search products"
+- DO NOT type into fields with these labels (they are NOT search boxes):
+  * "Your email address", "Email", "Newsletter", "Subscribe"
+  * "Zip code", "Location", "Enter your email"
+  * Any field asking for personal information
+- If unsure whether a field is a search box, DO NOT use it - click products/categories instead
+
 Common mistakes to AVOID:
 - Do NOT skip "Add to Cart" step - clicking a product link is NOT adding to cart
 - Do NOT combine multiple distinct actions into one step
 - Do NOT confuse filter/category clicks with product selection
+- Do NOT assume a search box exists - if none is clearly visible, click products/categories directly
+- Do NOT hallucinate search boxes - if page content doesn't show an obvious search input, use direct navigation
+- Do NOT type into email/newsletter/subscription fields - they are NOT search boxes
+- Do NOT use search when matching text is visible - click directly instead
 - Each distinct user action should be its own step
 
-Intent hints are critical - use clear hints like:
+Intent hints are critical - ALWAYS include the specific product/element name:
+- intent: "Click product Vinyl Tablecloth" (GOOD - includes product name)
+- intent: "Click on product title or image" (BAD - too generic, will click wrong product)
+- intent: "Click category link Tablecloths" (GOOD - includes category name)
 - intent: "Click Add to Cart button"
 - intent: "Click Proceed to Checkout"
-- intent: "Click on product title or image"
 - intent: "Click sign in button"
 """
     elif is_search_task:
@@ -1303,6 +1339,46 @@ For search tasks, include steps to:
 2. TYPE_AND_SUBMIT the search query
 3. Wait for/verify search results
 4. If selecting a result: CLICK on specific result item
+"""
+
+    # Check for extraction tasks
+    is_extraction_task = any(keyword in task_lower for keyword in [
+        "extract", "get the", "what is", "read the", "find the text", "scrape",
+        "title of", "price of", "name of", "content of",
+    ])
+
+    if is_extraction_task:
+        domain_guidance = """
+
+IMPORTANT: Extraction Task Planning Rules
+=========================================
+For extraction tasks where data is already visible on the page:
+
+1. If the data you need is VISIBLE in the page context markdown above:
+   - Use EXTRACT directly as the ONLY step - no clicking needed
+   - The EXTRACT action will read the visible text from the page
+
+2. If you need to navigate to see the data:
+   - First CLICK or NAVIGATE to the right page
+   - Then use EXTRACT
+
+CRITICAL: Do NOT click on links to external sites when extracting.
+- Hacker News post titles link to EXTERNAL sites, not to HN pages
+- To extract a title that's visible, use EXTRACT directly on the current page
+- Only click if you need to navigate to an HN item page (e.g., for comments)
+
+Example for "Extract the title of the first post":
+{
+  "steps": [
+    {
+      "id": 1,
+      "goal": "Extract the first post title from the page",
+      "action": "EXTRACT",
+      "target": "first post title",
+      "verify": []
+    }
+  ]
+}
 """
 
     system = f"""You are the PLANNER. Output a JSON execution plan for the web automation task.
@@ -1329,10 +1405,10 @@ Your output must be a valid JSON object with this EXACT structure:
     }},
     {{
       "id": 3,
-      "goal": "Click on result",
+      "goal": "Click on product from results",
       "action": "CLICK",
       "intent": "Click on product title",
-      "verify": [{{"predicate": "url_contains", "args": ["/product/"]}}]
+      "verify": []
     }}
   ]
 }}
@@ -1343,6 +1419,20 @@ CRITICAL: Each verify predicate MUST be an object with "predicate" and "args" ke
 - {{"predicate": "not_exists", "args": ["text~'error'"]}}
 
 DO NOT use string format like "url_contains('text')" - use object format only.
+
+CRITICAL - url_contains RULES:
+1. Use ONLY generic keywords, NEVER site-specific paths like "/product/", "/products/", "/collections/"
+2. Different sites use different URL patterns - don't guess the path structure
+3. For product pages: use "verify": [] (empty) or use the product keyword like ["snow-blower"]
+4. For search: "search" or "query=" work across most sites
+5. For checkout: "checkout" or "cart" work across most sites
+6. NEVER use paths like "/product/", "/products/", "/p/", "/dp/" - these are site-specific
+
+Examples:
+- GOOD: {{"predicate": "url_contains", "args": ["snow-blower"]}} - uses product keyword
+- GOOD: {{"predicate": "url_contains", "args": ["search"]}} - generic search indicator
+- BAD: {{"predicate": "url_contains", "args": ["/product/"]}} - site-specific path
+- BAD: {{"predicate": "url_contains", "args": ["/products/vinyl-tablecloth"]}} - guessing path structure
 {domain_guidance}
 Return ONLY valid JSON. No prose, no code fences, no markdown."""
 
@@ -1409,23 +1499,28 @@ def build_stepwise_planner_prompt(
     system = """You are a browser automation planner. Decide the NEXT action.
 
 Actions:
-- CLICK: Click an element. Set "intent" to element type/role (e.g., "invoice link", "submit button"). Optionally set "input" to the specific text to match.
-- TYPE_AND_SUBMIT: Type and submit. Set "intent" to element type and "input" to text to type.
+- CLICK: Click an element. Set "intent" to element type/role. Set "input" to EXACT text from elements list.
+- TYPE_AND_SUBMIT: Type and submit. ONLY use if you see a "searchbox" or "textbox" with "search" in the text.
 - SCROLL: Scroll page. Set "direction" to "up" or "down".
 - DONE: Goal achieved. Return this when the goal is complete.
 
+CRITICAL RULE FOR CLICK:
+- The "input" field MUST contain text that ACTUALLY APPEARS in the elements list below
+- Do NOT guess or invent text - copy EXACT text from an element
+- If product title "vinyl tablecloth" is NOT in the elements list, click a category link instead (e.g., "Catalog", "Home Goods")
+- Only click a specific product if you see its EXACT name in the elements
+
 Output ONLY valid JSON (no markdown, no ```):
-{"action":"CLICK","intent":"invoice link","input":"INV-2024-001","reasoning":"click first invoice"}
-{"action":"CLICK","intent":"submit button","reasoning":"submit the form"}
-{"action":"TYPE_AND_SUBMIT","intent":"search box","input":"wireless keyboard","reasoning":"search for product"}
+{"action":"CLICK","intent":"category link","input":"Catalog","reasoning":"browse products via category"}
+{"action":"CLICK","intent":"product link","input":"Vinyl Round Tablecloth","reasoning":"found exact product name"}
 {"action":"DONE","intent":"completed","reasoning":"goal achieved"}
 
 RULES:
-1. Look at ACTUAL elements shown - pick one that matches your intent
-2. For CLICK: "intent" = element type (link, button, etc.), "input" = specific text (optional)
-3. CRITICAL: Do NOT repeat the same action twice. If history shows an action was already done (e.g., "CLICK Route To Review"), do NOT do it again.
-4. CRITICAL: If the goal is to click a button (e.g., "click Route to Review") and history shows you already clicked it, return DONE immediately.
-5. Return DONE when: (a) you clicked the target button, (b) you typed/submitted text, (c) page state shows goal is achieved
+1. ONLY use text that appears EXACTLY in the elements list - do NOT invent names
+2. For shopping: start with category links (Catalog, Shop Now, Home Goods) to find products
+3. ONLY use TYPE_AND_SUBMIT if you see a textbox labeled "search"
+4. Do NOT type into "email" or "newsletter" fields
+5. Do NOT repeat the same action twice
 6. Output ONLY JSON - no <think> tags, no markdown, no prose"""
 
     user = f"""Goal: {goal}
@@ -1486,6 +1581,7 @@ def build_executor_prompt(
     compact_context: str,
     input_text: str | None = None,
     category: str | None = None,
+    action_type: str | None = None,
 ) -> tuple[str, str]:
     """
     Build system and user prompts for the Executor LLM.
@@ -1494,14 +1590,23 @@ def build_executor_prompt(
         goal: Human-readable goal for this step
         intent: Intent hint for element selection (optional)
         compact_context: Compact representation of page elements
-        input_text: Text to type for TYPE_AND_SUBMIT actions (optional)
+        input_text: For TYPE_AND_SUBMIT: text to type. For CLICK: target text to match (optional)
         category: Task category for category-specific hints (optional)
+        action_type: Action type (CLICK, TYPE_AND_SUBMIT, etc.) to determine prompt variant
 
     Returns:
         (system_prompt, user_prompt)
     """
     intent_line = f"Intent: {intent}\n" if intent else ""
-    input_line = f"Text to type: \"{input_text}\"\n" if input_text else ""
+
+    # For CLICK actions, input_text is target to match (not text to type)
+    is_type_action = action_type in ("TYPE_AND_SUBMIT", "TYPE")
+    if is_type_action and input_text:
+        input_line = f"Text to type: \"{input_text}\"\n"
+    elif input_text:
+        input_line = f"Target to find: \"{input_text}\"\n"
+    else:
+        input_line = ""
 
     # Get category-specific hints
     category_hints = _get_category_executor_hints(category)
@@ -1509,13 +1614,19 @@ def build_executor_prompt(
 
     # Tight prompt optimized for small local models (4B-7B)
     # Key: explicit format, no reasoning, clear failure consequence
-    if input_text:
+    if is_type_action and input_text:
         # TYPE action needed - find the INPUT element (textbox/combobox), not the submit button
         system = (
             "You are an executor for browser automation.\n"
             "Task: Find the INPUT element (textbox, combobox, searchbox) to type into.\n"
             "Return ONLY ONE line: TYPE(<id>, \"text\")\n"
             "IMPORTANT: Return the ID of the INPUT/TEXTBOX element, NOT the submit button.\n"
+            "CRITICAL - AVOID these fields (they are NOT search boxes):\n"
+            "- Fields with 'email', 'newsletter', 'subscribe', 'signup' in the text\n"
+            "- Fields labeled 'Your email address', 'Email', 'Enter your email'\n"
+            "- Fields in footer/newsletter sections\n"
+            "ONLY use fields explicitly labeled for SEARCH (placeholder='Search', aria='Search').\n"
+            "If NO search field exists, return NONE instead of guessing.\n"
             "If you output anything else, the action fails.\n"
             "Do NOT output <think> or any reasoning.\n"
             "No prose, no markdown, no extra whitespace.\n"
@@ -1523,20 +1634,83 @@ def build_executor_prompt(
         )
     else:
         # CLICK action (most common)
-        system = (
-            "You are an executor for browser automation.\n"
-            "Return ONLY a single-line CLICK(id) action.\n"
-            "If you output anything else, the action fails.\n"
-            "Do NOT output <think> or any reasoning.\n"
-            "No prose, no markdown, no extra whitespace.\n"
-            "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
-            "Example: CLICK(12)"
+        # Check if this is a search-related action (from intent or goal)
+        search_keywords = ["search", "magnify", "magnifier", "find"]
+        is_search_action = (
+            (intent and any(kw in intent.lower() for kw in search_keywords))
+            or any(kw in goal.lower() for kw in search_keywords)
         )
+        # Check if this is a product click action (from intent or goal)
+        product_keywords = ["product", "item", "result", "listing"]
+        is_product_action = (
+            (intent and any(kw in intent.lower() for kw in product_keywords))
+            or any(kw in goal.lower() for kw in product_keywords)
+        )
+        # Check if intent asks to match text (e.g., "Click element with text matching [keyword]")
+        is_text_matching_action = intent and "matching" in intent.lower()
+        # Check if input_text specifies a target to match (for CLICK actions, input_text is target text)
+        has_target_text = bool(input_text)
+
+        if is_search_action:
+            system = (
+                "You are an executor for browser automation.\n"
+                "Return ONLY a single-line CLICK(id) action.\n"
+                "If you output anything else, the action fails.\n"
+                "Do NOT output <think> or any reasoning.\n"
+                "SEARCH ICON HINTS: Look for links/buttons with 'search' in text/href, "
+                "or icon-only elements (text='0' or empty) with 'search' in href.\n"
+                "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
+                "Example: CLICK(12)"
+            )
+        elif is_text_matching_action or has_target_text:
+            # When planner specifies target text (input field), executor must match it
+            target_text = input_text or ""
+            system = (
+                "You are an executor for browser automation.\n"
+                "Return ONLY a single-line CLICK(id) action.\n"
+                "If you output anything else, the action fails.\n"
+                "Do NOT output <think> or any reasoning.\n"
+                f"CRITICAL: Find an element with text matching '{target_text}'.\n"
+                "- Look for: product titles, category names, link text, button labels\n"
+                "- Text must contain the target words (case-insensitive partial match is OK)\n"
+                "- If NO element contains the target text, return NONE instead of clicking something random\n"
+                "Output: CLICK(<digits>) or NONE\n"
+                "Example: CLICK(42) or NONE"
+            )
+        elif is_product_action:
+            # Product click action without specific target - guide executor to find product cards/links
+            system = (
+                "You are an executor for browser automation.\n"
+                "Return ONLY a single-line CLICK(id) action.\n"
+                "If you output anything else, the action fails.\n"
+                "Do NOT output <think> or any reasoning.\n"
+                "PRODUCT CLICK HINTS:\n"
+                "- Look for LINK elements (role=link) with product IDs in href (e.g., /7027762, /dp/B...)\n"
+                "- Prefer links with delivery info text like 'Delivery', 'Ships to Store', 'Get it...'\n"
+                "- These are inside product cards and will navigate to product detail pages\n"
+                "- AVOID buttons like 'Search', 'Shop', category buttons, or filter buttons\n"
+                "- AVOID image slider options (slider image 1, 2, etc.)\n"
+                "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
+                "Example: CLICK(1268)"
+            )
+        else:
+            system = (
+                "You are an executor for browser automation.\n"
+                "Return ONLY a single-line CLICK(id) action.\n"
+                "If you output anything else, the action fails.\n"
+                "Do NOT output <think> or any reasoning.\n"
+                "No prose, no markdown, no extra whitespace.\n"
+                "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
+                "Example: CLICK(12)"
+            )
 
     # Choose the appropriate closing instruction based on action type
-    if input_text:
+    if is_type_action and input_text:
         # For TYPE actions, explicitly ask for TYPE with the text
         action_instruction = f'Return TYPE(id, "{input_text}"):'
+    elif input_text:
+        # For CLICK with target text, remind to match target or return NONE
+        action_instruction = f'Return CLICK(id) for element matching "{input_text}", or NONE if not found:'
     else:
         action_instruction = "Return CLICK(id):"
 
@@ -2106,6 +2280,10 @@ class PlannerExecutorAgent:
         if "FINISH" in text:
             return "FINISH", []
 
+        # NONE - executor couldn't find a suitable element (e.g., no search box found)
+        if text.upper() == "NONE" or "NONE" in text.upper():
+            return "NONE", []
+
         return "UNKNOWN", [text]
 
     # -------------------------------------------------------------------------
@@ -2653,7 +2831,14 @@ class PlannerExecutorAgent:
 
         system = """You are the PLANNER. Output a JSON patch to edit an existing plan.
 Edit ONLY the failed step and optionally the next step.
-Return ONLY a JSON object with mode="patch" and replace_steps array."""
+Return ONLY a JSON object with mode="patch" and replace_steps array.
+
+IMPORTANT - Alternative approaches when CLICK fails:
+- If a direct product/element click failed, try a DIFFERENT approach:
+  * Use search: Add a TYPE_AND_SUBMIT step to search for the product
+  * Use category navigation: Click a category link instead of the product directly
+  * Click a different element: Try "Quick Shop" or "View Details" buttons
+- Don't just retry the same approach with minor changes"""
 
         user = f"""Task: {task}
 
@@ -2662,16 +2847,29 @@ Failure:
 - Step goal: {failed_step.goal}
 - Reason: {failure_reason}
 
-Return JSON patch:
+IMPORTANT: The element could not be clicked or the verification failed.
+Try a DIFFERENT approach - pick ONE of these alternatives:
+
+1. If clicking a category link failed (e.g., "Rally Home Goods" in sidebar):
+   - Try clicking "Catalog" or "Shop All" link instead
+   - Or click "SHOP NOW" button to browse all products
+
+2. If clicking a product failed:
+   - Try clicking a category first, then look for the product
+   - Or try clicking "Quick Shop" button near the product
+
+Example - replace failed category click with Catalog link:
 {{
   "mode": "patch",
   "replace_steps": [
     {{
       "id": {failed_step.id},
-      "step": {{ "id": {failed_step.id}, "goal": "...", "action": "...", "verify": [...] }}
+      "step": {{ "id": {failed_step.id}, "goal": "Click Catalog to browse products", "action": "CLICK", "intent": "Click Catalog or Shop Now link", "verify": [{{"predicate": "url_contains", "args": ["/collections"]}}] }}
     }}
   ]
-}}"""
+}}
+
+Return JSON patch:"""
 
         for attempt in range(1, max_attempts + 1):
             resp = self.planner.generate(
@@ -2833,6 +3031,7 @@ Return JSON patch:
                     ctx.compact_representation,
                     input_text=step.input,
                     category=self._get_cached_category_str(),
+                    action_type=step.action,
                 )
                 resp = self.executor.generate(
                     sys_prompt,
@@ -2906,6 +3105,7 @@ Return JSON patch:
                             ctx.compact_representation,
                             input_text=substep.input,
                             category=self._get_cached_category_str(),
+                            action_type=substep.action,
                         )
                         resp = self.executor.generate(
                             sys_prompt,
@@ -4030,6 +4230,7 @@ Return JSON patch:
                         ctx.compact_representation,
                         input_text=step.input,
                         category=self._get_cached_category_str(),
+                        action_type=step.action,
                     )
 
                     if self.config.verbose:
@@ -4252,6 +4453,12 @@ Return JSON patch:
                     pass  # Extraction already executed above
                 elif action_type == "FINISH":
                     pass  # No action needed
+                elif action_type == "NONE":
+                    # Executor couldn't find a suitable element (e.g., no search box)
+                    # This triggers replanning to try an alternative approach
+                    error = f"No suitable element found for step: {step.goal}"
+                    if self.config.verbose:
+                        print(f"  [EXECUTOR] NONE - no suitable element found, will trigger replan", flush=True)
                 elif action_type not in ("CLICK", "TYPE", "TYPE_AND_SUBMIT") or element_id is None:
                     if action_type in ("CLICK", "TYPE", "TYPE_AND_SUBMIT"):
                         error = f"No element ID for {action_type}"
@@ -4319,7 +4526,13 @@ Return JSON patch:
                 if not verification_passed and original_action in ("TYPE_AND_SUBMIT", "CLICK"):
                     current_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
                     if current_url and pre_url and current_url != pre_url:
-                        fallback_ok = True
+                        # Check if this is a meaningful URL change (not just anchor change)
+                        # Strip anchors (#...) before comparing
+                        pre_url_base = pre_url.split("#")[0]
+                        current_url_base = current_url.split("#")[0]
+                        is_meaningful_change = pre_url_base != current_url_base
+
+                        fallback_ok = is_meaningful_change
                         if original_action == "TYPE_AND_SUBMIT":
                             typed_element = None
                             for el in (ctx.snapshot.elements or []):
@@ -4600,6 +4813,9 @@ Return JSON patch:
                 )
                 if self.config.verbose and page_context:
                     print(f"  [PAGE-CONTEXT] Extracted {len(page_context)} chars of markdown for planning", flush=True)
+                    print("\n--- Page Context (Markdown) ---", flush=True)
+                    print(page_context, flush=True)
+                    print("--- End Page Context ---\n", flush=True)
             except Exception:
                 pass  # Fail silently - page context is optional
 
@@ -4810,18 +5026,8 @@ Return JSON patch:
                             continuation_task = self._build_checkout_continuation_task(
                                 task_description, page_type
                             )
-                            # Refresh page context for continuation planning if enabled
-                            continuation_context: str | None = None
-                            if self.config.use_page_context:
-                                try:
-                                    continuation_context = await runtime.read_markdown(
-                                        max_chars=self.config.page_context_max_chars
-                                    )
-                                except Exception:
-                                    pass
-                            plan = await self.plan(
-                                continuation_task, start_url=None, page_context=continuation_context
-                            )
+                            # Note: page_context (markdown) is only extracted once during initial planning
+                            plan = await self.plan(continuation_task, start_url=None)
                             step_index = 0  # Start from beginning of new plan
                             self._replans_used += 1
                             continue
