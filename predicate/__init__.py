@@ -118,6 +118,7 @@ from .models import (  # Agent Layer Models
 # Ordinal support (Phase 3)
 from .ordinal import OrdinalIntent, boost_ordinal_elements, detect_ordinal_intent, select_by_ordinal
 from .overlay import clear_overlay, show_overlay
+from .overlay_dismissal import OverlayDismissResult, dismiss_overlays, dismiss_overlays_before_agent
 from .permissions import PermissionPolicy
 from .pruning import (
     CategoryDetectionResult,
@@ -259,6 +260,10 @@ __all__ = [
     "screenshot",
     "show_overlay",
     "clear_overlay",
+    # Overlay dismissal (proactive popup/banner removal)
+    "OverlayDismissResult",
+    "dismiss_overlays",
+    "dismiss_overlays_before_agent",
     # Text Search
     "find_text_rect",
     "TextRectSearchResult",

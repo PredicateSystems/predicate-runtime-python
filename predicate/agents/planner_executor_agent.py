@@ -1752,6 +1752,12 @@ def build_executor_prompt(
             (intent and any(kw in intent.lower() for kw in product_keywords))
             or any(kw in goal.lower() for kw in product_keywords)
         )
+        # Check if this is an Add to Cart action
+        add_to_cart_keywords = ["add to cart", "add to bag", "add to basket", "buy now"]
+        is_add_to_cart_action = (
+            (intent and any(kw in intent.lower() for kw in add_to_cart_keywords))
+            or any(kw in goal.lower() for kw in add_to_cart_keywords)
+        )
         # Check if intent asks to match text (e.g., "Click element with text matching [keyword]")
         is_text_matching_action = intent and "matching" in intent.lower()
         # Check if input_text specifies a target to match (for CLICK actions, input_text is target text)
@@ -1798,6 +1804,24 @@ def build_executor_prompt(
                 "- AVOID image slider options (slider image 1, 2, etc.)\n"
                 "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
                 "Example: CLICK(1268)"
+            )
+        elif is_add_to_cart_action:
+            # Add to Cart action - may need to click product first if on search results page
+            system = (
+                "You are an executor for browser automation.\n"
+                "Return ONLY a single-line CLICK(id) action.\n"
+                "If you output anything else, the action fails.\n"
+                "Do NOT output <think> or any reasoning.\n"
+                "ADD TO CART HINTS:\n"
+                "- FIRST: Look for buttons with text: 'Add to Cart', 'Add to Bag', 'Add to Basket', 'Buy Now'\n"
+                "- If found, click that button directly\n"
+                "- FALLBACK: If NO 'Add to Cart' button is visible, you are likely on a SEARCH RESULTS page\n"
+                "  - In this case, click a PRODUCT LINK to go to the product details page first\n"
+                "  - Look for LINK elements with product IDs in href (e.g., /7027762, /dp/B...)\n"
+                "  - Prefer links with product names, prices, or delivery info\n"
+                "- AVOID: 'Search' buttons, category buttons, filter buttons, pagination\n"
+                "Output MUST match exactly: CLICK(<digits>) with no spaces.\n"
+                "Example: CLICK(42)"
             )
         else:
             system = (
@@ -2940,11 +2964,28 @@ Edit ONLY the failed step and optionally the next step.
 Return ONLY a JSON object with mode="patch" and replace_steps array.
 
 IMPORTANT - Alternative approaches when CLICK fails:
-- If a direct product/element click failed, try a DIFFERENT approach:
-  * Use search: Add a TYPE_AND_SUBMIT step to search for the product
-  * Use category navigation: Click a category link instead of the product directly
-  * Click a different element: Try "Quick Shop" or "View Details" buttons
+- If a product/category navigation failed, USE SITE SEARCH instead:
+  * Replace the failed CLICK with a TYPE_AND_SUBMIT to search for the product
+  * This is the MOST RELIABLE fallback - site search works on all websites
+- If clicking a specific element failed:
+  * Try a different selector or button (e.g., "Quick Shop", "View Details")
 - Don't just retry the same approach with minor changes"""
+
+        # Extract product/item name from step for search suggestion
+        product_hint = ""
+        step_labels = " ".join([
+            failed_step.goal or "",
+            failed_step.target or "",
+            failed_step.intent or "",
+        ]).lower()
+        # Common patterns to extract product name
+        for pattern in [r"snow\s*blower", r"product\s+(\w+)", r"click\s+(?:on\s+)?(.+?)(?:\s+product|\s+category)?$"]:
+            match = re.search(pattern, step_labels, re.IGNORECASE)
+            if match:
+                product_hint = match.group(0) if match.lastindex is None else match.group(1)
+                break
+        if not product_hint and failed_step.target:
+            product_hint = failed_step.target
 
         user = f"""Task: {task}
 
@@ -2953,27 +2994,23 @@ Failure:
 - Step goal: {failed_step.goal}
 - Reason: {failure_reason}
 
-IMPORTANT: The element could not be clicked or the verification failed.
-Try a DIFFERENT approach - pick ONE of these alternatives:
+IMPORTANT: The element could not be found or clicked. The current page likely doesn't have the target.
+The BEST approach is to USE SITE SEARCH to find the product directly.
 
-1. If clicking a category link failed (e.g., "Rally Home Goods" in sidebar):
-   - Try clicking "Catalog" or "Shop All" link instead
-   - Or click "SHOP NOW" button to browse all products
-
-2. If clicking a product failed:
-   - Try clicking a category first, then look for the product
-   - Or try clicking "Quick Shop" button near the product
-
-Example - replace failed category click with Catalog link:
+RECOMMENDED: Replace the failed step with a site search:
 {{
   "mode": "patch",
   "replace_steps": [
     {{
       "id": {failed_step.id},
-      "step": {{ "id": {failed_step.id}, "goal": "Click Catalog to browse products", "action": "CLICK", "intent": "Click Catalog or Shop Now link", "verify": [{{"predicate": "url_contains", "args": ["/collections"]}}] }}
+      "step": {{ "id": {failed_step.id}, "goal": "Search for {product_hint or 'the product'}", "action": "TYPE_AND_SUBMIT", "input": "{product_hint or 'product name'}", "intent": "Type in search box and submit", "verify": [{{"predicate": "url_contains", "args": ["search"]}}] }}
     }}
   ]
 }}
+
+Alternative approaches (if search doesn't apply):
+1. Click "Catalog" or "Shop All" to browse products
+2. Click "Quick Shop" or "View Details" buttons
 
 Return JSON patch:"""
 
@@ -3491,6 +3528,102 @@ Return JSON patch:"""
             )
         ).lower()
         return "search" in labels
+
+    def _is_add_to_cart_step(self, step: PlanStep) -> bool:
+        """Detect if a step is an Add to Cart action."""
+        add_to_cart_keywords = ["add to cart", "add to bag", "add to basket", "buy now"]
+        labels = " ".join(
+            str(part or "").lower()
+            for part in (step.goal, step.intent, step.input)
+        )
+        return any(kw in labels for kw in add_to_cart_keywords)
+
+    def _is_search_results_url(self, url: str) -> bool:
+        """Check if URL looks like a search results page."""
+        url_lower = url.lower()
+        # Common patterns for search results pages
+        search_patterns = [
+            "search",
+            "query=",
+            "q=",
+            "s=",
+            "/s?",
+            "keyword=",
+            "keywords=",
+            "results",
+        ]
+        return any(pattern in url_lower for pattern in search_patterns)
+
+    def _is_category_navigation_step(self, step: PlanStep) -> bool:
+        """Check if this step is navigating to a category/section."""
+        nav_keywords = [
+            "navigate to", "go to", "click category", "category link",
+            "click on", "browse", "section", "department"
+        ]
+        labels = " ".join(
+            str(part or "").lower()
+            for part in (step.goal, step.intent)
+        )
+        return any(kw in labels for kw in nav_keywords)
+
+    def _url_change_matches_intent(self, step: PlanStep, pre_url: str, post_url: str) -> bool:
+        """
+        Check if URL change actually matches the step's intent.
+
+        For category navigation, the new URL should contain keywords from the target.
+        This prevents accepting unrelated URL changes as successful navigation.
+        """
+        # Extract target keywords from step
+        target = step.target or ""
+        intent = step.intent or ""
+        goal = step.goal or ""
+
+        post_url_lower = post_url.lower()
+
+        # Special case: checkout/cart related steps
+        # These steps may go to /cart first before /checkout, which is valid
+        checkout_keywords = ["checkout", "proceed to checkout", "cart", "view cart"]
+        step_labels = f"{goal} {intent}".lower()
+        is_checkout_step = any(kw in step_labels for kw in checkout_keywords)
+        if is_checkout_step:
+            # Accept cart or checkout URLs as valid for checkout steps
+            checkout_url_patterns = ["cart", "checkout", "basket", "bag"]
+            if any(pattern in post_url_lower for pattern in checkout_url_patterns):
+                return True
+
+        # Get keywords from target (e.g., "Outdoor Power Equipment" -> ["outdoor", "power", "equipment"])
+        target_words = set(
+            word.lower() for word in re.split(r'[\s\-_]+', target)
+            if len(word) >= 3  # Skip short words like "to", "and"
+        )
+
+        # Also check predicates for expected URL patterns
+        expected_patterns = []
+        for pred in (step.verify or []):
+            if pred.predicate == "url_contains" and pred.args:
+                expected_patterns.append(pred.args[0].lower())
+
+        # If predicates specify URL patterns, check those
+        if expected_patterns:
+            if any(pattern in post_url_lower for pattern in expected_patterns):
+                return True
+            # For non-checkout steps, reject URL changes that don't match predicates
+            # But only if we have a target to validate against
+            if target_words:
+                return False
+            # No target and no predicate match - be permissive
+            return True
+
+        # Otherwise check if target keywords appear in URL
+        if target_words:
+            # At least one target word should appear in URL
+            if any(word in post_url_lower for word in target_words):
+                return True
+            # URL doesn't contain any target keywords - suspicious
+            return False
+
+        # No target specified - can't validate, allow fallback
+        return True
 
     def _find_submit_button_for_type_and_submit(
         self,
@@ -4702,6 +4835,95 @@ EXTRACTED TEXT:"""
                                 element=typed_element,
                                 typed_text=executor_text or step.input or "",
                             )
+                        elif original_action == "CLICK" and is_meaningful_change:
+                            # For CLICK actions, validate URL change matches step intent
+                            # This prevents accepting wrong category navigations
+                            url_matches_intent = self._url_change_matches_intent(
+                                step=step,
+                                pre_url=pre_url,
+                                post_url=current_url,
+                            )
+                            if not url_matches_intent:
+                                fallback_ok = False
+                                if self.config.verbose:
+                                    print(f"  [VERIFY] URL changed but doesn't match step intent", flush=True)
+                                    print(f"  [VERIFY] Step target: {step.target}, URL: {current_url}", flush=True)
+
+                        # Special handling for Add to Cart steps: if we were on search results
+                        # and navigated to a product page, retry the step on the new page
+                        # instead of accepting URL change as success
+                        is_add_to_cart = self._is_add_to_cart_step(step)
+                        was_on_search_results = self._is_search_results_url(pre_url)
+                        now_on_product_page = not self._is_search_results_url(current_url)
+
+                        if is_add_to_cart and was_on_search_results and now_on_product_page and is_meaningful_change:
+                            # We clicked a product link instead of Add to Cart
+                            # Retry the step on the product page
+                            if self.config.verbose:
+                                print(f"  [ADD-TO-CART] Navigated from search results to product page: {pre_url} -> {current_url}", flush=True)
+                                print(f"  [ADD-TO-CART] Retrying Add to Cart action on product page...", flush=True)
+
+                            # Get fresh snapshot on the product page
+                            await asyncio.sleep(0.5)  # Brief wait for page to load
+                            try:
+                                retry_ctx = await self._get_execution_context(
+                                    runtime, step, step_index
+                                )
+                                # Build prompt for retry - looking for Add to Cart on product page
+                                retry_prompt = self.build_executor_prompt(
+                                    goal=step.goal,
+                                    elements=retry_ctx.snapshot.elements or [],
+                                    intent=step.intent,
+                                    task_category=retry_ctx.task_category,
+                                    input_text=step.input,
+                                )
+                                if self.config.verbose:
+                                    print(f"  [ADD-TO-CART] Asking executor to find Add to Cart button...", flush=True)
+
+                                retry_resp = self.executor.generate(
+                                    retry_prompt["system"],
+                                    retry_prompt["user"],
+                                    max_tokens=self.config.executor_max_tokens,
+                                )
+                                self._usage.record(role="executor", resp=retry_resp)
+                                retry_action = retry_resp.content.strip()
+                                if self.config.verbose:
+                                    print(f"  [ADD-TO-CART] Retry executor output: {retry_action}", flush=True)
+
+                                # Parse and execute retry action
+                                retry_match = re.match(r"CLICK\((\d+)\)", retry_action)
+                                if retry_match:
+                                    retry_element_id = int(retry_match.group(1))
+                                    await runtime.click(retry_element_id)
+                                    if self.config.verbose:
+                                        print(f"  [ADD-TO-CART] Clicked element {retry_element_id}", flush=True)
+
+                                    # Wait and verify
+                                    await asyncio.sleep(0.5)
+                                    verification_passed = await self._verify_step(runtime, step)
+                                    if verification_passed:
+                                        if self.config.verbose:
+                                            print(f"  [ADD-TO-CART] Add to Cart successful after retry!", flush=True)
+                                    else:
+                                        # Check for DOM change (cart drawer/modal)
+                                        post_retry_snap = await runtime.snapshot(SnapshotOptions(limit=50))
+                                        if post_retry_snap and hasattr(post_retry_snap, "elements"):
+                                            post_els = post_retry_snap.elements or []
+                                            cart_indicators = ["cart", "bag", "basket", "checkout", "added", "item"]
+                                            has_cart_indicator = any(
+                                                any(ind in (getattr(el, "text", "") or "").lower() for ind in cart_indicators)
+                                                for el in post_els[:30]
+                                            )
+                                            if has_cart_indicator:
+                                                if self.config.verbose:
+                                                    print(f"  [ADD-TO-CART] Cart indicator detected, accepting as success", flush=True)
+                                                verification_passed = True
+                            except Exception as retry_err:
+                                if self.config.verbose:
+                                    print(f"  [ADD-TO-CART] Retry failed: {retry_err}", flush=True)
+
+                            # Skip the normal URL fallback since we handled Add to Cart specially
+                            fallback_ok = False
 
                         if fallback_ok:
                             if self.config.verbose:
