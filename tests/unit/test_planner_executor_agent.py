@@ -789,6 +789,81 @@ class TestPlannerExecutorConfigNewOptions:
         config = PlannerExecutorConfig(use_page_context=True, page_context_max_chars=4000)
         assert config.page_context_max_chars == 4000
 
+    def test_strict_fail_fast_default_disabled(self) -> None:
+        config = PlannerExecutorConfig()
+        assert config.strict_fail_fast is False
+
+    def test_strict_fail_fast_can_be_enabled(self) -> None:
+        config = PlannerExecutorConfig(strict_fail_fast=True)
+        assert config.strict_fail_fast is True
+
+
+class TestStrictFailFastBehavior:
+    """Behavioral tests for strict fail-fast mode."""
+
+    @pytest.mark.asyncio
+    async def test_run_aborts_required_failure_without_recovery_or_replan(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from predicate.agents.planner_executor_agent import (
+            PlannerExecutorAgent,
+            StepOutcome,
+            StepStatus,
+        )
+
+        config = PlannerExecutorConfig(strict_fail_fast=True)
+        agent = PlannerExecutorAgent(
+            planner=MockLLMProvider(),
+            executor=MockLLMProvider(),
+            config=config,
+        )
+
+        plan = Plan(
+            task="Search for product",
+            steps=[
+                PlanStep(
+                    id=1,
+                    goal="Click product result",
+                    action="CLICK",
+                    intent="product link",
+                    verify=[PredicateSpec(predicate="url_contains", args=["/product"])],
+                    required=True,
+                )
+            ],
+        )
+
+        failed_outcome = StepOutcome(
+            step_id=1,
+            goal="Click product result",
+            status=StepStatus.FAILED,
+            action_taken="CLICK(1)",
+            verification_passed=False,
+            error="verification_failed",
+        )
+
+        runtime = MagicMock()
+        runtime.get_url = AsyncMock(return_value="https://shop.example.com/search")
+        runtime.goto = AsyncMock()
+        runtime.read_markdown = AsyncMock(return_value=None)
+
+        agent.plan = AsyncMock(return_value=plan)  # type: ignore[method-assign]
+        agent._execute_step = AsyncMock(return_value=failed_outcome)  # type: ignore[method-assign]
+        agent.replan = AsyncMock(side_effect=RuntimeError("should not replan"))  # type: ignore[method-assign]
+        agent._attempt_recovery = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        outcome = await agent.run(
+            runtime,
+            task="Search for product",
+            start_url="https://shop.example.com",
+        )
+
+        assert outcome.success is False
+        assert outcome.replans_used == 0
+        assert outcome.error == "Step 1 failed: verification_failed"
+        assert len(outcome.step_outcomes) == 1
+        agent.replan.assert_not_awaited()  # type: ignore[attr-defined]
+        agent._attempt_recovery.assert_not_awaited()  # type: ignore[attr-defined]
+
 
 # ---------------------------------------------------------------------------
 # Test PlanStep with optional_substeps

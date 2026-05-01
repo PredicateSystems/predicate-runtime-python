@@ -696,6 +696,11 @@ class PlannerExecutorConfig:
     # Pre-step verification (skip step if predicates already pass)
     pre_step_verification: bool = True
 
+    # Strict fail-fast mode:
+    # - required step failures abort the run immediately
+    # - disables recovery/replan and intra-step fallback recoveries
+    strict_fail_fast: bool = False
+
     # Scroll-to-find: automatically scroll to find elements when not in viewport
     scroll_to_find_enabled: bool = True
     scroll_to_find_max_scrolls: int = 3  # Max scroll attempts per direction
@@ -4799,7 +4804,7 @@ EXTRACTED TEXT:"""
                         pass  # Ignore snapshot errors
 
                 # If verification failed and we have optional substeps, try them
-                if not verification_passed and step.optional_substeps:
+                if not verification_passed and step.optional_substeps and not self.config.strict_fail_fast:
                     substep_outcomes = await self._execute_optional_substeps(
                         step.optional_substeps,
                         runtime,
@@ -4812,7 +4817,11 @@ EXTRACTED TEXT:"""
                 # Fallback: For navigation-causing actions, if URL changed significantly,
                 # consider the action successful even if predicate verification failed.
                 # This handles cases where local LLMs generate imprecise predicates.
-                if not verification_passed and original_action in ("TYPE_AND_SUBMIT", "CLICK"):
+                if (
+                    not verification_passed
+                    and original_action in ("TYPE_AND_SUBMIT", "CLICK")
+                    and not self.config.strict_fail_fast
+                ):
                     current_url = await runtime.get_url() if hasattr(runtime, "get_url") else None
                     if current_url and pre_url and current_url != pre_url:
                         # Check if this is a meaningful URL change (not just anchor change)
@@ -5233,6 +5242,10 @@ EXTRACTED TEXT:"""
 
                 # Handle failure
                 if outcome.status == StepStatus.FAILED and step.required:
+                    if self.config.strict_fail_fast:
+                        error = f"Step {step.id} failed: {outcome.error or 'verification_failed'}"
+                        break
+
                     # Check if we've reached an authentication boundary
                     # This is a graceful terminal state - agent did all it could
                     if self.config.auth_boundary.enabled:
